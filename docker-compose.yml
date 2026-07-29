@@ -1,0 +1,19 @@
+services:
+  cloudflare-ddns-webui:
+    build: .
+    container_name: cloudflare-ddns-webui
+    security_opt:
+      - no-new-privileges:true
+    ports:
+      - "8080:8080"
+    environment:
+      - CLOUDFLARE_API_TOKEN=your-api-token
+      - ADMIN_PASSWORD=change-me-min-8-chars
+      # - SECURE_COOKIES=true          # enable when served over HTTPS (Dokploy/Traefik)
+      # - DOMAINS=example.com,www.example.com
+      # - IP4_PROVIDER=ipify
+      # - IP6_PROVIDER=cloudflare.trace
+      # - PROXIED=false
+      # - TTL=1
+      # - RECORD_COMMENT=Managed by cloudflare-ddns
+    restart: unless-stopped

@@ -1,0 +1,7 @@
+target/
+.git/
+.gitignore
+Cloudflare DDNS/
+GUI riferimento/
+docker-compose.yml
+env-example
