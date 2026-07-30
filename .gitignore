@@ -1,4 +1,6 @@
 target/
+.env
+data/
 
 # Local reference material (not part of the project)
 Cloudflare DDNS/
