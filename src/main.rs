@@ -1,14 +1,16 @@
 mod auth;
 mod cloudflare;
 mod config;
+mod customize;
 mod ddns;
 mod http;
 mod pp;
 mod routes;
+mod totp;
 
-use crate::auth::{LoginLimiter, PasswordHash, SessionStore};
+use crate::auth::Auth;
 use crate::cloudflare::CloudflareClient;
-use crate::config::Config;
+use crate::customize::UiStore;
 use crate::pp::PP;
 use crate::routes::AppState;
 use std::sync::Arc;
@@ -24,7 +26,6 @@ async fn main() {
 
     println!("cloudflare-ddns-webui v{VERSION}");
 
-    // Load configuration from environment
     let cfg = match config::load_config() {
         Ok(c) => c,
         Err(e) => {
@@ -36,18 +37,19 @@ async fn main() {
     let ppfmt = PP::new(cfg.emoji, cfg.quiet);
     config::print_config_summary(&cfg, &ppfmt);
 
-    // Hash the admin password once at boot; the plaintext is dropped.
-    let password = PasswordHash::from_password(&cfg.admin_password);
-    let cfg = Config {
-        admin_password: String::new(), // do not keep plaintext in memory
-        ..cfg
-    };
+    let state_path = format!("{}/state.json", cfg.data_dir);
+    let auth = Auth::new(cfg.session_ttl, &state_path);
+    if !auth.is_configured() {
+        ppfmt.warningf(
+            pp::EMOJI_LOCK,
+            "No admin password set yet - open the web UI to create one on first access.",
+        );
+    }
 
     let state = Arc::new(AppState {
         cf: CloudflareClient::new(&cfg.api_token, cfg.update_timeout, cfg.api_base.as_deref()),
-        sessions: SessionStore::new(cfg.session_ttl),
-        limiter: LoginLimiter::new(),
-        password,
+        auth,
+        ui: UiStore::new(&cfg.data_dir),
         pp: ppfmt,
         cfg,
     });
@@ -56,17 +58,11 @@ async fn main() {
     let listener = match tokio::net::TcpListener::bind(&listen).await {
         Ok(l) => l,
         Err(e) => {
-            ppfmt.errorf(
-                pp::EMOJI_ERROR,
-                &format!("failed to bind {listen}: {e}"),
-            );
+            ppfmt.errorf(pp::EMOJI_ERROR, &format!("failed to bind {listen}: {e}"));
             std::process::exit(1);
         }
     };
-    ppfmt.successf(
-        pp::EMOJI_GLOBE,
-        &format!("Web UI listening on http://{listen}"),
-    );
+    ppfmt.successf(pp::EMOJI_GLOBE, &format!("Web UI listening on http://{listen}"));
 
     let handler_state = state.clone();
     let handler = Arc::new(move |req: http::Request| {

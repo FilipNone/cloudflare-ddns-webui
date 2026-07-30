@@ -12,6 +12,9 @@ RUN apk add --no-cache upx && upx --best --lzma target/release/cloudflare-ddns-w
 FROM scratch AS release
 COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
 COPY --from=builder /build/target/release/cloudflare-ddns-webui /cloudflare-ddns-webui
+# Writable data dir for state.json / ui settings (mount a volume here).
+COPY --from=builder --chown=65534:65534 /build/target /data
 USER 65534:65534
 EXPOSE 8080
+VOLUME ["/data"]
 ENTRYPOINT ["/cloudflare-ddns-webui"]

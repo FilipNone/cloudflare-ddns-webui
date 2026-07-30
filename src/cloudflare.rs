@@ -228,7 +228,7 @@ impl CloudflareClient {
         loop {
             let path = format!("zones?per_page=50&page={page}&order=name");
             let (mut batch, info): (Vec<Zone>, Option<ResultInfo>) = {
-                // Need both result and result_info — decode manually.
+                // Need both result and result_info - decode manually.
                 let resp = self
                     .request(reqwest::Method::GET, &path)
                     .send()
@@ -405,7 +405,7 @@ impl CloudflareClient {
         filename: &str,
         bind_data: Vec<u8>,
     ) -> Result<ImportResult, ApiFailure> {
-        // Hand-rolled multipart/form-data body (keeps the binary lean — no
+        // Hand-rolled multipart/form-data body (keeps the binary lean - no
         // extra multipart dependency).
         let boundary = format!("cfddnswebui{}", std::process::id());
         let mut body = Vec::with_capacity(bind_data.len() + 256);

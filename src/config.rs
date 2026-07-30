@@ -1,11 +1,15 @@
 //! Configuration via environment variables, following the cloudflare-ddns
 //! philosophy: everything is configured with env vars, with `*_FILE` variants
 //! for secrets (Docker secrets compatible).
+//!
+//! There is deliberately NO admin-password env var: the web UI asks for a
+//! password on first access and stores only a PBKDF2 hash in the data dir.
 
 use crate::pp::PP;
 use std::time::Duration;
 
 pub const DEFAULT_LISTEN: &str = "0.0.0.0:8080";
+pub const DEFAULT_DATA_DIR: &str = "/data";
 pub const DEFAULT_SESSION_TTL_SECS: u64 = 24 * 60 * 60; // 24h
 pub const DEFAULT_UPDATE_TIMEOUT_SECS: u64 = 30;
 pub const DEFAULT_DETECTION_TIMEOUT_SECS: u64 = 5;
@@ -14,10 +18,10 @@ pub const DEFAULT_DETECTION_TIMEOUT_SECS: u64 = 5;
 pub struct Config {
     /// Cloudflare API token (Bearer).
     pub api_token: String,
-    /// Admin password for the web GUI login.
-    pub admin_password: String,
     /// Address the HTTP server binds to.
     pub listen: String,
+    /// Directory holding state.json, ui settings and uploaded icon.
+    pub data_dir: String,
     /// How long a login session stays valid.
     pub session_ttl: Duration,
     /// Timeout for Cloudflare API requests.
@@ -57,7 +61,6 @@ fn duration_env_secs(name: &str, default_secs: u64) -> Duration {
     match std::env::var(name) {
         Ok(v) => {
             let v = v.trim();
-            // Accept "300", "300s", "5m", "1h"
             let (num, mult) = if let Some(n) = v.strip_suffix('s') {
                 (n, 1u64)
             } else if let Some(n) = v.strip_suffix('m') {
@@ -117,21 +120,16 @@ pub fn load_config() -> Result<Config, String> {
 
     let api_token = secret_env("CLOUDFLARE_API_TOKEN")
         .ok_or("CLOUDFLARE_API_TOKEN (or CLOUDFLARE_API_TOKEN_FILE) must be set")?;
-    let admin_password = secret_env("ADMIN_PASSWORD")
-        .ok_or("ADMIN_PASSWORD (or ADMIN_PASSWORD_FILE) must be set")?;
-    if admin_password.len() < 8 {
-        return Err("ADMIN_PASSWORD must be at least 8 characters long".to_string());
-    }
 
     let listen = std::env::var("LISTEN").unwrap_or_else(|_| DEFAULT_LISTEN.to_string());
+    let data_dir = std::env::var("DATA_DIR").unwrap_or_else(|_| DEFAULT_DATA_DIR.to_string());
     let session_ttl = duration_env_secs("SESSION_TTL", DEFAULT_SESSION_TTL_SECS);
     let update_timeout = duration_env_secs("UPDATE_TIMEOUT", DEFAULT_UPDATE_TIMEOUT_SECS);
     let detection_timeout = duration_env_secs("DETECTION_TIMEOUT", DEFAULT_DETECTION_TIMEOUT_SECS);
     let secure_cookies = bool_env("SECURE_COOKIES", false);
 
     let domains = list_env("DOMAINS");
-    let ip4_provider =
-        std::env::var("IP4_PROVIDER").unwrap_or_else(|_| "ipify".to_string());
+    let ip4_provider = std::env::var("IP4_PROVIDER").unwrap_or_else(|_| "ipify".to_string());
     let ip6_provider =
         std::env::var("IP6_PROVIDER").unwrap_or_else(|_| "cloudflare.trace".to_string());
 
@@ -148,8 +146,8 @@ pub fn load_config() -> Result<Config, String> {
 
     Ok(Config {
         api_token,
-        admin_password,
         listen,
+        data_dir,
         session_ttl,
         update_timeout,
         detection_timeout,
@@ -171,10 +169,11 @@ pub fn print_config_summary(cfg: &Config, ppfmt: &PP) {
         return;
     }
     ppfmt.infof("", &format!("Listen address: {}", cfg.listen));
+    ppfmt.infof("", &format!("Data directory: {}", cfg.data_dir));
     ppfmt.infof("", &format!("Session TTL: {}s", cfg.session_ttl.as_secs()));
     ppfmt.infof("", &format!("Secure cookies: {}", cfg.secure_cookies));
     if cfg.domains.is_empty() {
-        ppfmt.infof("", "DDNS domains: (none configured — dashboard DDNS features disabled)");
+        ppfmt.infof("", "DDNS domains: (none configured - dashboard DDNS features disabled)");
     } else {
         ppfmt.infof("", &format!("DDNS domains: {}", cfg.domains.join(", ")));
         ppfmt.infof("", &format!("IPv4 provider: {}", cfg.ip4_provider));

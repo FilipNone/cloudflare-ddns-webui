@@ -1,5 +1,12 @@
-/* Cloudflare DDNS Web UI — vanilla JS SPA. No build step, no frameworks. */
+/* Cloudflare DDNS Web UI - vanilla JS SPA. No build step, no frameworks. */
 "use strict";
+
+/* Theme applied immediately at parse time (before first paint). */
+(function () {
+  var mode = localStorage.getItem("cfddns.theme") || "system";
+  var dark = mode === "dark" || (mode === "system" && window.matchMedia("(prefers-color-scheme: dark)").matches);
+  document.documentElement.classList.toggle("dark", dark);
+})();
 
 /* ================= i18n ================= */
 
@@ -16,21 +23,33 @@ const I18N = {
     "login.password": "Password",
     "login.submit": "Sign in",
     "login.error": "Invalid password. Please try again.",
-    "login.wait": "Signing in…",
-    "topbar.language": "Language",
-    "topbar.refresh": "Refresh",
+    "login.wait": "Signing in...",
+    "login.2fa.title": "Two-factor authentication",
+    "login.2fa.subtitle": "Enter the 6-digit code from your authenticator app, or one of your backup codes.",
+    "login.2fa.code": "Authentication code",
+    "login.2fa.submit": "Verify",
+    "login.2fa.back": "Back to sign in",
+    "login.2fa.backup_used": "Signed in with a backup code. {n} backup codes remaining.",
+    "login.github": "View on GitHub",
+    "setup.title": "Welcome",
+    "setup.subtitle": "Create the admin password for this installation. This only happens once.",
+    "setup.password": "New password",
+    "setup.confirm": "Confirm password",
+    "setup.hint": "At least 8 characters.",
+    "setup.submit": "Create password",
+    "setup.mismatch": "Passwords do not match.",
+    "setup.short": "Password must be at least 8 characters long.",
     "dash.title": "Dashboard",
     "dash.ipv4": "Public IPv4",
     "dash.ipv6": "Public IPv6",
     "dash.zones": "Zones",
-    "dash.records": "Records in zone",
     "dash.na": "Not available",
     "dash.ddns.title": "DDNS domains",
     "dash.ddns.desc": "Sync status of the domains configured via the DOMAINS environment variable.",
     "dash.ddns.not_configured": "No DDNS domains configured.",
     "dash.ddns.hint": "Set the DOMAINS environment variable (same as cloudflare-ddns) to enable sync status and on-demand updates.",
     "dash.ddns.update_now": "Update now",
-    "dash.ddns.updating": "Updating…",
+    "dash.ddns.updating": "Updating...",
     "dash.ddns.domain": "Domain",
     "dash.ddns.type": "Type",
     "dash.ddns.detected": "Detected IP",
@@ -44,18 +63,19 @@ const I18N = {
     "records.add": "Add record",
     "records.import": "Import",
     "records.export": "Export",
-    "records.search": "Search records…",
+    "records.search": "Search records...",
     "records.all_types": "All types",
     "records.columns": "Columns",
+    "records.refresh": "Refresh",
     "records.selected": "{n} selected",
     "records.edit": "Edit",
     "records.delete": "Delete",
     "records.clear": "Clear selection",
-    "records.showing": "Showing {from}–{to} of {total}",
+    "records.showing": "Showing {from}-{to} of {total}",
     "records.per_page": "Rows per page",
     "records.empty.title": "No records found",
     "records.empty.desc": "No DNS records match your current filters, or this zone has no records yet.",
-    "records.loading": "Loading records…",
+    "records.no_zones": "No zones available for this API token.",
     "col.type": "Type",
     "col.name": "Name",
     "col.content": "Content",
@@ -72,9 +92,10 @@ const I18N = {
     "ttl.auto": "Auto",
     "modal.add.title": "Add DNS record",
     "modal.edit.title": "Edit DNS record",
+    "modal.zone": "Zone",
     "modal.type": "Type",
     "modal.name": "Name",
-    "modal.name.hint": "Use @ for the zone root.",
+    "modal.name.hint": "Use @ for the zone root. The record is created as name.{zone}",
     "modal.content": "Content",
     "modal.content.A": "IPv4 address",
     "modal.content.AAAA": "IPv6 address",
@@ -91,7 +112,12 @@ const I18N = {
     "modal.caa.flags": "Flags",
     "modal.caa.tag": "Tag",
     "modal.caa.value": "Value",
+    "modal.svc.priority": "Priority",
+    "modal.svc.target": "Destination",
+    "modal.svc.value": "Value (optional)",
+    "modal.svc.value.hint": "Space-separated SvcParams, e.g. alpn=\"h3,h2\" ipv4hint=192.0.2.1",
     "modal.ttl": "TTL",
+    "modal.ttl.proxied": "TTL is managed by Cloudflare while the record is proxied.",
     "modal.proxy": "Proxy status",
     "modal.proxy.hint": "Proxy this record through Cloudflare (orange cloud).",
     "modal.tags": "Tags",
@@ -101,6 +127,13 @@ const I18N = {
     "modal.create": "Create",
     "modal.cancel": "Cancel",
     "modal.required": "This field is required.",
+    "modal.invalid": "Invalid value",
+    "modal.invalid.ipv4": "Enter a valid IPv4 address (e.g. 192.0.2.1).",
+    "modal.invalid.ipv6": "Enter a valid IPv6 address (e.g. 2001:db8::1).",
+    "modal.invalid.domain": "Enter a valid domain name.",
+    "modal.invalid.number": "Enter a number between {min} and {max}.",
+    "modal.invalid.name": "Letters, digits, hyphens, dots, underscores and * only.",
+    "modal.invalid.srvname": "SRV names must look like _service._tcp.name",
     "modal.bulk.title": "Edit {n} records",
     "modal.bulk.keep": "Keep as is",
     "modal.bulk.ttl": "TTL",
@@ -118,27 +151,67 @@ const I18N = {
     "modal.delete.many": "Delete {n} records? This cannot be undone.",
     "modal.delete.confirm": "Delete",
     "modal.import.title": "Import DNS records",
-    "modal.import.desc": "Upload a BIND zone file. Cloudflare parses it natively — comments and cf_tags (e.g. cf-proxied:true) are honoured, exactly like the dashboard import.",
+    "modal.import.desc": "Upload a BIND zone file. Cloudflare parses it natively and appends new records - existing records are never replaced. Comments and cf_tags (e.g. cf-proxied:true) are honoured, exactly like the dashboard import.",
     "modal.import.drop": "Drop your zone file here, or <strong>browse</strong>",
+    "modal.import.file_selected": "Selected: {name} ({size})",
     "modal.import.submit": "Import",
     "modal.import.result": "Imported {added} of {parsed} records.",
+    "modal.import.skipped": "{n} records were skipped (already existing or unsupported).",
+    "modal.import.empty": "The file contains no importable DNS records.",
     "settings.title": "Settings",
+    "settings.appearance.title": "Appearance",
+    "settings.appearance.desc": "Theme and branding of the interface.",
+    "settings.theme": "Theme",
+    "settings.theme.system": "System default",
+    "settings.theme.light": "Light",
+    "settings.theme.dark": "Dark",
     "settings.lang.title": "Language",
     "settings.lang.desc": "Interface language. More languages are coming soon.",
-    "settings.token.title": "Cloudflare API token",
-    "settings.token.desc": "The web UI talks to Cloudflare with an API token supplied via the CLOUDFLARE_API_TOKEN environment variable. Create it with the following preset:",
-    "settings.token.step1": "Open <strong>My Profile → API Tokens</strong> in the Cloudflare dashboard.",
-    "settings.token.step2": "Click <strong>Create Token</strong> and choose the <strong>Edit zone DNS</strong> template.",
-    "settings.token.step3": "Keep permissions <code>Zone → DNS → Edit</code> and add <code>Zone → Zone → Read</code>.",
-    "settings.token.step4": "Under <strong>Zone Resources</strong> pick <em>Include → Specific zone</em> for least privilege (or <em>All zones</em>).",
-    "settings.token.step5": "Create the token and set it as <code>CLOUDFLARE_API_TOKEN</code> (or mount it via <code>CLOUDFLARE_API_TOKEN_FILE</code>).",
+    "settings.accent": "Accent color",
+    "settings.accent.hint": "Pick a preset or any custom color.",
+    "settings.icon": "Logo & favicon",
+    "settings.icon.hint": "PNG, JPEG, WebP, GIF or SVG, max 512 KB. Applied to the logo and used as the favicon.",
+    "settings.icon.upload": "Upload image",
+    "settings.icon.reset": "Reset to default",
+    "settings.icon.too_big": "Image is larger than 512 KB.",
+    "settings.icon.bad_type": "Unsupported format - use PNG, JPEG, WebP, GIF or SVG.",
     "settings.security.title": "Security",
-    "settings.security.desc": "Current security posture of this installation.",
+    "settings.security.desc": "Password and two-factor authentication.",
     "settings.security.session": "Session lifetime",
-    "settings.security.password": "Admin password",
-    "settings.security.password.value": "Set via ADMIN_PASSWORD (PBKDF2-hashed in memory)",
     "settings.security.cookies": "Secure cookies",
     "settings.security.cookies.hint": "Set SECURE_COOKIES=true when serving the UI over HTTPS (recommended on Dokploy).",
+    "settings.password.change": "Change password",
+    "settings.password.current": "Current password",
+    "settings.password.new": "New password",
+    "settings.password.confirm": "Confirm new password",
+    "settings.password.code": "2FA or backup code",
+    "settings.password.code.hint": "Required because 2FA is enabled.",
+    "settings.password.submit": "Update password",
+    "settings.password.done": "Password updated.",
+    "settings.2fa.title": "Two-factor authentication",
+    "settings.2fa.desc": "Require a TOTP code from an authenticator app at sign-in, with one-time backup codes for recovery.",
+    "settings.2fa.status.on": "Enabled",
+    "settings.2fa.status.off": "Disabled",
+    "settings.2fa.backup_count": "{n} backup codes remaining",
+    "settings.2fa.enable": "Enable 2FA",
+    "settings.2fa.disable": "Disable 2FA",
+    "settings.2fa.scan": "Scan this QR code with your authenticator app (Aegis, Bitwarden, Google Authenticator...), then enter the 6-digit code to confirm.",
+    "settings.2fa.manual": "Or enter the secret manually:",
+    "settings.2fa.code": "6-digit code",
+    "settings.2fa.confirm": "Confirm & activate",
+    "settings.2fa.cancel": "Cancel",
+    "settings.2fa.backup.title": "Save your backup codes",
+    "settings.2fa.backup.desc": "These codes are shown only once. Each can be used a single time if you lose access to your authenticator app.",
+    "settings.2fa.backup.download": "Download as .txt",
+    "settings.2fa.backup.done": "Done",
+    "settings.2fa.disable.hint": "Enter a current 2FA code (or a backup code) to disable two-factor authentication.",
+    "settings.token.title": "Cloudflare API token",
+    "settings.token.desc": "The web UI talks to Cloudflare with an API token supplied via the CLOUDFLARE_API_TOKEN environment variable. Create it with the following preset:",
+    "settings.token.step1": "Open <strong>My Profile -> API Tokens</strong> in the Cloudflare dashboard.",
+    "settings.token.step2": "Click <strong>Create Token</strong> and choose the <strong>Edit zone DNS</strong> template.",
+    "settings.token.step3": "Keep permissions <code>Zone -> DNS -> Edit</code> and add <code>Zone -> Zone -> Read</code>.",
+    "settings.token.step4": "Under <strong>Zone Resources</strong> pick <em>Include -> Specific zone</em> for least privilege (or <em>All zones</em>).",
+    "settings.token.step5": "Create the token and set it as <code>CLOUDFLARE_API_TOKEN</code> (or mount it via <code>CLOUDFLARE_API_TOKEN_FILE</code>).",
     "settings.about.title": "About",
     "settings.about.version": "Version",
     "settings.about.source": "Source code",
@@ -148,6 +221,8 @@ const I18N = {
     "common.close": "Close",
     "common.copy": "Click to copy",
     "common.copied": "Copied to clipboard",
+    "common.enabled": "Enabled",
+    "common.disabled": "Disabled",
     "toast.saved": "Record saved",
     "toast.created": "Record created",
     "toast.deleted": "Record deleted",
@@ -157,7 +232,11 @@ const I18N = {
     "toast.error": "Error",
     "toast.exported": "Zone file exported",
     "toast.updated_ddns": "DDNS update finished",
-    "confirm": "Confirm",
+    "toast.accent": "Accent color updated",
+    "toast.icon": "Logo updated",
+    "toast.2fa.enabled": "Two-factor authentication enabled",
+    "toast.2fa.disabled": "Two-factor authentication disabled",
+    "toast.password": "Password updated",
   },
 };
 
@@ -173,8 +252,8 @@ function t(key, vars) {
 /* ================= Icons ================= */
 
 const I = {
-  cloud: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17.5 19H9a7 7 0 1 1 6.71-9h1.79a4.5 4.5 0 1 1 0 9Z"/></svg>',
-  cloudFill: '<svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M17.5 19H9a7 7 0 1 1 6.71-9h1.79a4.5 4.5 0 1 1 0 9Z"/></svg>',
+  cloud: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17.5 19H9a7 7 0 1 1 6.71-9h1.79a4.5 4.5 0 1 1 0 9Z"/></svg>',
+  cloudFill: '<svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M17.5 19H9a7 7 0 1 1 6.71-9h1.79a4.5 4.5 0 1 1 0 9Z"/></svg>',
   dashboard: '<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="7" height="9" x="3" y="3" rx="1"/><rect width="7" height="5" x="14" y="3" rx="1"/><rect width="7" height="9" x="14" y="12" rx="1"/><rect width="7" height="5" x="3" y="16" rx="1"/></svg>',
   dns: '<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M2 12h20"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>',
   settings: '<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/></svg>',
@@ -194,21 +273,29 @@ const I = {
   close: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg>',
   check: '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>',
   collapse: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="3" rx="2"/><path d="M9 3v18"/><path d="m14 9-3 3 3 3"/></svg>',
-  menu: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="4" x2="20" y1="6" y2="6"/><line x1="4" x2="20" y1="12" y2="12"/><line x1="4" x2="20" y1="18" y2="18"/></svg>',
   bolt: '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>',
   file: '<svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M14.5 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7.5L14.5 2z"/><polyline points="14 2 14 8 20 8"/></svg>',
   shield: '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/></svg>',
+  sun: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2"/><path d="M12 20v2"/><path d="m4.93 4.93 1.41 1.41"/><path d="m17.66 17.66 1.41 1.41"/><path d="M2 12h2"/><path d="M20 12h2"/><path d="m6.34 17.66-1.41 1.41"/><path d="m19.07 4.93-1.41 1.41"/></svg>',
+  moon: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/></svg>',
+  monitor: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="20" height="14" x="2" y="3" rx="2"/><line x1="8" x2="16" y1="21" y2="21"/><line x1="12" x2="12" y1="17" y2="21"/></svg>',
+  github: '<svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M12 .5C5.65.5.5 5.65.5 12c0 5.08 3.29 9.39 7.86 10.91.58.11.79-.25.79-.56 0-.27-.01-1.17-.02-2.12-3.2.7-3.88-1.36-3.88-1.36-.52-1.33-1.28-1.68-1.28-1.68-1.04-.71.08-.7.08-.7 1.15.08 1.76 1.18 1.76 1.18 1.03 1.76 2.69 1.25 3.35.96.1-.75.4-1.25.72-1.54-2.55-.29-5.24-1.28-5.24-5.69 0-1.26.45-2.29 1.19-3.1-.12-.29-.52-1.46.11-3.05 0 0 .97-.31 3.18 1.18a11 11 0 0 1 5.78 0c2.21-1.49 3.18-1.18 3.18-1.18.63 1.59.23 2.76.11 3.05.74.81 1.19 1.84 1.19 3.1 0 4.42-2.7 5.4-5.27 5.68.41.36.78 1.06.78 2.14 0 1.55-.01 2.8-.01 3.18 0 .31.21.68.8.56A10.52 10.52 0 0 0 23.5 12C23.5 5.65 18.35.5 12 .5z"/></svg>',
+  key: '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m21 2-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0 3 3L22 7l-3-3m-3.5 3.5L19 4"/></svg>',
+  copy: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>',
+  palette: '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="13.5" cy="6.5" r=".5" fill="currentColor"/><circle cx="17.5" cy="10.5" r=".5" fill="currentColor"/><circle cx="8.5" cy="7.5" r=".5" fill="currentColor"/><circle cx="6.5" cy="12.5" r=".5" fill="currentColor"/><path d="M12 2C6.5 2 2 6.5 2 12s4.5 10 10 10c.926 0 1.648-.746 1.648-1.688 0-.437-.18-.835-.437-1.125-.29-.289-.438-.652-.438-1.125a1.64 1.64 0 0 1 1.668-1.668h1.996c3.051 0 5.555-2.503 5.555-5.554C21.965 6.012 17.461 2 12 2z"/></svg>',
 };
 
-/* ================= State ================= */
+/* ================= Constants & state ================= */
 
-const RECORD_TYPES = ["A", "AAAA", "CNAME", "TXT", "MX", "NS", "SRV", "CAA", "PTR", "HTTPS", "SVCB"];
+const RECORD_TYPES = ["A", "AAAA", "CAA", "CNAME", "HTTPS", "MX", "NS", "PTR", "SRV", "SVCB", "TXT"];
 const PROXIABLE = ["A", "AAAA", "CNAME"];
 const TTL_OPTIONS = [
   [1, "Auto"], [60, "1 min"], [120, "2 min"], [300, "5 min"], [600, "10 min"],
   [1800, "30 min"], [3600, "1 hour"], [7200, "2 hours"], [18000, "5 hours"],
   [43200, "12 hours"], [86400, "1 day"],
 ];
+const ACCENT_PRESETS = ["#f6821f", "#3b82f6", "#22c55e", "#a855f7", "#ef4444", "#14b8a6", "#eab308", "#ec4899"];
+// NOTE: .sw-0..sw-7 classes in style.css must stay in the same order.
 
 const DEFAULT_COLUMNS = {
   type: true, name: true, content: true, proxy: true, ttl: true,
@@ -218,7 +305,8 @@ const COLUMN_ORDER = ["type", "name", "content", "proxy", "ttl", "tags", "commen
 
 const state = {
   authed: false,
-  booted: false,
+  configured: true,
+  totpEnabled: false,
   route: location.hash.replace("#/", "") || "dashboard",
   zones: [],
   zoneId: null,
@@ -237,8 +325,43 @@ const state = {
   ddns: null,
   ddnsLoading: false,
   sessionTtl: null,
+  backupCodesRemaining: 0,
   config: null,
+  pendingChallenge: null,
 };
+
+/* ================= Theme ================= */
+
+const themeMedia = window.matchMedia("(prefers-color-scheme: dark)");
+themeMedia.addEventListener("change", () => applyTheme());
+
+function currentTheme() { return localStorage.getItem("cfddns.theme") || "system"; }
+
+function applyTheme() {
+  const mode = currentTheme();
+  const dark = mode === "dark" || (mode === "system" && themeMedia.matches);
+  document.documentElement.classList.toggle("dark", dark);
+}
+
+function setTheme(mode) {
+  localStorage.setItem("cfddns.theme", mode);
+  applyTheme();
+}
+
+function themeIcon() {
+  const mode = currentTheme();
+  return mode === "dark" ? I.moon : mode === "light" ? I.sun : I.monitor;
+}
+
+function cycleTheme() {
+  const order = ["system", "light", "dark"];
+  const next = order[(order.indexOf(currentTheme()) + 1) % order.length];
+  setTheme(next);
+  document.querySelectorAll("[data-theme-btn]").forEach((b) => {
+    b.innerHTML = themeIcon();
+    b.title = t("settings.theme." + (next === "system" ? "system" : next));
+  });
+}
 
 /* ================= Helpers ================= */
 
@@ -262,12 +385,18 @@ function fmtTtl(ttl) {
 }
 
 function fmtDate(iso) {
-  if (!iso) return "—";
+  if (!iso) return "-";
   try {
     return new Date(iso).toLocaleString(lang === "en" ? "en-US" : lang, {
       year: "numeric", month: "short", day: "numeric", hour: "2-digit", minute: "2-digit",
     });
   } catch { return iso; }
+}
+
+function fmtBytes(n) {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / 1024 / 1024).toFixed(1)} MB`;
 }
 
 function toast(msg, kind = "ok") {
@@ -279,8 +408,19 @@ function toast(msg, kind = "ok") {
   setTimeout(() => {
     div.classList.add("out");
     setTimeout(() => div.remove(), 350);
-  }, 4000);
+  }, 4500);
 }
+
+/* ================= Validation ================= */
+
+const V = {
+  ipv4(v) { return /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.test(v.trim()) && v.trim().split(".").every((o) => +o <= 255); },
+  ipv6(v) { return /^[0-9a-fA-F:]+$/.test(v.trim()) && v.includes(":"); },
+  domain(v) { return /^(\*\.)?([a-zA-Z0-9_]([a-zA-Z0-9_-]*[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}\.?$/.test(v.trim()) || /^[a-zA-Z0-9_]([a-zA-Z0-9_-]*[a-zA-Z0-9])?\.?$/.test(v.trim()); },
+  recordName(v) { return v === "@" || /^[a-zA-Z0-9_*]([a-zA-Z0-9._-]*)$/.test(v.trim()); },
+  srvName(v) { return /^_[a-zA-Z0-9-]+\._(tcp|udp)\..+$/.test(v.trim()) || v === "@"; },
+  uint(v, min, max) { const n = Number(v); return Number.isInteger(n) && n >= min && n <= max; },
+};
 
 /* ================= API ================= */
 
@@ -294,14 +434,14 @@ async function api(path, opts = {}) {
     init.headers["Content-Type"] = "application/json";
     init.body = JSON.stringify(opts.json);
   } else if (opts.raw !== undefined) {
-    init.headers["Content-Type"] = "text/plain";
+    init.headers["Content-Type"] = opts.rawType || "text/plain";
     init.body = opts.raw;
   }
   let resp;
   try {
     resp = await fetch(path, init);
   } catch {
-    throw new Error("network error — is the server reachable?");
+    throw new Error("network error - is the server reachable?");
   }
   if (resp.status === 401 && !path.startsWith("/api/auth/")) {
     state.authed = false;
@@ -320,11 +460,175 @@ async function api(path, opts = {}) {
   }
   if (ct.includes("application/json")) {
     const data = await resp.json();
-    if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`);
+    if (!resp.ok) {
+      const err = new Error(data.error || `HTTP ${resp.status}`);
+      err.status = resp.status;
+      throw err;
+    }
     return data;
   }
-  if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+  if (!resp.ok) {
+    const err = new Error(`HTTP ${resp.status}`);
+    err.status = resp.status;
+    throw err;
+  }
   return null;
+}
+
+/* ================= Modern select component ================= */
+
+let openMSelect = null;
+
+function closeMSelects() {
+  document.querySelectorAll(".mselect.open").forEach((m) => m.classList.remove("open"));
+  document.querySelectorAll(".menu.open").forEach((m) => m.classList.remove("open"));
+  document.querySelectorAll(".menu-overlay").forEach((o) => o.remove());
+  openMSelect = null;
+}
+
+/**
+ * Build a modern dropdown. opts: {id, options: [{value,label,group?}], value,
+ * placeholder, disabled, cls, onChange}
+ */
+function mselect(opts) {
+  const wrap = document.createElement("div");
+  wrap.className = `mselect ${opts.cls || ""}`;
+  if (opts.id) wrap.id = opts.id;
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "mselect-btn";
+  btn.disabled = !!opts.disabled;
+  const label = document.createElement("span");
+  label.className = "ms-label";
+  const caret = document.createElement("span");
+  caret.className = "ms-caret";
+  caret.innerHTML = I.chevronDown;
+  btn.append(label, caret);
+  const menu = document.createElement("div");
+  menu.className = "mselect-menu";
+  wrap.append(btn, menu);
+
+  const getValue = () => wrap.dataset.value ?? "";
+  const setLabel = (v) => {
+    const opt = opts.options.find((o) => String(o.value) === String(v));
+    label.textContent = opt ? opt.label : (opts.placeholder || "");
+  };
+
+  let lastGroup = null;
+  for (const o of opts.options) {
+    if (o.group && o.group !== lastGroup) {
+      lastGroup = o.group;
+      const g = document.createElement("div");
+      g.className = "mselect-group";
+      g.textContent = o.group;
+      menu.appendChild(g);
+    }
+    const item = document.createElement("button");
+    item.type = "button";
+    item.className = "mselect-option";
+    item.dataset.value = o.value;
+    item.innerHTML = `<span class="check">${String(o.value) === String(opts.value) ? I.check : ""}</span><span>${esc(o.label)}</span>`;
+    if (String(o.value) === String(opts.value)) item.classList.add("selected");
+    item.addEventListener("click", () => {
+      wrap.dataset.value = o.value;
+      setLabel(o.value);
+      menu.querySelectorAll(".mselect-option").forEach((x) => {
+        x.classList.toggle("selected", x.dataset.value === String(o.value));
+        x.querySelector(".check").innerHTML = x.dataset.value === String(o.value) ? I.check : "";
+      });
+      closeMSelects();
+      if (opts.onChange) opts.onChange(o.value);
+    });
+    menu.appendChild(item);
+  }
+
+  wrap.dataset.value = opts.value ?? "";
+  setLabel(opts.value);
+
+  btn.addEventListener("click", (e) => {
+    e.stopPropagation();
+    const wasOpen = wrap.classList.contains("open");
+    closeMSelects();
+    if (wasOpen) return;
+    // Flip up when near the bottom of the viewport.
+    const rect = btn.getBoundingClientRect();
+    const spaceBelow = window.innerHeight - rect.bottom;
+    menu.classList.toggle("up", spaceBelow < 280);
+    wrap.classList.add("open");
+    openMSelect = wrap;
+    const overlay = document.createElement("div");
+    overlay.className = "menu-overlay";
+    overlay.addEventListener("click", closeMSelects);
+    document.body.appendChild(overlay);
+  });
+
+  wrap.mset = (v) => {
+    wrap.dataset.value = v;
+    setLabel(v);
+    menu.querySelectorAll(".mselect-option").forEach((x) => {
+      x.classList.toggle("selected", x.dataset.value === String(v));
+      x.querySelector(".check").innerHTML = x.dataset.value === String(v) ? I.check : "";
+    });
+  };
+  wrap.mget = getValue;
+  wrap.msetDisabled = (d) => { btn.disabled = d; };
+  wrap.msetOptions = (newOptions, value) => {
+    opts.options = newOptions;
+    menu.innerHTML = "";
+    let lg = null;
+    for (const o of newOptions) {
+      if (o.group && o.group !== lg) {
+        lg = o.group;
+        const g = document.createElement("div");
+        g.className = "mselect-group";
+        g.textContent = o.group;
+        menu.appendChild(g);
+      }
+      const item = document.createElement("button");
+      item.type = "button";
+      item.className = "mselect-option";
+      item.dataset.value = o.value;
+      item.innerHTML = `<span class="check">${String(o.value) === String(value) ? I.check : ""}</span><span>${esc(o.label)}</span>`;
+      if (String(o.value) === String(value)) item.classList.add("selected");
+      item.addEventListener("click", () => {
+        wrap.dataset.value = o.value;
+        setLabel(o.value);
+        closeMSelects();
+        if (opts.onChange) opts.onChange(o.value);
+      });
+      menu.appendChild(item);
+    }
+    wrap.mset(value);
+  };
+  return wrap;
+}
+
+/* Simple dropdown menu (topbar/columns) */
+function bindDropdown(btnId, menuId) {
+  const btn = el(btnId), menu = el(menuId);
+  if (!btn || !menu) return;
+  btn.addEventListener("click", (e) => {
+    e.stopPropagation();
+    const wasOpen = menu.classList.contains("open");
+    closeMSelects();
+    if (!wasOpen) {
+      // Flip up when near the bottom.
+      const rect = btn.getBoundingClientRect();
+      if (window.innerHeight - rect.bottom < 300 && rect.top > 320) {
+        menu.classList.add("up");
+        menu.style.top = "auto";
+        menu.style.bottom = "calc(100% + 6px)";
+      } else {
+        menu.style.top = "";
+        menu.style.bottom = "";
+      }
+      menu.classList.add("open");
+      const overlay = document.createElement("div");
+      overlay.className = "menu-overlay";
+      overlay.addEventListener("click", closeMSelects);
+      document.body.appendChild(overlay);
+    }
+  });
 }
 
 /* ================= Data loading ================= */
@@ -373,26 +677,24 @@ async function loadDdns() {
 
 function render() {
   const app = el("app");
-  if (!state.authed) {
-    renderLogin(app);
-    return;
-  }
+  if (!state.configured) { renderSetup(app); return; }
+  if (!state.authed) { renderLogin(app); return; }
   const route = state.route;
   app.innerHTML = `
     <div class="layout ${state.sidebarCollapsed ? "collapsed" : ""}" id="layout">
       <aside class="sidebar">
         <div class="sidebar-brand">
-          <img src="/static/favicon.svg" alt="logo">
+          <img src="/static/favicon.svg?v=${state.config?.version || "1"}" alt="logo">
           <span>${esc(t("app.name"))}</span>
         </div>
         <nav class="sidebar-nav">
-          <button class="nav-item ${route === "dashboard" ? "active" : ""}" data-nav="dashboard">${I.dashboard}<span>${esc(t("nav.dashboard"))}</span></button>
-          <button class="nav-item ${route === "records" ? "active" : ""}" data-nav="records">${I.dns}<span>${esc(t("nav.records"))}</span></button>
-          <button class="nav-item ${route === "settings" ? "active" : ""}" data-nav="settings">${I.settings}<span>${esc(t("nav.settings"))}</span></button>
+          <button class="nav-item ${route === "dashboard" ? "active" : ""}" data-nav="dashboard">${I.dashboard}<span class="nav-label">${esc(t("nav.dashboard"))}</span></button>
+          <button class="nav-item ${route === "records" ? "active" : ""}" data-nav="records">${I.dns}<span class="nav-label">${esc(t("nav.records"))}</span></button>
+          <button class="nav-item ${route === "settings" ? "active" : ""}" data-nav="settings">${I.settings}<span class="nav-label">${esc(t("nav.settings"))}</span></button>
         </nav>
         <div class="sidebar-footer">
-          <button class="nav-item" id="collapse-btn" title="${esc(t("nav.collapse"))}">${I.collapse}<span>${esc(t("nav.collapse"))}</span></button>
-          <button class="nav-item" id="logout-btn">${I.logout}<span>${esc(t("nav.logout"))}</span></button>
+          <button class="nav-item" id="collapse-btn" title="${esc(t("nav.collapse"))}">${I.collapse}<span class="nav-label">${esc(t("nav.collapse"))}</span></button>
+          <button class="nav-item" id="logout-btn">${I.logout}<span class="nav-label">${esc(t("nav.logout"))}</span></button>
         </div>
       </aside>
       <div class="main">
@@ -415,6 +717,7 @@ function render() {
   el("logout-btn").addEventListener("click", async () => {
     try { await api("/api/auth/logout", { method: "POST" }); } catch { /* ignore */ }
     state.authed = false;
+    navigate("dashboard");
     render();
   });
 
@@ -438,93 +741,130 @@ window.addEventListener("hashchange", () => {
 function renderTopbarActions() {
   const box = el("topbar-actions");
   if (!box) return;
-  let html = "";
+  box.innerHTML = "";
   if (state.route === "records" && state.zones.length > 0) {
-    html += `<select class="select u-zone-select" id="zone-select">
-      ${state.zones.map((z) => `<option value="${esc(z.id)}" ${z.id === state.zoneId ? "selected" : ""}>${esc(z.name)}</option>`).join("")}
-    </select>`;
+    const zoneSelect = mselect({
+      id: "zone-select",
+      cls: "u-zone-select",
+      options: state.zones.map((z) => ({ value: z.id, label: z.name })),
+      value: state.zoneId,
+      onChange: async (v) => {
+        state.zoneId = v;
+        localStorage.setItem("cfddns.zone", v);
+        state.search = ""; state.typeFilter = "";
+        await refreshRecords();
+      },
+    });
+    box.appendChild(zoneSelect);
   }
-  html += `
-    <div class="dropdown">
-      <button class="btn icon" id="lang-btn" title="${esc(t("topbar.language"))}">${I.globe}</button>
-      <div class="menu" id="lang-menu">
-        <div class="menu-label">${esc(t("topbar.language"))}</div>
-        ${LANGS.map((l) => `<button class="menu-item" data-lang="${l.code}"><span class="check">${l.code === lang ? I.check : ""}</span>${esc(l.name)}${l.code === "en" ? "" : ""}</button>`).join("")}
+  const themeBtn = document.createElement("button");
+  themeBtn.className = "btn icon";
+  themeBtn.dataset.themeBtn = "1";
+  themeBtn.title = t("settings.theme." + currentTheme());
+  themeBtn.innerHTML = themeIcon();
+  themeBtn.addEventListener("click", cycleTheme);
+  box.appendChild(themeBtn);
+}
+
+/* ================= Render: first-run setup ================= */
+
+function renderSetup(app) {
+  app.innerHTML = loginShell(`
+    <form class="login-card" id="setup-form">
+      <div class="login-logo">
+        <img src="/static/favicon.svg" alt="logo">
+        <h1>${esc(t("app.name"))}</h1>
       </div>
-    </div>
-    <div class="dropdown">
-      <button class="avatar" id="user-btn" title="Admin">A</button>
-      <div class="menu" id="user-menu">
-        <button class="menu-item" id="menu-logout">${I.logout} ${esc(t("nav.logout"))}</button>
+      <p class="login-sub">${esc(t("setup.subtitle"))}</p>
+      <div class="login-error" id="setup-error"></div>
+      <label class="field">
+        <span>${esc(t("setup.password"))}</span>
+        <input class="input" type="password" id="setup-password" autocomplete="new-password" required autofocus>
+      </label>
+      <label class="field">
+        <span>${esc(t("setup.confirm"))}</span>
+        <input class="input" type="password" id="setup-confirm" autocomplete="new-password" required>
+        <div class="field-hint">${esc(t("setup.hint"))}</div>
+      </label>
+      <button class="btn primary u-w100" type="submit" id="setup-submit">${esc(t("setup.submit"))}</button>
+    </form>`);
+
+  el("setup-form").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const errBox = el("setup-error");
+    const btn = el("setup-submit");
+    errBox.classList.remove("visible");
+    const password = el("setup-password").value;
+    const confirm = el("setup-confirm").value;
+    if (password.length < 8) { errBox.textContent = t("setup.short"); errBox.classList.add("visible"); return; }
+    if (password !== confirm) { errBox.textContent = t("setup.mismatch"); errBox.classList.add("visible"); return; }
+    btn.disabled = true;
+    try {
+      await api("/api/auth/setup", { method: "POST", json: { password, confirm } });
+      state.configured = true;
+      state.authed = true;
+      await bootAuthed();
+    } catch (err) {
+      errBox.textContent = err.message;
+      errBox.classList.add("visible");
+      btn.disabled = false;
+    }
+  });
+}
+
+/* ================= Render: login ================= */
+
+function loginShell(cardHtml) {
+  return `
+    <div class="login-wrap">
+      <div class="login-corner">
+        <button class="btn icon" data-theme-btn="1" title="${esc(t("settings.theme." + currentTheme()))}">${themeIcon()}</button>
+        <div class="dropdown">
+          <button class="btn icon" id="login-lang-btn" title="${esc(t("settings.lang.title"))}">${I.globe}</button>
+          <div class="menu" id="login-lang-menu">
+            <div class="menu-label">${esc(t("settings.lang.title"))}</div>
+            ${LANGS.map((l) => `<button class="menu-item" data-lang="${l.code}"><span class="check">${l.code === lang ? I.check : ""}</span>${esc(l.name)}</button>`).join("")}
+          </div>
+        </div>
+      </div>
+      ${cardHtml}
+      <div class="login-footer">
+        <a href="${esc(state.config?.github || "https://github.com/FilipNone/cloudflare-ddns-webui")}" target="_blank" rel="noopener noreferrer">${I.github} ${esc(t("login.github"))}</a>
       </div>
     </div>`;
-  box.innerHTML = html;
+}
 
-  const zoneSelect = el("zone-select");
-  if (zoneSelect) {
-    zoneSelect.addEventListener("change", async () => {
-      state.zoneId = zoneSelect.value;
-      localStorage.setItem("cfddns.zone", state.zoneId);
-      state.search = ""; state.typeFilter = "";
-      await refreshRecords();
-    });
-  }
-  bindDropdown("lang-btn", "lang-menu");
-  bindDropdown("user-btn", "user-menu");
-  box.querySelectorAll("[data-lang]").forEach((b) =>
+function wireLoginShell() {
+  document.querySelectorAll("[data-theme-btn]").forEach((b) => b.addEventListener("click", cycleTheme));
+  bindDropdown("login-lang-btn", "login-lang-menu");
+  document.querySelectorAll("#login-lang-menu [data-lang]").forEach((b) =>
     b.addEventListener("click", () => {
       lang = b.dataset.lang;
       localStorage.setItem("cfddns.lang", lang);
       render();
     })
   );
-  const menuLogout = el("menu-logout");
-  if (menuLogout) menuLogout.addEventListener("click", () => el("logout-btn").click());
 }
-
-function bindDropdown(btnId, menuId) {
-  const btn = el(btnId), menu = el(menuId);
-  if (!btn || !menu) return;
-  btn.addEventListener("click", (e) => {
-    e.stopPropagation();
-    const open = menu.classList.contains("open");
-    closeAllMenus();
-    if (!open) {
-      menu.classList.add("open");
-      const overlay = document.createElement("div");
-      overlay.className = "menu-overlay";
-      overlay.addEventListener("click", () => { closeAllMenus(); overlay.remove(); });
-      document.body.appendChild(overlay);
-    }
-  });
-}
-
-function closeAllMenus() {
-  document.querySelectorAll(".menu.open").forEach((m) => m.classList.remove("open"));
-  document.querySelectorAll(".menu-overlay").forEach((o) => o.remove());
-}
-
-/* ================= Render: login ================= */
 
 function renderLogin(app) {
-  app.innerHTML = `
-    <div class="login-wrap">
-      <form class="login-card" id="login-form">
-        <div class="login-logo">
-          <img src="/static/favicon.svg" alt="logo">
-          <h1>${esc(t("app.name"))}</h1>
-        </div>
-        <p class="login-sub">${esc(t("login.subtitle"))}</p>
-        <div class="login-error" id="login-error"></div>
-        <label class="field">
-          <span>${esc(t("login.password"))}</span>
-          <input class="input" type="password" id="login-password" autocomplete="current-password" required autofocus>
-        </label>
-        <button class="btn primary u-w100" type="submit" id="login-submit">${esc(t("login.submit"))}</button>
-      </form>
-    </div>`;
-  const form = el("login-form");
-  form.addEventListener("submit", async (e) => {
+  if (state.pendingChallenge) { renderLogin2fa(app); return; }
+  app.innerHTML = loginShell(`
+    <form class="login-card" id="login-form">
+      <div class="login-logo">
+        <img src="/static/favicon.svg" alt="logo">
+        <h1>${esc(t("app.name"))}</h1>
+      </div>
+      <p class="login-sub">${esc(t("login.subtitle"))}</p>
+      <div class="login-error" id="login-error"></div>
+      <label class="field">
+        <span>${esc(t("login.password"))}</span>
+        <input class="input" type="password" id="login-password" autocomplete="current-password" required autofocus>
+      </label>
+      <button class="btn primary u-w100" type="submit" id="login-submit">${esc(t("login.submit"))}</button>
+    </form>`);
+  wireLoginShell();
+
+  el("login-form").addEventListener("submit", async (e) => {
     e.preventDefault();
     const btn = el("login-submit");
     const errBox = el("login-error");
@@ -532,14 +872,63 @@ function renderLogin(app) {
     btn.disabled = true;
     btn.textContent = t("login.wait");
     try {
-      await api("/api/auth/login", { method: "POST", json: { password: el("login-password").value } });
+      const res = await api("/api/auth/login", { method: "POST", json: { password: el("login-password").value } });
+      if (res.requires_2fa) {
+        state.pendingChallenge = res.challenge;
+        render();
+        return;
+      }
       state.authed = true;
       await bootAuthed();
     } catch (err) {
-      errBox.textContent = err.message === "unauthorized" ? t("login.error") : err.message;
+      errBox.textContent = err.status === 401 ? t("login.error") : err.message;
       errBox.classList.add("visible");
       btn.disabled = false;
       btn.textContent = t("login.submit");
+    }
+  });
+}
+
+function renderLogin2fa(app) {
+  app.innerHTML = loginShell(`
+    <form class="login-card" id="login2fa-form">
+      <div class="login-logo">
+        <img src="/static/favicon.svg" alt="logo">
+        <h1>${esc(t("login.2fa.title"))}</h1>
+      </div>
+      <p class="login-sub">${esc(t("login.2fa.subtitle"))}</p>
+      <div class="login-error" id="login2fa-error"></div>
+      <label class="field">
+        <span>${esc(t("login.2fa.code"))}</span>
+        <input class="input" type="text" id="login2fa-code" inputmode="numeric" autocomplete="one-time-code" placeholder="123456" required autofocus>
+      </label>
+      <button class="btn primary u-w100" type="submit" id="login2fa-submit">${esc(t("login.2fa.submit"))}</button>
+      <button class="btn ghost u-w100 u-mt8" type="button" id="login2fa-back">${esc(t("login.2fa.back"))}</button>
+    </form>`);
+  wireLoginShell();
+
+  el("login2fa-back").addEventListener("click", () => { state.pendingChallenge = null; render(); });
+  el("login2fa-form").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const btn = el("login2fa-submit");
+    const errBox = el("login2fa-error");
+    errBox.classList.remove("visible");
+    btn.disabled = true;
+    try {
+      const res = await api("/api/auth/login/2fa", {
+        method: "POST",
+        json: { challenge: state.pendingChallenge, code: el("login2fa-code").value.trim() },
+      });
+      state.pendingChallenge = null;
+      state.authed = true;
+      if (res.backup_code_used) {
+        toast(t("login.2fa.backup_used", { n: res.backup_codes_remaining }), "info");
+      }
+      await bootAuthed();
+    } catch (err) {
+      errBox.textContent = err.message;
+      errBox.classList.add("visible");
+      btn.disabled = false;
     }
   });
 }
@@ -559,18 +948,15 @@ function renderDashboardCards() {
   const grid = el("stat-grid");
   if (!grid) return;
   const d = state.ddns;
-  const ipv4 = d ? (d.ipv4 || null) : null;
-  const ipv6 = d ? (d.ipv6 || null) : null;
   const loading = state.ddnsLoading || d === null;
   grid.innerHTML = `
     <div class="stat-card">
       <div class="stat-label">${I.globe} ${esc(t("dash.ipv4"))}</div>
-      <div class="stat-value ${!ipv4 ? "na" : ""}">${loading ? '<div class="spinner small"></div>' : esc(ipv4 || (d && d.ipv4_error) || t("dash.na"))}</div>
-      ${d && d.configured === false ? "" : ""}
+      <div class="stat-value ${!(d && d.ipv4) ? "na" : ""}">${loading ? '<div class="spinner small"></div>' : esc((d && d.ipv4) || (d && d.ipv4_error) || t("dash.na"))}</div>
     </div>
     <div class="stat-card">
       <div class="stat-label">${I.globe} ${esc(t("dash.ipv6"))}</div>
-      <div class="stat-value ${!ipv6 ? "na" : ""}">${loading ? '<div class="spinner small"></div>' : esc(ipv6 || (d && d.ipv6_error) || t("dash.na"))}</div>
+      <div class="stat-value ${!(d && d.ipv6) ? "na" : ""}">${loading ? '<div class="spinner small"></div>' : esc((d && d.ipv6) || (d && d.ipv6_error) || t("dash.na"))}</div>
     </div>
     <div class="stat-card">
       <div class="stat-label">${I.dns} ${esc(t("dash.zones"))}</div>
@@ -601,19 +987,17 @@ function renderDashboardCards() {
     return `<tr>
       <td class="name-cell">${esc(dom.domain)}</td>
       <td><span class="badge">${esc(dom.record_type)}</span></td>
-      <td class="mono">${esc(dom.detected_ip || "—")}</td>
-      <td class="mono">${esc(dom.dns_ips.join(", ") || "—")}</td>
+      <td class="mono">${esc(dom.detected_ip || "-")}</td>
+      <td class="mono">${esc(dom.dns_ips.join(", ") || "-")}</td>
       <td>${statusBadge}${dom.error ? `<div class="cell-muted u-err-detail">${esc(dom.error)}</div>` : ""}</td>
     </tr>`;
   }).join("");
   section.innerHTML = `
     <div class="card">
       <div class="toolbar">
-        <div>
-          <div class="card-title">${esc(t("dash.ddns.title"))}</div>
-        </div>
+        <div class="card-title u-mb0">${esc(t("dash.ddns.title"))}</div>
         <div class="u-flex1"></div>
-        <button class="btn ghost sm" id="ddns-refresh">${I.refresh} ${esc(t("topbar.refresh"))}</button>
+        <button class="btn ghost sm" id="ddns-refresh">${I.refresh} ${esc(t("records.refresh"))}</button>
         <button class="btn primary sm" id="ddns-update">${I.bolt} ${esc(t("dash.ddns.update_now"))}</button>
       </div>
       <div class="table-wrap">
@@ -691,10 +1075,9 @@ function filteredRecords() {
 function renderRecords() {
   const page = el("page");
   if (state.zones.length === 0) {
-    page.innerHTML = `<div class="card"><div class="empty-state">${I.file}<h4>${esc(t("records.empty.title"))}</h4><p>No zones available for this API token.</p></div></div>`;
+    page.innerHTML = `<div class="card"><div class="empty-state">${I.file}<h4>${esc(t("records.empty.title"))}</h4><p>${esc(t("records.no_zones"))}</p></div></div>`;
     return;
   }
-  // Records are stale (first visit or zone switch) — fetch, then re-render.
   if (state.zoneId && state.recordsZoneId !== state.zoneId && !state.recordsLoading) {
     loadRecords()
       .then(renderRecords)
@@ -710,12 +1093,8 @@ function renderRecords() {
       </div>
     </div>
     <div class="card">
-      <div class="toolbar">
+      <div class="toolbar" id="records-toolbar">
         <div class="search-box">${I.search}<input class="input" id="search-input" placeholder="${esc(t("records.search"))}" value="${esc(state.search)}"></div>
-        <select class="select" id="type-filter">
-          <option value="">${esc(t("records.all_types"))}</option>
-          ${RECORD_TYPES.map((tp) => `<option value="${tp}" ${state.typeFilter === tp ? "selected" : ""}>${tp}</option>`).join("")}
-        </select>
         <div class="u-flex1"></div>
         <div class="dropdown">
           <button class="btn" id="columns-btn">${I.columns} ${esc(t("records.columns"))}</button>
@@ -724,7 +1103,7 @@ function renderRecords() {
             ${COLUMN_ORDER.map((c) => `<button class="menu-item" data-col="${c}"><span class="check">${state.columns[c] ? I.check : ""}</span>${esc(t("col." + c))}</button>`).join("")}
           </div>
         </div>
-        <button class="btn icon" id="refresh-btn" title="${esc(t("topbar.refresh"))}">${I.refresh}</button>
+        <button class="btn icon" id="refresh-btn" title="Refresh">${I.refresh}</button>
       </div>
       <div class="bulkbar" id="bulkbar">
         <span id="bulk-count"></span>
@@ -738,13 +1117,16 @@ function renderRecords() {
       <div class="pagination" id="pagination"></div>
     </div>`;
 
+  // Type filter (modern select)
+  const typeFilterSelect = mselect({
+    options: [{ value: "", label: t("records.all_types") }, ...RECORD_TYPES.map((tp) => ({ value: tp, label: tp }))],
+    value: state.typeFilter,
+    onChange: (v) => { state.typeFilter = v; state.page = 1; renderRecordsTable(); },
+  });
+  el("records-toolbar").insertBefore(typeFilterSelect, el("records-toolbar").children[1]);
+
   el("search-input").addEventListener("input", (e) => {
     state.search = e.target.value;
-    state.page = 1;
-    renderRecordsTable();
-  });
-  el("type-filter").addEventListener("change", (e) => {
-    state.typeFilter = e.target.value;
     state.page = 1;
     renderRecordsTable();
   });
@@ -753,7 +1135,7 @@ function renderRecords() {
     b.addEventListener("click", () => {
       state.columns[b.dataset.col] = !state.columns[b.dataset.col];
       localStorage.setItem("cfddns.columns", JSON.stringify(state.columns));
-      closeAllMenus();
+      closeMSelects();
       renderRecords();
     })
   );
@@ -821,14 +1203,14 @@ function renderRecordsTable() {
     if (c.proxy) {
       if (r.proxiable) {
         const on = !!r.proxied;
-        cells.push(`<td><button class="cloud-btn ${on ? "on" : "off"}" data-proxy="${esc(r.id)}" data-proxy-state="${on}" title="${esc(on ? t("proxy.proxied") : t("proxy.dns_only"))}">${on ? I.cloudFill : I.cloud}<span>${esc(on ? t("proxy.proxied") : t("proxy.dns_only"))}</span></button></td>`);
+        cells.push(`<td><span class="proxy-pill ${on ? "on" : "off"}">${on ? I.cloudFill : I.cloud}<span>${esc(on ? t("proxy.proxied") : t("proxy.dns_only"))}</span></span></td>`);
       } else {
-        cells.push(`<td><span class="cloud-btn disabled" title="${esc(t("proxy.na"))}">${I.cloud}<span class="cell-muted">—</span></span></td>`);
+        cells.push(`<td><span class="proxy-pill" title="${esc(t("proxy.na"))}">${I.cloud}<span class="cell-muted">-</span></span></td>`);
       }
     }
     if (c.ttl) cells.push(`<td>${esc(fmtTtl(r.ttl))}</td>`);
-    if (c.tags) cells.push(`<td class="truncate">${(r.tags || []).map((tag) => `<span class="tag-chip">${esc(tag)}</span>`).join("") || '<span class="cell-muted">—</span>'}</td>`);
-    if (c.comment) cells.push(`<td class="truncate cell-muted" title="${esc(r.comment || "")}">${esc(r.comment || "—")}</td>`);
+    if (c.tags) cells.push(`<td class="truncate">${(r.tags || []).map((tag) => `<span class="tag-chip">${esc(tag)}</span>`).join("") || '<span class="cell-muted">-</span>'}</td>`);
+    if (c.comment) cells.push(`<td class="truncate cell-muted" title="${esc(r.comment || "")}">${esc(r.comment || "-")}</td>`);
     if (c.updated) cells.push(`<td class="cell-muted u-nowrap">${esc(fmtDate(r.modified_on))}</td>`);
     if (c.created) cells.push(`<td class="cell-muted u-nowrap">${esc(fmtDate(r.created_on))}</td>`);
     cells.push(`<td class="u-nowrap">
@@ -842,7 +1224,6 @@ function renderRecordsTable() {
     ? `<div class="empty-state">${I.file}<h4>${esc(t("records.empty.title"))}</h4><p>${esc(t("records.empty.desc"))}</p></div>`
     : `<table class="data"><thead><tr>${headCols.join("")}</tr></thead><tbody>${bodyRows}</tbody></table>`;
 
-  // Wire events
   const selectAll = el("select-all");
   if (selectAll) {
     const pageIds = rows.map((r) => r.id);
@@ -876,25 +1257,6 @@ function renderRecordsTable() {
       try { await navigator.clipboard.writeText(td.dataset.copy); toast(t("common.copied")); } catch { /* clipboard unavailable */ }
     })
   );
-  wrap.querySelectorAll("[data-proxy]").forEach((btn) =>
-    btn.addEventListener("click", async () => {
-      const id = btn.dataset.proxy;
-      const on = btn.dataset.proxyState === "true";
-      btn.disabled = true;
-      try {
-        await api(`/api/zones/${state.zoneId}/records/bulk`, {
-          method: "POST",
-          json: { action: "update", ids: [id], patch: { proxied: !on } },
-        });
-        const rec = state.records.find((r) => r.id === id);
-        if (rec) rec.proxied = !on;
-        renderRecordsTable();
-      } catch (e) {
-        toast(e.message, "error");
-        btn.disabled = false;
-      }
-    })
-  );
   wrap.querySelectorAll("[data-edit]").forEach((btn) =>
     btn.addEventListener("click", () => {
       const rec = state.records.find((r) => r.id === btn.dataset.edit);
@@ -921,19 +1283,21 @@ function renderPagination(total, from, shown) {
     <span>${esc(t("records.showing", { from: from + 1, to: from + shown, total }))}</span>
     <div class="spacer"></div>
     <span>${esc(t("records.per_page"))}</span>
-    <select class="select" id="per-page">
-      ${[20, 50, 100].map((n) => `<option value="${n}" ${state.perPage === n ? "selected" : ""}>${n}</option>`).join("")}
-    </select>
+    <span id="per-page-slot"></span>
     <div class="page-btns">
       <button class="btn icon sm" id="page-prev" ${state.page <= 1 ? "disabled" : ""}>${I.chevronLeft}</button>
       <button class="btn icon sm" id="page-next" ${state.page >= pages ? "disabled" : ""}>${I.chevronRight}</button>
     </div>`;
-  el("per-page").addEventListener("change", (e) => {
-    state.perPage = parseInt(e.target.value, 10);
-    localStorage.setItem("cfddns.perPage", String(state.perPage));
-    state.page = 1;
-    renderRecordsTable();
-  });
+  el("per-page-slot").replaceWith(mselect({
+    options: [20, 50, 100].map((n) => ({ value: String(n), label: String(n) })),
+    value: String(state.perPage),
+    onChange: (v) => {
+      state.perPage = parseInt(v, 10);
+      localStorage.setItem("cfddns.perPage", String(state.perPage));
+      state.page = 1;
+      renderRecordsTable();
+    },
+  }));
   el("page-prev").addEventListener("click", () => { state.page--; renderRecordsTable(); });
   el("page-next").addEventListener("click", () => { state.page++; renderRecordsTable(); });
 }
@@ -982,34 +1346,53 @@ function typeSpecificFields(type, rec) {
   if (type === "MX") {
     return `
       <label class="field"><span>${esc(t("modal.content.MX"))} *</span>
-        <input class="input" id="f-content" value="${esc(rec ? rec.content : "")}" placeholder="mail.example.com" required></label>
+        <input class="input" id="f-content" value="${esc(rec ? rec.content : "")}" placeholder="mail.example.com" data-v="domain">
+        <div class="field-error" data-err="f-content">${esc(t("modal.invalid.domain"))}</div></label>
       <label class="field"><span>${esc(t("modal.priority"))} *</span>
-        <input class="input" id="f-priority" type="number" min="0" max="65535" value="${esc(rec && rec.priority != null ? rec.priority : 10)}" required></label>`;
+        <input class="input" id="f-priority" type="number" min="0" max="65535" value="${esc(rec && rec.priority != null ? rec.priority : 10)}">
+        <div class="field-error" data-err="f-priority">${esc(t("modal.invalid.number", { min: 0, max: 65535 }))}</div></label>`;
   }
   if (type === "SRV") {
     return `
       <div class="form-grid">
         <label class="field"><span>${esc(t("modal.srv.priority"))} *</span>
-          <input class="input" id="f-srv-priority" type="number" min="0" max="65535" value="${esc(d.priority ?? 0)}" required></label>
+          <input class="input" id="f-srv-priority" type="number" min="0" max="65535" value="${esc(d.priority ?? 0)}">
+          <div class="field-error" data-err="f-srv-priority">${esc(t("modal.invalid.number", { min: 0, max: 65535 }))}</div></label>
         <label class="field"><span>${esc(t("modal.srv.weight"))} *</span>
-          <input class="input" id="f-srv-weight" type="number" min="0" max="65535" value="${esc(d.weight ?? 5)}" required></label>
+          <input class="input" id="f-srv-weight" type="number" min="0" max="65535" value="${esc(d.weight ?? 5)}">
+          <div class="field-error" data-err="f-srv-weight">${esc(t("modal.invalid.number", { min: 0, max: 65535 }))}</div></label>
         <label class="field"><span>${esc(t("modal.srv.port"))} *</span>
-          <input class="input" id="f-srv-port" type="number" min="0" max="65535" value="${esc(d.port ?? "")}" placeholder="25565" required></label>
+          <input class="input" id="f-srv-port" type="number" min="0" max="65535" value="${esc(d.port ?? "")}" placeholder="25565">
+          <div class="field-error" data-err="f-srv-port">${esc(t("modal.invalid.number", { min: 0, max: 65535 }))}</div></label>
         <label class="field"><span>${esc(t("modal.srv.target"))} *</span>
-          <input class="input" id="f-srv-target" value="${esc(d.target ?? "")}" placeholder="mc.example.com" required></label>
+          <input class="input" id="f-srv-target" value="${esc(d.target ?? "")}" placeholder="mc.example.com" data-v="domain">
+          <div class="field-error" data-err="f-srv-target">${esc(t("modal.invalid.domain"))}</div></label>
       </div>`;
   }
   if (type === "CAA") {
     return `
       <div class="form-grid">
         <label class="field"><span>${esc(t("modal.caa.flags"))} *</span>
-          <input class="input" id="f-caa-flags" type="number" min="0" max="255" value="${esc(d.flags ?? 0)}" required></label>
-        <label class="field"><span>${esc(t("modal.caa.tag"))} *</span>
-          <select class="select" id="f-caa-tag">
-            ${["issue", "issuewild", "iodef"].map((tag) => `<option ${d.tag === tag ? "selected" : ""}>${tag}</option>`).join("")}
-          </select></label>
+          <input class="input" id="f-caa-flags" type="number" min="0" max="255" value="${esc(d.flags ?? 0)}">
+          <div class="field-error" data-err="f-caa-flags">${esc(t("modal.invalid.number", { min: 0, max: 255 }))}</div></label>
+        <div class="field"><span>${esc(t("modal.caa.tag"))} *</span><span id="f-caa-tag-slot"></span></div>
         <label class="field full"><span>${esc(t("modal.caa.value"))} *</span>
-          <input class="input" id="f-caa-value" value="${esc(d.value ?? "")}" placeholder="letsencrypt.org" required></label>
+          <input class="input" id="f-caa-value" value="${esc(d.value ?? "")}" placeholder="letsencrypt.org">
+          <div class="field-error" data-err="f-caa-value">${esc(t("modal.required"))}</div></label>
+      </div>`;
+  }
+  if (type === "HTTPS" || type === "SVCB") {
+    return `
+      <div class="form-grid">
+        <label class="field"><span>${esc(t("modal.svc.priority"))} *</span>
+          <input class="input" id="f-svc-priority" type="number" min="0" max="65535" value="${esc(d.priority ?? 1)}">
+          <div class="field-error" data-err="f-svc-priority">${esc(t("modal.invalid.number", { min: 0, max: 65535 }))}</div></label>
+        <label class="field"><span>${esc(t("modal.svc.target"))} *</span>
+          <input class="input" id="f-svc-target" value="${esc(d.target ?? "")}" placeholder=". or example.com">
+          <div class="field-error" data-err="f-svc-target">${esc(t("modal.required"))}</div></label>
+        <label class="field full"><span>${esc(t("modal.svc.value"))}</span>
+          <input class="input" id="f-svc-value" value="${esc(d.value ?? "")}" placeholder='alpn="h3,h2"'>
+          <div class="field-hint">${esc(t("modal.svc.value.hint"))}</div></label>
       </div>`;
   }
   const labelKey = `modal.content.${type}`;
@@ -1017,10 +1400,51 @@ function typeSpecificFields(type, rec) {
   const placeholders = {
     A: "192.0.2.1", AAAA: "2001:db8::1", CNAME: "example.com",
     TXT: "v=spf1 include:example.com ~all", NS: "ns1.example.com", PTR: "example.com",
-    HTTPS: "1 . alpn=h3", SVCB: "1 . alpn=h3",
   };
+  const validators = { A: "ipv4", AAAA: "ipv6", CNAME: "domain", NS: "domain", PTR: "domain" };
+  const errKeys = { A: "modal.invalid.ipv4", AAAA: "modal.invalid.ipv6", CNAME: "modal.invalid.domain", NS: "modal.invalid.domain", PTR: "modal.invalid.domain" };
+  const v = validators[type];
   return `<label class="field"><span>${esc(label)} *</span>
-    <input class="input" id="f-content" value="${esc(rec ? rec.content : "")}" placeholder="${esc(placeholders[type] || "")}" required></label>`;
+    <input class="input" id="f-content" value="${esc(rec ? rec.content : "")}" placeholder="${esc(placeholders[type] || "")}" ${v ? `data-v="${v}"` : ""}>
+    ${v ? `<div class="field-error" data-err="f-content">${esc(t(errKeys[type]))}</div>` : `<div class="field-error" data-err="f-content">${esc(t("modal.required"))}</div>`}</label>`;
+}
+
+function wireTypeSelectValidation(modal, type) {
+  // CAA tag modern select.
+  const tagSlot = modal.querySelector("#f-caa-tag-slot");
+  if (tagSlot) {
+    const current = (modal.dataset.caaTag || "issue");
+    tagSlot.replaceWith(mselect({
+      id: "f-caa-tag-slot",
+      options: ["issue", "issuewild", "iodef"].map((tag) => ({ value: tag, label: tag })),
+      value: current,
+      onChange: (v) => { modal.dataset.caaTag = v; },
+    }));
+  }
+  // Live validation.
+  modal.querySelectorAll("[data-v]").forEach((input) => {
+    input.addEventListener("input", () => markValidity(modal, input));
+  });
+  if (type === "SRV") {
+    modal.querySelectorAll("#f-srv-priority, #f-srv-weight, #f-srv-port").forEach((input) =>
+      input.addEventListener("input", () => markValidity(modal, input))
+    );
+  }
+}
+
+function markValidity(modal, input) {
+  const kind = input.dataset.v;
+  let ok = true;
+  const val = input.value.trim();
+  if (kind === "ipv4") ok = V.ipv4(val);
+  else if (kind === "ipv6") ok = V.ipv6(val);
+  else if (kind === "domain") ok = val !== "" && V.domain(val);
+  else if (input.type === "number") ok = V.uint(val, Number(input.min || 0), Number(input.max || 65535));
+  else ok = val !== "";
+  input.classList.toggle("invalid", !ok && val !== "");
+  const err = modal.querySelector(`[data-err="${input.id}"]`);
+  if (err) err.classList.toggle("visible", !ok && val !== "");
+  return ok;
 }
 
 function openRecordModal(rec) {
@@ -1028,32 +1452,27 @@ function openRecordModal(rec) {
   const zone = currentZone();
   const zoneName = zone ? zone.name : "";
   const type = rec ? rec.type : "A";
+  const initialProxied = rec ? !!rec.proxied : false;
 
   const modal = openModal(`
     ${modalHead(isEdit ? t("modal.edit.title") : t("modal.add.title"))}
     <div class="modal-body">
+      <div class="zone-suffix-banner">${I.dns} <span>${esc(t("modal.zone"))}:</span> <strong>${esc(zoneName)}</strong></div>
       <div class="form-grid">
-        <label class="field"><span>${esc(t("modal.type"))}</span>
-          <select class="select" id="f-type" ${isEdit ? "disabled" : ""}>
-            ${RECORD_TYPES.map((tp) => `<option value="${tp}" ${tp === type ? "selected" : ""}>${tp}</option>`).join("")}
-          </select></label>
+        <div class="field"><span>${esc(t("modal.type"))}</span><span id="f-type-slot"></span></div>
         <label class="field"><span>${esc(t("modal.name"))} *</span>
-          <div class="input-group">
-            <input class="input" id="f-name" value="${esc(rec ? shortName(rec.name, zoneName) : "")}" placeholder="@" required ${isEdit ? "disabled" : ""}>
-            <span class="suffix">.${esc(zoneName)}</span>
-          </div>
-          <div class="field-hint">${esc(t("modal.name.hint"))}</div></label>
+          <input class="input" id="f-name" value="${esc(rec ? shortName(rec.name, zoneName) : "")}" placeholder="subdomain" ${isEdit ? "disabled" : ""}>
+          <div class="field-hint">${esc(t("modal.name.hint", { zone: zoneName }))}</div>
+          <div class="field-error" data-err="f-name">${esc(t("modal.invalid.name"))}</div></label>
       </div>
       <div id="type-fields">${typeSpecificFields(type, rec)}</div>
       <div class="form-grid">
-        <label class="field"><span>${esc(t("modal.ttl"))}</span>
-          <select class="select" id="f-ttl">
-            ${TTL_OPTIONS.map(([v, lbl]) => `<option value="${v}" ${rec && rec.ttl === v ? "selected" : (!rec && v === 1 ? "selected" : "")}>${v === 1 ? t("ttl.auto") : lbl}</option>`).join("")}
-          </select></label>
+        <div class="field"><span>${esc(t("modal.ttl"))}</span><span id="f-ttl-slot"></span>
+          <div class="field-hint u-hidden" id="f-ttl-hint">${esc(t("modal.ttl.proxied"))}</div></div>
         <div class="field">
           <span>&nbsp;</span>
-          <div class="switch-row u-mb0">
-            <label class="switch"><input type="checkbox" id="f-proxied" ${rec && rec.proxied ? "checked" : ""} ${PROXIABLE.includes(type) ? "" : "disabled"}><span class="track"></span></label>
+          <div class="switch-row">
+            <label class="switch"><input type="checkbox" id="f-proxied" ${initialProxied ? "checked" : ""} ${PROXIABLE.includes(type) ? "" : "disabled"}><span class="track"></span></label>
             <span class="lbl">${esc(t("modal.proxy"))}</span>
           </div>
         </div>
@@ -1069,20 +1488,59 @@ function openRecordModal(rec) {
       <button class="btn primary" id="f-save">${esc(isEdit ? t("modal.save") : t("modal.create"))}</button>
     </div>`, true);
 
-  const typeSel = modal.querySelector("#f-type");
-  const fieldsBox = modal.querySelector("#type-fields");
+  modal.dataset.caaTag = (rec && rec.data && rec.data.tag) || "issue";
+  let currentType = type;
+
+  // Type modern select.
+  const typeSlot = modal.querySelector("#f-type-slot");
+  typeSlot.replaceWith(mselect({
+    id: "f-type-slot",
+    options: RECORD_TYPES.map((tp) => ({ value: tp, label: tp })),
+    value: type,
+    disabled: isEdit,
+    onChange: (v) => {
+      currentType = v;
+      modal.querySelector("#type-fields").innerHTML = typeSpecificFields(v, null);
+      const ok = PROXIABLE.includes(v);
+      const proxiedInput = modal.querySelector("#f-proxied");
+      proxiedInput.disabled = !ok;
+      if (!ok) proxiedInput.checked = false;
+      syncTtlAvailability();
+      wireTypeSelectValidation(modal, v);
+    },
+  }));
+
+  // TTL modern select.
+  const ttlSlot = modal.querySelector("#f-ttl-slot");
+  const ttlSelect = mselect({
+    id: "f-ttl-slot",
+    options: TTL_OPTIONS.map(([v, lbl]) => ({ value: String(v), label: v === 1 ? t("ttl.auto") : lbl })),
+    value: String(rec ? rec.ttl ?? 1 : 1),
+  });
+  ttlSlot.replaceWith(ttlSelect);
+
   const proxiedInput = modal.querySelector("#f-proxied");
-  typeSel.addEventListener("change", () => {
-    fieldsBox.innerHTML = typeSpecificFields(typeSel.value, null);
-    const ok = PROXIABLE.includes(typeSel.value);
-    proxiedInput.disabled = !ok;
-    if (!ok) proxiedInput.checked = false;
+  function syncTtlAvailability() {
+    const proxied = proxiedInput.checked && PROXIABLE.includes(currentType);
+    ttlSelect.msetDisabled(proxied);
+    if (proxied) ttlSelect.mset("1");
+    modal.querySelector("#f-ttl-hint").classList.toggle("u-hidden", !proxied);
+  }
+  proxiedInput.addEventListener("change", syncTtlAvailability);
+  syncTtlAvailability();
+  wireTypeSelectValidation(modal, currentType);
+
+  // Name validation.
+  const nameInput = modal.querySelector("#f-name");
+  nameInput.addEventListener("input", () => {
+    const ok = currentType === "SRV" ? V.srvName(nameInput.value) : V.recordName(nameInput.value);
+    nameInput.classList.toggle("invalid", !ok && nameInput.value !== "");
+    modal.querySelector('[data-err="f-name"]').classList.toggle("visible", !ok && nameInput.value !== "");
   });
 
   modal.querySelector("#f-save").addEventListener("click", async () => {
     const saveBtn = modal.querySelector("#f-save");
-    const tp = isEdit ? rec.type : typeSel.value;
-    const payload = buildPayload(modal, tp, zoneName, isEdit ? rec : null);
+    const payload = buildPayload(modal, currentType, zoneName, isEdit ? rec : null, ttlSelect);
     if (!payload) return;
     saveBtn.disabled = true;
     saveBtn.innerHTML = `<div class="spinner small"></div>`;
@@ -1113,15 +1571,33 @@ function shortName(fqdn, zoneName) {
 function fullName(short, zoneName) {
   const s = short.trim().toLowerCase();
   if (s === "@" || s === "") return zoneName;
-  if (s.endsWith(`.${zoneName}`)) return s;
+  if (s.endsWith(`.${zoneName}`) || s === zoneName) return s;
   return `${s}.${zoneName}`;
 }
 
-function buildPayload(modal, type, zoneName, rec) {
+function buildPayload(modal, type, zoneName, rec, ttlSelect) {
   const val = (sel) => { const x = modal.querySelector(sel); return x ? x.value.trim() : ""; };
-  const name = isEditNameDisabled(modal) ? (rec ? rec.name : "") : fullName(val("#f-name"), zoneName);
-  const ttl = parseInt(val("#f-ttl"), 10) || 1;
+  const isEdit = !!rec;
+
+  // Validate all visible inputs first.
+  let allOk = true;
+  modal.querySelectorAll("#type-fields [data-v], #type-fields input[type=number]").forEach((input) => {
+    if (!markValidity(modal, input)) allOk = false;
+  });
+  const nameRaw = isEdit ? "" : val("#f-name");
+  if (!isEdit) {
+    const nameOk = type === "SRV" ? V.srvName(nameRaw) : V.recordName(nameRaw);
+    if (!nameOk) {
+      modal.querySelector("#f-name").classList.add("invalid");
+      modal.querySelector('[data-err="f-name"]').classList.add("visible");
+      allOk = false;
+    }
+  }
+  if (!allOk) { toast(t("modal.invalid"), "error"); return null; }
+
+  const name = isEdit ? rec.name : fullName(nameRaw, zoneName);
   const proxied = PROXIABLE.includes(type) ? modal.querySelector("#f-proxied").checked : false;
+  const ttl = proxied ? 1 : parseInt(ttlSelect.mget(), 10) || 1;
   const comment = val("#f-comment") || null;
   const tagsRaw = val("#f-tags");
   const tags = tagsRaw ? tagsRaw.split(",").map((x) => x.trim()).filter(Boolean) : null;
@@ -1130,33 +1606,26 @@ function buildPayload(modal, type, zoneName, rec) {
   if (type === "MX") {
     payload.content = val("#f-content");
     payload.priority = parseInt(val("#f-priority"), 10);
-    if (!payload.content || isNaN(payload.priority)) { toast(t("modal.required"), "error"); return null; }
   } else if (type === "SRV") {
-    const data = {
+    payload.data = {
       priority: parseInt(val("#f-srv-priority"), 10),
       weight: parseInt(val("#f-srv-weight"), 10),
       port: parseInt(val("#f-srv-port"), 10),
       target: val("#f-srv-target"),
     };
-    if ([data.priority, data.weight, data.port].some(isNaN) || !data.target) { toast(t("modal.required"), "error"); return null; }
-    payload.data = data;
-    payload.content = `${data.weight} ${data.port} ${data.target}`;
+    payload.content = `${payload.data.weight} ${payload.data.port} ${payload.data.target}`;
   } else if (type === "CAA") {
-    const data = { flags: parseInt(val("#f-caa-flags"), 10), tag: val("#f-caa-tag"), value: val("#f-caa-value") };
-    if (isNaN(data.flags) || !data.value) { toast(t("modal.required"), "error"); return null; }
-    payload.data = data;
-    payload.content = `${data.flags} ${data.tag} "${data.value}"`;
+    payload.data = { flags: parseInt(val("#f-caa-flags"), 10), tag: modal.dataset.caaTag || "issue", value: val("#f-caa-value") };
+    payload.content = `${payload.data.flags} ${payload.data.tag} "${payload.data.value}"`;
+  } else if (type === "HTTPS" || type === "SVCB") {
+    payload.data = { priority: parseInt(val("#f-svc-priority"), 10), target: val("#f-svc-target") };
+    const svcValue = val("#f-svc-value");
+    if (svcValue) payload.data.value = svcValue;
+    payload.content = `${payload.data.priority} ${payload.data.target}${svcValue ? " " + svcValue : ""}`;
   } else {
     payload.content = val("#f-content");
-    if (!payload.content) { toast(t("modal.required"), "error"); return null; }
   }
-  if (!payload.name) { toast(t("modal.required"), "error"); return null; }
   return payload;
-}
-
-function isEditNameDisabled(modal) {
-  const n = modal.querySelector("#f-name");
-  return n && n.disabled;
 }
 
 /* ----- Bulk edit ----- */
@@ -1171,25 +1640,11 @@ function openBulkEditModal() {
     ${modalHead(t("modal.bulk.title", { n: selected.length }))}
     <div class="modal-body">
       <div class="form-grid">
-        <label class="field"><span>${esc(t("modal.bulk.ttl"))}</span>
-          <select class="select" id="b-ttl">
-            <option value="">${esc(t("modal.bulk.keep"))}</option>
-            ${TTL_OPTIONS.map(([v, lbl]) => `<option value="${v}">${v === 1 ? t("ttl.auto") : lbl}</option>`).join("")}
-          </select></label>
-        <label class="field"><span>${esc(t("modal.bulk.proxy"))}</span>
-          <select class="select" id="b-proxied" ${allProxiable ? "" : "disabled"}>
-            <option value="">${esc(t("modal.bulk.keep"))}</option>
-            <option value="true">${esc(t("modal.bulk.proxy.on"))}</option>
-            <option value="false">${esc(t("modal.bulk.proxy.off"))}</option>
-          </select></label>
+        <div class="field"><span>${esc(t("modal.bulk.ttl"))}</span><span id="b-ttl-slot"></span></div>
+        <div class="field"><span>${esc(t("modal.bulk.proxy"))}</span><span id="b-proxy-slot"></span></div>
       </div>
       ${allProxiable ? "" : `<div class="login-error visible u-mb16">${esc(t("modal.bulk.proxy.blocked"))} (${esc(nonProxiableTypes.join(", "))})</div>`}
-      <label class="field"><span>${esc(t("modal.bulk.comment"))}</span>
-        <select class="select" id="b-comment-mode">
-          <option value="keep">${esc(t("modal.bulk.comment.keep"))}</option>
-          <option value="replace">${esc(t("modal.bulk.comment.replace"))}</option>
-          <option value="clear">${esc(t("modal.bulk.comment.clear"))}</option>
-        </select></label>
+      <div class="field"><span>${esc(t("modal.bulk.comment"))}</span><span id="b-comment-mode-slot"></span></div>
       <label class="field u-hidden" id="b-comment-wrap">
         <input class="input" id="b-comment" maxlength="100"></label>
     </div>
@@ -1198,22 +1653,49 @@ function openBulkEditModal() {
       <button class="btn primary" id="b-apply">${esc(t("modal.bulk.apply", { n: selected.length }))}</button>
     </div>`);
 
-  const modeSel = modal.querySelector("#b-comment-mode");
-  const commentWrap = modal.querySelector("#b-comment-wrap");
-  modeSel.addEventListener("change", () => {
-    commentWrap.classList.toggle("u-hidden", modeSel.value !== "replace");
+  const ttlSelect = mselect({
+    options: [{ value: "", label: t("modal.bulk.keep") }, ...TTL_OPTIONS.map(([v, lbl]) => ({ value: String(v), label: v === 1 ? t("ttl.auto") : lbl }))],
+    value: "",
   });
+  modal.querySelector("#b-ttl-slot").replaceWith(ttlSelect);
+
+  const proxySelect = mselect({
+    options: [
+      { value: "", label: t("modal.bulk.keep") },
+      { value: "true", label: t("modal.bulk.proxy.on") },
+      { value: "false", label: t("modal.bulk.proxy.off") },
+    ],
+    value: "",
+    disabled: !allProxiable,
+  });
+  modal.querySelector("#b-proxy-slot").replaceWith(proxySelect);
+
+  let commentMode = "keep";
+  const commentWrap = modal.querySelector("#b-comment-wrap");
+  const commentModeSelect = mselect({
+    options: [
+      { value: "keep", label: t("modal.bulk.comment.keep") },
+      { value: "replace", label: t("modal.bulk.comment.replace") },
+      { value: "clear", label: t("modal.bulk.comment.clear") },
+    ],
+    value: "keep",
+    onChange: (v) => {
+      commentMode = v;
+      commentWrap.classList.toggle("u-hidden", v !== "replace");
+    },
+  });
+  modal.querySelector("#b-comment-mode-slot").replaceWith(commentModeSelect);
 
   modal.querySelector("#b-apply").addEventListener("click", async () => {
     const applyBtn = modal.querySelector("#b-apply");
     const patch = {};
-    const ttlV = modal.querySelector("#b-ttl").value;
+    const ttlV = ttlSelect.mget();
     if (ttlV) patch.ttl = parseInt(ttlV, 10);
-    const proxV = modal.querySelector("#b-proxied").value;
+    const proxV = proxySelect.mget();
     if (proxV) patch.proxied = proxV === "true";
-    if (modeSel.value !== "keep") {
+    if (commentMode !== "keep") {
       patch.comment_set = true;
-      patch.comment = modeSel.value === "replace" ? modal.querySelector("#b-comment").value.trim() : "";
+      patch.comment = commentMode === "replace" ? modal.querySelector("#b-comment").value.trim() : "";
     }
     if (Object.keys(patch).length === 0) { closeModal(); return; }
     applyBtn.disabled = true;
@@ -1280,6 +1762,7 @@ function openImportModal() {
         <div class="u-mt8" id="drop-label">${t("modal.import.drop")}</div>
       </div>
       <input type="file" id="file-input" accept=".txt,.zone,text/plain" class="u-hidden">
+      <div class="field-error" id="import-error"></div>
     </div>
     <div class="modal-foot">
       <button class="btn" data-close>${esc(t("modal.cancel"))}</button>
@@ -1291,18 +1774,31 @@ function openImportModal() {
   const fi = modal.querySelector("#file-input");
   const submit = modal.querySelector("#i-submit");
   const label = modal.querySelector("#drop-label");
+  const errBox = modal.querySelector("#import-error");
+
+  function setFile(f) {
+    errBox.classList.remove("visible");
+    if (!f) return;
+    if (f.size > 15 * 1024 * 1024) {
+      errBox.textContent = "File too large (max 15 MB).";
+      errBox.classList.add("visible");
+      return;
+    }
+    file = f;
+    label.textContent = t("modal.import.file_selected", { name: f.name, size: fmtBytes(f.size) });
+    submit.disabled = false;
+  }
 
   dz.addEventListener("click", () => fi.click());
-  dz.addEventListener("dragover", (e) => { e.preventDefault(); dz.classList.add("drag"); });
-  dz.addEventListener("dragleave", () => dz.classList.remove("drag"));
+  dz.addEventListener("dragover", (e) => { e.preventDefault(); e.stopPropagation(); dz.classList.add("drag"); });
+  dz.addEventListener("dragleave", (e) => { e.preventDefault(); dz.classList.remove("drag"); });
   dz.addEventListener("drop", (e) => {
     e.preventDefault();
+    e.stopPropagation();
     dz.classList.remove("drag");
-    if (e.dataTransfer.files.length) { file = e.dataTransfer.files[0]; label.textContent = file.name; submit.disabled = false; }
+    if (e.dataTransfer.files && e.dataTransfer.files.length) setFile(e.dataTransfer.files[0]);
   });
-  fi.addEventListener("change", () => {
-    if (fi.files.length) { file = fi.files[0]; label.textContent = file.name; submit.disabled = false; }
-  });
+  fi.addEventListener("change", () => { if (fi.files.length) setFile(fi.files[0]); });
 
   submit.addEventListener("click", async () => {
     if (!file) return;
@@ -1310,14 +1806,29 @@ function openImportModal() {
     submit.innerHTML = `<div class="spinner small"></div>`;
     try {
       const text = await file.text();
+      // Pre-flight: warn early when the file has no DNS lines at all.
+      const hasRecords = /^\S+\s+\d+\s+IN\s+\S+/m.test(text);
+      if (!hasRecords) {
+        errBox.textContent = t("modal.import.empty");
+        errBox.classList.add("visible");
+        submit.disabled = false;
+        submit.innerHTML = `${I.upload} ${esc(t("modal.import.submit"))}`;
+        return;
+      }
       const res = await api(`/api/zones/${state.zoneId}/import?filename=${encodeURIComponent(file.name)}`, {
         method: "POST", raw: text,
       });
-      toast(t("modal.import.result", { added: res.recs_added ?? "?", parsed: res.total_records_parsed ?? "?" }));
+      const added = res.recs_added ?? 0;
+      const parsed = res.total_records_parsed ?? 0;
+      toast(t("modal.import.result", { added, parsed }), added > 0 ? "ok" : "info");
+      if (parsed > added) {
+        toast(t("modal.import.skipped", { n: parsed - added }), "info");
+      }
       closeModal();
       await refreshRecords();
     } catch (e) {
-      toast(e.message, "error");
+      errBox.textContent = e.message;
+      errBox.classList.add("visible");
       submit.disabled = false;
       submit.innerHTML = `${I.upload} ${esc(t("modal.import.submit"))}`;
     }
@@ -1350,15 +1861,51 @@ function renderSettings() {
   page.innerHTML = `
     <div class="settings-grid">
       <div class="card"><div class="card-pad">
-        <div class="card-title">${esc(t("settings.lang.title"))}</div>
-        <div class="card-desc">${esc(t("settings.lang.desc"))}</div>
-        <select class="select u-lang-select" id="settings-lang">
-          ${LANGS.map((l) => `<option value="${l.code}" ${l.code === lang ? "selected" : ""}>${esc(l.name)}</option>`).join("")}
-        </select>
+        <div class="card-title">${I.palette} ${esc(t("settings.appearance.title"))}</div>
+        <div class="card-desc">${esc(t("settings.appearance.desc"))}</div>
+        <div class="settings-row">
+          <div class="grow">
+            <div class="lbl">${esc(t("settings.theme"))}</div>
+          </div>
+          <span id="settings-theme-slot"></span>
+        </div>
+        <div class="settings-sep"></div>
+        <div class="settings-row">
+          <div class="grow">
+            <div class="lbl">${esc(t("settings.lang.title"))}</div>
+            <div class="hint">${esc(t("settings.lang.desc"))}</div>
+          </div>
+          <span id="settings-lang-slot"></span>
+        </div>
+        <div class="settings-sep"></div>
+        <div class="settings-row u-row-start">
+          <div class="grow">
+            <div class="lbl">${esc(t("settings.accent"))}</div>
+            <div class="hint">${esc(t("settings.accent.hint"))}</div>
+            <div class="swatch-row u-mt8" id="accent-row"></div>
+          </div>
+        </div>
+        <div class="settings-sep"></div>
+        <div class="settings-row">
+          <div class="grow">
+            <div class="lbl">${esc(t("settings.icon"))}</div>
+            <div class="hint">${esc(t("settings.icon.hint"))}</div>
+          </div>
+          <img class="icon-preview" id="icon-preview" src="/static/favicon.svg" alt="icon">
+          <button class="btn sm" id="icon-upload">${I.upload} ${esc(t("settings.icon.upload"))}</button>
+          <button class="btn sm ghost" id="icon-reset">${esc(t("settings.icon.reset"))}</button>
+          <input type="file" id="icon-input" accept="image/png,image/jpeg,image/webp,image/gif,image/svg+xml" class="u-hidden">
+        </div>
       </div></div>
 
       <div class="card"><div class="card-pad">
-        <div class="card-title">${I.shield} ${esc(t("settings.token.title"))}</div>
+        <div class="card-title">${I.shield} ${esc(t("settings.security.title"))}</div>
+        <div class="card-desc">${esc(t("settings.security.desc"))}</div>
+        <div id="security-body"></div>
+      </div></div>
+
+      <div class="card"><div class="card-pad">
+        <div class="card-title">${I.key} ${esc(t("settings.token.title"))}</div>
         <div class="card-desc">${esc(t("settings.token.desc"))}</div>
         <ol class="token-steps">
           <li>${t("settings.token.step1")}</li>
@@ -1373,27 +1920,339 @@ function renderSettings() {
       </div></div>
 
       <div class="card"><div class="card-pad">
-        <div class="card-title">${esc(t("settings.security.title"))}</div>
-        <div class="card-desc">${esc(t("settings.security.desc"))}</div>
-        <table class="kv-table">
-          <tr><td>${esc(t("settings.security.session"))}</td><td class="mono">${state.sessionTtl ? `${Math.round(state.sessionTtl / 3600)} h` : "—"}</td></tr>
-          <tr><td>${esc(t("settings.security.password"))}</td><td>${esc(t("settings.security.password.value"))}</td></tr>
-          <tr><td>${esc(t("settings.security.cookies"))}</td><td><span class="cell-muted">${esc(t("settings.security.cookies.hint"))}</span></td></tr>
-        </table>
-      </div></div>
-
-      <div class="card"><div class="card-pad">
         <div class="card-title">${esc(t("settings.about.title"))}</div>
         <table class="kv-table">
           <tr><td>${esc(t("settings.about.version"))}</td><td class="mono">v${esc(state.config ? state.config.version : "?")}</td></tr>
+          <tr><td>${esc(t("settings.about.source"))}</td><td><a href="${esc(state.config?.github || "")}" target="_blank" rel="noopener noreferrer">GitHub</a></td></tr>
           <tr><td>${esc(t("settings.about.upstream"))}</td><td><a href="https://github.com/timothymiller/cloudflare-ddns" target="_blank" rel="noopener noreferrer">cloudflare-ddns</a></td></tr>
         </table>
       </div></div>
     </div>`;
-  el("settings-lang").addEventListener("change", (e) => {
-    lang = e.target.value;
-    localStorage.setItem("cfddns.lang", lang);
-    render();
+
+  // Theme select
+  el("settings-theme-slot").replaceWith(mselect({
+    options: [
+      { value: "system", label: t("settings.theme.system") },
+      { value: "light", label: t("settings.theme.light") },
+      { value: "dark", label: t("settings.theme.dark") },
+    ],
+    value: currentTheme(),
+    onChange: (v) => { setTheme(v); renderTopbarActions(); },
+  }));
+
+  // Language select
+  el("settings-lang-slot").replaceWith(mselect({
+    cls: "u-lang-select",
+    options: LANGS.map((l) => ({ value: l.code, label: l.name })),
+    value: lang,
+    onChange: (v) => { lang = v; localStorage.setItem("cfddns.lang", v); render(); },
+  }));
+
+  renderAccentRow();
+  wireIconSettings();
+  renderSecurityBody();
+}
+
+function renderAccentRow() {
+  const row = el("accent-row");
+  if (!row) return;
+  const current = (state.config && state.config.accent) || "#f6821f";
+  row.innerHTML = "";
+  ACCENT_PRESETS.forEach((color, i) => {
+    const b = document.createElement("button");
+    b.className = `swatch sw-${i} ${current.toLowerCase() === color ? "selected" : ""}`;
+    b.title = color;
+    b.addEventListener("click", () => saveAccent(color));
+    row.appendChild(b);
+  });
+  const picker = document.createElement("input");
+  picker.type = "color";
+  picker.className = "color-input";
+  picker.value = /^#[0-9a-fA-F]{6}$/.test(current) ? current : "#f6821f";
+  picker.title = "Custom color";
+  picker.addEventListener("change", () => saveAccent(picker.value));
+  row.appendChild(picker);
+  const reset = document.createElement("button");
+  reset.className = "btn sm ghost";
+  reset.textContent = "Default";
+  reset.addEventListener("click", () => saveAccent(null));
+  row.appendChild(reset);
+}
+
+async function saveAccent(color) {
+  try {
+    await api("/api/ui/accent", { method: "POST", json: { accent: color } });
+    state.config.accent = color;
+    document.documentElement.style.setProperty("--accent", color || "");
+    if (color) document.documentElement.style.setProperty("--accent", color);
+    else document.documentElement.style.removeProperty("--accent");
+    // Recompute hover color minimally: keep hover as-is (server injects on next load).
+    toast(t("toast.accent"));
+    renderAccentRow();
+  } catch (e) {
+    toast(e.message, "error");
+  }
+}
+
+function wireIconSettings() {
+  const input = el("icon-input");
+  const preview = el("icon-preview");
+  el("icon-upload").addEventListener("click", () => input.click());
+  input.addEventListener("change", async () => {
+    if (!input.files.length) return;
+    const f = input.files[0];
+    if (f.size > 512 * 1024) { toast(t("settings.icon.too_big"), "error"); input.value = ""; return; }
+    const okTypes = ["image/png", "image/jpeg", "image/webp", "image/gif", "image/svg+xml"];
+    if (!okTypes.includes(f.type)) { toast(t("settings.icon.bad_type"), "error"); input.value = ""; return; }
+    try {
+      const buf = await f.arrayBuffer();
+      await api(`/api/ui/icon?mime=${encodeURIComponent(f.type)}`, {
+        method: "POST", raw: buf, rawType: f.type,
+      });
+      toast(t("toast.icon"));
+      preview.src = `/static/favicon.svg?v=${Date.now()}`;
+      // Update favicon immediately.
+      document.querySelectorAll('link[rel="icon"]').forEach((l) => { l.href = `/static/favicon.svg?v=${Date.now()}`; });
+    } catch (e) {
+      toast(e.message, "error");
+    }
+    input.value = "";
+  });
+  el("icon-reset").addEventListener("click", async () => {
+    try {
+      await api("/api/ui/icon", { method: "DELETE" });
+      toast(t("toast.icon"));
+      preview.src = "/static/favicon.svg";
+      document.querySelectorAll('link[rel="icon"]').forEach((l) => { l.href = "/static/favicon.svg"; });
+    } catch (e) {
+      toast(e.message, "error");
+    }
+  });
+}
+
+/* ----- Security section ----- */
+
+function renderSecurityBody() {
+  const body = el("security-body");
+  if (!body) return;
+  const totpOn = state.totpEnabled;
+  body.innerHTML = `
+    <table class="kv-table">
+      <tr><td>${esc(t("settings.security.session"))}</td><td class="mono">${state.sessionTtl ? `${Math.round(state.sessionTtl / 3600)} h` : "-"}</td></tr>
+      <tr><td>${esc(t("settings.security.cookies"))}</td><td><span class="cell-muted">${esc(t("settings.security.cookies.hint"))}</span></td></tr>
+      <tr><td>${esc(t("settings.2fa.title"))}</td><td>
+        <span class="badge ${totpOn ? "green" : "grey"}">${esc(totpOn ? t("settings.2fa.status.on") : t("settings.2fa.status.off"))}</span>
+        ${totpOn ? `<span class="cell-muted u-ml8">${esc(t("settings.2fa.backup_count", { n: state.backupCodesRemaining }))}</span>` : ""}
+      </td></tr>
+    </table>
+    <div class="settings-sep"></div>
+    <div class="settings-row">
+      <div class="grow">
+        <div class="lbl">${esc(t("settings.2fa.title"))}</div>
+        <div class="hint">${esc(t("settings.2fa.desc"))}</div>
+      </div>
+      ${totpOn
+        ? `<button class="btn sm danger" id="2fa-disable-btn">${esc(t("settings.2fa.disable"))}</button>`
+        : `<button class="btn sm primary" id="2fa-enable-btn">${esc(t("settings.2fa.enable"))}</button>`}
+    </div>
+    <div class="settings-sep"></div>
+    <div class="settings-row">
+      <div class="grow">
+        <div class="lbl">${esc(t("settings.password.change"))}</div>
+      </div>
+      <button class="btn sm" id="pw-change-btn">${esc(t("settings.password.change"))}</button>
+    </div>`;
+
+  const enableBtn = el("2fa-enable-btn");
+  if (enableBtn) enableBtn.addEventListener("click", open2faSetupModal);
+  const disableBtn = el("2fa-disable-btn");
+  if (disableBtn) disableBtn.addEventListener("click", open2faDisableModal);
+  el("pw-change-btn").addEventListener("click", openPasswordModal);
+}
+
+/* ----- 2FA setup ----- */
+
+async function open2faSetupModal() {
+  let begin;
+  try {
+    begin = await api("/api/auth/2fa/begin", { method: "POST", json: {} });
+  } catch (e) {
+    toast(e.message, "error");
+    return;
+  }
+  const modal = openModal(`
+    ${modalHead(t("settings.2fa.enable"))}
+    <div class="modal-body">
+      <p class="u-note-sm">${esc(t("settings.2fa.scan"))}</p>
+      <div class="qr-box">${begin.qr_svg || ""}</div>
+      <div class="secret-row u-mb16">
+        <code>${esc(begin.secret)}</code>
+        <button class="btn icon sm" id="copy-secret" title="${esc(t("common.copy"))}">${I.copy}</button>
+      </div>
+      <div class="login-error" id="t2fa-error"></div>
+      <label class="field"><span>${esc(t("settings.2fa.code"))}</span>
+        <input class="input" id="t2fa-code" inputmode="numeric" autocomplete="one-time-code" placeholder="123456" maxlength="6"></label>
+    </div>
+    <div class="modal-foot">
+      <button class="btn" id="t2fa-cancel">${esc(t("settings.2fa.cancel"))}</button>
+      <button class="btn primary" id="t2fa-confirm">${esc(t("settings.2fa.confirm"))}</button>
+    </div>`);
+
+  modal.querySelector("#copy-secret").addEventListener("click", async () => {
+    try { await navigator.clipboard.writeText(begin.secret); toast(t("common.copied")); } catch { /* no clipboard */ }
+  });
+  const cancel = async () => {
+    try { await api("/api/auth/2fa/cancel", { method: "POST", json: {} }); } catch { /* ignore */ }
+    closeModal();
+  };
+  modal.querySelector("#t2fa-cancel").addEventListener("click", cancel);
+
+  modal.querySelector("#t2fa-confirm").addEventListener("click", async () => {
+    const btn = modal.querySelector("#t2fa-confirm");
+    const errBox = modal.querySelector("#t2fa-error");
+    errBox.classList.remove("visible");
+    btn.disabled = true;
+    try {
+      const res = await api("/api/auth/2fa/confirm", {
+        method: "POST",
+        json: { code: modal.querySelector("#t2fa-code").value.trim() },
+      });
+      state.totpEnabled = true;
+      state.backupCodesRemaining = res.backup_codes.length;
+      showBackupCodesModal(res.backup_codes);
+    } catch (e) {
+      errBox.textContent = e.message;
+      errBox.classList.add("visible");
+      btn.disabled = false;
+    }
+  });
+}
+
+function showBackupCodesModal(codes) {
+  const modal = openModal(`
+    ${modalHead(t("settings.2fa.backup.title"))}
+    <div class="modal-body">
+      <p class="u-note-sm">${esc(t("settings.2fa.backup.desc"))}</p>
+      <div class="backup-grid">
+        ${codes.map((c) => `<div class="backup-code">${esc(c)}</div>`).join("")}
+      </div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn" id="bc-download">${I.download} ${esc(t("settings.2fa.backup.download"))}</button>
+      <button class="btn primary" id="bc-done">${esc(t("settings.2fa.backup.done"))}</button>
+    </div>`, true);
+  modal.querySelector("#bc-download").addEventListener("click", () => {
+    const text = `Cloudflare DDNS Web UI - backup recovery codes
+Generated: ${new Date().toISOString()}
+
+Each code can be used once to sign in if you lose access to your
+authenticator app. Store them somewhere safe.
+
+${codes.join("\n")}
+`;
+    const blob = new Blob([text], { type: "text/plain" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "cloudflare-ddns-backup-codes.txt";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  });
+  modal.querySelector("#bc-done").addEventListener("click", () => {
+    closeModal();
+    toast(t("toast.2fa.enabled"));
+    renderSecurityBody();
+  });
+}
+
+/* ----- 2FA disable ----- */
+
+function open2faDisableModal() {
+  const modal = openModal(`
+    ${modalHead(t("settings.2fa.disable"))}
+    <div class="modal-body">
+      <p class="u-note-sm">${esc(t("settings.2fa.disable.hint"))}</p>
+      <div class="login-error" id="d2fa-error"></div>
+      <label class="field"><span>${esc(t("login.2fa.code"))}</span>
+        <input class="input" id="d2fa-code" inputmode="text" autocomplete="one-time-code" placeholder="123456"></label>
+    </div>
+    <div class="modal-foot">
+      <button class="btn" data-close>${esc(t("modal.cancel"))}</button>
+      <button class="btn danger" id="d2fa-confirm">${esc(t("settings.2fa.disable"))}</button>
+    </div>`);
+  modal.querySelector("#d2fa-confirm").addEventListener("click", async () => {
+    const btn = modal.querySelector("#d2fa-confirm");
+    const errBox = modal.querySelector("#d2fa-error");
+    errBox.classList.remove("visible");
+    btn.disabled = true;
+    try {
+      await api("/api/auth/2fa/disable", {
+        method: "POST",
+        json: { code: modal.querySelector("#d2fa-code").value.trim() },
+      });
+      state.totpEnabled = false;
+      state.backupCodesRemaining = 0;
+      closeModal();
+      toast(t("toast.2fa.disabled"));
+      renderSecurityBody();
+    } catch (e) {
+      errBox.textContent = e.message;
+      errBox.classList.add("visible");
+      btn.disabled = false;
+    }
+  });
+}
+
+/* ----- Change password ----- */
+
+function openPasswordModal() {
+  const totpOn = state.totpEnabled;
+  const modal = openModal(`
+    ${modalHead(t("settings.password.change"))}
+    <div class="modal-body">
+      <div class="login-error" id="pw-error"></div>
+      <label class="field"><span>${esc(t("settings.password.current"))}</span>
+        <input class="input" type="password" id="pw-current" autocomplete="current-password"></label>
+      ${totpOn ? `
+      <label class="field"><span>${esc(t("settings.password.code"))}</span>
+        <input class="input" id="pw-code" inputmode="text" autocomplete="one-time-code" placeholder="123456">
+        <div class="field-hint">${esc(t("settings.password.code.hint"))}</div></label>` : ""}
+      <label class="field"><span>${esc(t("settings.password.new"))}</span>
+        <input class="input" type="password" id="pw-new" autocomplete="new-password"></label>
+      <label class="field"><span>${esc(t("settings.password.confirm"))}</span>
+        <input class="input" type="password" id="pw-confirm" autocomplete="new-password"></label>
+    </div>
+    <div class="modal-foot">
+      <button class="btn" data-close>${esc(t("modal.cancel"))}</button>
+      <button class="btn primary" id="pw-submit">${esc(t("settings.password.submit"))}</button>
+    </div>`);
+  modal.querySelector("#pw-submit").addEventListener("click", async () => {
+    const btn = modal.querySelector("#pw-submit");
+    const errBox = modal.querySelector("#pw-error");
+    errBox.classList.remove("visible");
+    const val = (id) => modal.querySelector(id).value;
+    if (val("#pw-new").length < 8) { errBox.textContent = t("setup.short"); errBox.classList.add("visible"); return; }
+    if (val("#pw-new") !== val("#pw-confirm")) { errBox.textContent = t("setup.mismatch"); errBox.classList.add("visible"); return; }
+    btn.disabled = true;
+    try {
+      await api("/api/auth/password", {
+        method: "POST",
+        json: {
+          current_password: val("#pw-current"),
+          code: totpOn ? val("#pw-code").trim() : null,
+          new_password: val("#pw-new"),
+          confirm: val("#pw-confirm"),
+        },
+      });
+      closeModal();
+      toast(t("toast.password"));
+    } catch (e) {
+      errBox.textContent = e.message;
+      errBox.classList.add("visible");
+      btn.disabled = false;
+    }
   });
 }
 
@@ -1403,6 +2262,8 @@ async function bootAuthed() {
   try {
     const me = await api("/api/auth/me");
     state.sessionTtl = me.session_ttl;
+    state.totpEnabled = !!me.totp_enabled;
+    state.backupCodesRemaining = me.backup_codes_remaining ?? 0;
   } catch { /* non-fatal */ }
   try {
     await loadZones();
@@ -1419,13 +2280,21 @@ async function bootAuthed() {
 }
 
 (async function boot() {
+  applyTheme();
   try {
     state.config = await api("/api/config");
+    state.configured = state.config.configured !== false;
+    if (state.config.accent) {
+      document.documentElement.style.setProperty("--accent", state.config.accent);
+    }
   } catch { /* server may still be starting */ }
+  if (!state.configured) { render(); return; }
   try {
     const me = await api("/api/auth/me");
     state.authed = !!me.authenticated;
     state.sessionTtl = me.session_ttl;
+    state.totpEnabled = !!me.totp_enabled;
+    state.backupCodesRemaining = me.backup_codes_remaining ?? 0;
   } catch {
     state.authed = false;
   }

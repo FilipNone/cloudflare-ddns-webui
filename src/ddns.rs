@@ -211,7 +211,7 @@ pub async fn update_now(cfg: &Config, cf: &CloudflareClient) -> Vec<String> {
             let detected = if family == "ipv4" { &ipv4 } else { &ipv6 };
             let ip = match detected {
                 Some(ip) => ip.clone(),
-                None => continue, // transient failure or disabled — preserve records
+                None => continue, // transient failure or disabled - preserve records
             };
             match cf.list_records_by_name(&zone.id, rtype, domain).await {
                 Ok(records) if records.is_empty() => {

@@ -159,8 +159,45 @@ class Handler(BaseHTTPRequestHandler):
 
             if len(parts) == 4 and parts[3] == "import" and method == "POST":
                 body = self._body()
-                parsed_lines = len([l for l in body.split(b"\n") if b"\tIN\t" in l])
-                return self._json(envelope({"recs_added": parsed_lines, "total_records_parsed": parsed_lines}))
+                # Extract the zone file from the multipart body (or raw body).
+                bind = body
+                if b"Content-Disposition" in body:
+                    marker = b"\r\n\r\n"
+                    start = body.find(marker)
+                    if start != -1:
+                        end = body.rfind(b"\r\n--")
+                        bind = body[start + len(marker):end if end != -1 else len(body)]
+                added = 0
+                parsed = 0
+                zone_name = next((z["name"] for z in ZONES if z["id"] == zone_id), "example.com")
+                for line in bind.decode("utf-8", "replace").splitlines():
+                    line = line.split(";", 1)[0].strip()
+                    if not line or "\tIN\t" not in line and " IN " not in line:
+                        continue
+                    parts_l = line.replace("\t", " ").split()
+                    if len(parts_l) < 5:
+                        continue
+                    name, ttl_s, _in, rtype = parts_l[0], parts_l[1], parts_l[2], parts_l[3]
+                    content = " ".join(parts_l[4:]).strip('"')
+                    if rtype in ("SOA", "NS"):
+                        parsed += 1
+                        continue  # SOA/NS are skipped by Cloudflare imports
+                    if rtype not in ("A", "AAAA", "CNAME", "TXT", "MX", "SRV", "CAA", "PTR"):
+                        parsed += 1
+                        continue
+                    parsed += 1
+                    if any(r["name"] == name.rstrip(".") and r["type"] == rtype and r["content"] == content for r in records):
+                        continue  # duplicate - skipped, not replaced
+                    prio = None
+                    data = None
+                    if rtype == "MX" and len(parts_l) >= 6:
+                        prio = int(parts_l[4]); content = " ".join(parts_l[5:])
+                    if rtype == "SRV" and len(parts_l) >= 8:
+                        data = {"priority": int(parts_l[4]), "weight": int(parts_l[5]), "port": int(parts_l[6]), "target": parts_l[7].rstrip(".")}
+                        content = f"{data['weight']} {data['port']} {data['target']}"
+                    records.append(rec(rtype, name.rstrip("."), content, None, int(ttl_s) if ttl_s.isdigit() else 1, None, [], prio, data))
+                    added += 1
+                return self._json(envelope({"recs_added": added, "total_records_parsed": parsed}))
 
             if len(parts) == 4:
                 rid = parts[3]

@@ -1,5 +1,5 @@
 //! A minimal, dependency-free HTTP/1.1 server built directly on tokio's
-//! TcpListener — in the spirit of cloudflare-ddns: no web framework, no
+//! TcpListener - in the spirit of cloudflare-ddns: no web framework, no
 //! runtime bloat, just enough HTTP to serve the GUI and its JSON API.
 
 use std::collections::HashMap;
