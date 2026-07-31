@@ -1,3 +1,5 @@
+# DO NOT INSTALL - APLHA RELEASE
+
 # 🌍 Cloudflare DDNS - Web UI
 
 A **lightweight, fast web GUI for [cloudflare-ddns](https://github.com/timothymiller/cloudflare-ddns)**, written in Rust. Built with the same philosophy as cloudflare-ddns: a tiny fully-static binary with zero runtime dependencies and minimal crates - no web framework, the HTTP/1.1 server is hand-rolled on top of tokio, and the entire frontend (vanilla JS + CSS, no build step) is embedded in the binary at compile time.
