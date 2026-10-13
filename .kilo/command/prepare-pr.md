@@ -1,0 +1,4 @@
+---
+description: Review and humanize a change before a requested PR
+---
+Read AGENTS.md, SPEC.md and the current task acceptance criteria. Inspect status, the complete diff against the intended base, and all commits to be included without displaying private author emails. Check that contribution metadata uses only 165696124+FilipNone@users.noreply.github.com; do not print other email values. Load humanizer and rewrite only comments introduced by this change, preserving technical meaning and unrelated old comments. If the skill is unavailable, stop and report the missing prerequisite. Run the required checks and obtain independent fresh-context review. Fix actionable findings, retest and prepare a concise PR summary with evidence and manual-check gaps. This command prepares a PR; creating, committing or pushing one still needs an explicit request. Never merge automatically.

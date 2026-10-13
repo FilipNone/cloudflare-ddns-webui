@@ -5,3 +5,8 @@ Cloudflare DDNS/
 GUI riferimento/
 docker-compose.yml
 env-example
+.env
+.env.*
+data/
+.kilo/
+__pycache__/

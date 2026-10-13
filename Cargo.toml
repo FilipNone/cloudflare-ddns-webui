@@ -8,7 +8,7 @@ license = "GPL-3.0"
 [dependencies]
 qrcodegen = "1.8"
 reqwest = { version = "0.13", features = ["json", "rustls-no-provider"], default-features = false }
-rustls = { version = "0.23", features = ["ring"], default-features = false }
+rustls = { version = "0.23.45", features = ["ring"], default-features = false }
 ring = "0.17"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

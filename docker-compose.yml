@@ -5,7 +5,7 @@ services:
     security_opt:
       - no-new-privileges:true
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
     volumes:
       - webui-data:/data   # persists the admin password hash, 2FA secret, UI settings
     environment:

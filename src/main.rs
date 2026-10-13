@@ -1,4 +1,5 @@
 mod auth;
+mod bind;
 mod cloudflare;
 mod config;
 mod customize;
@@ -38,7 +39,13 @@ async fn main() {
     config::print_config_summary(&cfg, &ppfmt);
 
     let state_path = format!("{}/state.json", cfg.data_dir);
-    let auth = Auth::new(cfg.session_ttl, &state_path);
+    let auth = match Auth::new(cfg.session_ttl, &state_path) {
+        Ok(auth) => auth,
+        Err(error) => {
+            ppfmt.errorf(pp::EMOJI_ERROR, &format!("cannot load auth state: {error}"));
+            std::process::exit(1);
+        }
+    };
     if !auth.is_configured() {
         ppfmt.warningf(
             pp::EMOJI_LOCK,
@@ -51,6 +58,7 @@ async fn main() {
         auth,
         ui: UiStore::new(&cfg.data_dir),
         pp: ppfmt,
+        ddns_running: std::sync::atomic::AtomicBool::new(false),
         cfg,
     });
 
@@ -62,7 +70,10 @@ async fn main() {
             std::process::exit(1);
         }
     };
-    ppfmt.successf(pp::EMOJI_GLOBE, &format!("Web UI listening on http://{listen}"));
+    ppfmt.successf(
+        pp::EMOJI_GLOBE,
+        &format!("Web UI listening on http://{listen}"),
+    );
 
     let handler_state = state.clone();
     let handler = Arc::new(move |req: http::Request| {

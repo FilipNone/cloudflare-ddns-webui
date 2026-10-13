@@ -18,6 +18,7 @@ const I18N = {
     "nav.settings": "Settings",
     "nav.collapse": "Collapse",
     "nav.logout": "Log out",
+    "nav.menu": "Navigation menu",
     "login.title": "Sign in",
     "login.subtitle": "Enter your admin password to manage your DNS.",
     "login.password": "Password",
@@ -59,6 +60,9 @@ const I18N = {
     "dash.ddns.out_of_sync": "Out of sync",
     "dash.ddns.error": "Error",
     "dash.ddns.missing": "No record",
+    "dash.ddns.update_failed": "DDNS update failed or partially completed",
+    "dash.ddns.last_update": "Last manual update",
+    "dash.ddns.contract": "Manual update contract: {contract}. Companion daemon status is not observed.",
     "records.title": "DNS Records",
     "records.add": "Add record",
     "records.import": "Import",
@@ -145,6 +149,10 @@ const I18N = {
     "modal.bulk.comment.keep": "Keep existing",
     "modal.bulk.comment.replace": "Replace with",
     "modal.bulk.comment.clear": "Clear comments",
+    "modal.metadata.keep": "Keep existing",
+    "modal.metadata.set": "Set value",
+    "modal.metadata.clear": "Clear value",
+    "modal.metadata.empty": "Enter a value or choose Clear value.",
     "modal.bulk.apply": "Apply to {n} records",
     "modal.delete.title": "Delete records",
     "modal.delete.one": "Delete this record?",
@@ -170,11 +178,11 @@ const I18N = {
     "settings.accent": "Accent color",
     "settings.accent.hint": "Pick a preset or any custom color.",
     "settings.icon": "Logo & favicon",
-    "settings.icon.hint": "PNG, JPEG, WebP, GIF or SVG, max 512 KB. Applied to the logo and used as the favicon.",
+    "settings.icon.hint": "PNG, JPEG, WebP or GIF, max 512 KB. Applied to the logo and used as the favicon.",
     "settings.icon.upload": "Upload image",
     "settings.icon.reset": "Reset to default",
     "settings.icon.too_big": "Image is larger than 512 KB.",
-    "settings.icon.bad_type": "Unsupported format - use PNG, JPEG, WebP, GIF or SVG.",
+    "settings.icon.bad_type": "Unsupported format - use PNG, JPEG, WebP or GIF.",
     "settings.security.title": "Security",
     "settings.security.desc": "Password and two-factor authentication.",
     "settings.security.session": "Session lifetime",
@@ -204,6 +212,8 @@ const I18N = {
     "settings.2fa.backup.desc": "These codes are shown only once. Each can be used a single time if you lose access to your authenticator app.",
     "settings.2fa.backup.download": "Download as .txt",
     "settings.2fa.backup.done": "Done",
+    "settings.2fa.backup.pending": "Your new recovery codes have not been acknowledged. Keep this page open until you have saved them.",
+    "settings.2fa.backup.reopen": "View recovery codes",
     "settings.2fa.disable.hint": "Enter a current 2FA code (or a backup code) to disable two-factor authentication.",
     "settings.token.title": "Cloudflare API token",
     "settings.token.desc": "The web UI talks to Cloudflare with an API token supplied via the CLOUDFLARE_API_TOKEN environment variable. Create it with the following preset:",
@@ -314,6 +324,8 @@ const state = {
   recordsTotal: 0,
   recordsZoneId: null,
   recordsLoading: false,
+  recordsAttemptedZoneId: null,
+  recordsError: null,
   search: "",
   typeFilter: "",
   sort: { key: "name", dir: 1 },
@@ -322,13 +334,34 @@ const state = {
   selection: new Set(),
   columns: { ...DEFAULT_COLUMNS, ...JSON.parse(localStorage.getItem("cfddns.columns") || "{}") },
   sidebarCollapsed: localStorage.getItem("cfddns.sidebar") === "collapsed",
+  mobileNavOpen: false,
   ddns: null,
   ddnsLoading: false,
+  ddnsUpdating: false,
+  ddnsUpdateResult: null,
   sessionTtl: null,
   backupCodesRemaining: 0,
   config: null,
   pendingChallenge: null,
+  pendingBackupCodes: null,
 };
+
+let authGeneration = 0;
+let pageGeneration = 0;
+let recordsRequest = 0;
+let ddnsRequest = 0;
+
+function invalidatePageRequests() {
+  pageGeneration++;
+  recordsRequest++;
+  ddnsRequest++;
+  if (state.recordsLoading) state.recordsAttemptedZoneId = null;
+  state.recordsLoading = false;
+  state.ddnsLoading = false;
+  state.mobileNavOpen = false;
+  closeMSelects();
+  closeModal(true);
+}
 
 /* ================= Theme ================= */
 
@@ -425,6 +458,9 @@ const V = {
 /* ================= API ================= */
 
 async function api(path, opts = {}) {
+  const authentication = authGeneration;
+  const page = pageGeneration;
+  const zoneId = state.zoneId;
   const init = {
     method: opts.method || "GET",
     credentials: "same-origin",
@@ -444,10 +480,33 @@ async function api(path, opts = {}) {
     throw new Error("network error - is the server reachable?");
   }
   if (resp.status === 401 && !path.startsWith("/api/auth/")) {
-    state.authed = false;
-    render();
+    if (authentication === authGeneration && page === pageGeneration && zoneId === state.zoneId) {
+      authGeneration++;
+      state.authed = false;
+      state.ddnsUpdating = false;
+      state.ddnsUpdateResult = null;
+      state.pendingBackupCodes = null;
+      invalidatePageRequests();
+      render();
+    }
     throw new Error("unauthorized");
   }
+  const sameAuthentication = authentication === authGeneration;
+  if (resp.ok && init.method === "POST" && sameAuthentication
+    && ["/api/auth/setup", "/api/auth/login", "/api/auth/login/2fa", "/api/auth/logout", "/api/auth/password", "/api/auth/2fa/confirm", "/api/auth/2fa/disable"].includes(path)) {
+    authGeneration++;
+    recordsRequest++;
+    ddnsRequest++;
+    if (state.recordsLoading) state.recordsAttemptedZoneId = null;
+    state.recordsLoading = false;
+    state.ddnsLoading = false;
+    state.ddnsUpdating = false;
+    state.ddnsUpdateResult = null;
+    if (["/api/auth/setup", "/api/auth/login", "/api/auth/login/2fa", "/api/auth/logout"].includes(path)) {
+      state.pendingBackupCodes = null;
+    }
+  }
+  if (resp.ok && sameAuthentication && opts.authContext) opts.authContext.generation = authGeneration;
   const ct = resp.headers.get("content-type") || "";
   if (opts.text) {
     const body = await resp.text();
@@ -480,11 +539,30 @@ async function api(path, opts = {}) {
 let openMSelect = null;
 
 function closeMSelects() {
-  document.querySelectorAll(".mselect.open").forEach((m) => m.classList.remove("open"));
+  document.querySelectorAll(".mselect.open, .dropdown.open").forEach((m) => {
+    m.classList.remove("open");
+    m.querySelector("button")?.setAttribute("aria-expanded", "false");
+  });
   document.querySelectorAll(".menu.open").forEach((m) => m.classList.remove("open"));
-  document.querySelectorAll(".menu-overlay").forEach((o) => o.remove());
   openMSelect = null;
 }
+
+document.addEventListener("click", (e) => {
+  if (!e.target.closest(".mselect, .dropdown")) closeMSelects();
+});
+document.addEventListener("keydown", (e) => {
+  if (e.key !== "Escape") return;
+  const trigger = document.querySelector(".mselect.open > button, .dropdown.open > button");
+  if (trigger) {
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    closeMSelects();
+    trigger.focus();
+  } else if (state.mobileNavOpen) {
+    e.preventDefault();
+    toggleMobileNav(false);
+  }
+});
 
 /**
  * Build a modern dropdown. opts: {id, options: [{value,label,group?}], value,
@@ -498,6 +576,8 @@ function mselect(opts) {
   btn.type = "button";
   btn.className = "mselect-btn";
   btn.disabled = !!opts.disabled;
+  btn.setAttribute("aria-expanded", "false");
+  if (opts.label) btn.setAttribute("aria-label", opts.label);
   const label = document.createElement("span");
   label.className = "ms-label";
   const caret = document.createElement("span");
@@ -537,6 +617,7 @@ function mselect(opts) {
         x.querySelector(".check").innerHTML = x.dataset.value === String(o.value) ? I.check : "";
       });
       closeMSelects();
+      btn.focus();
       if (opts.onChange) opts.onChange(o.value);
     });
     menu.appendChild(item);
@@ -553,13 +634,22 @@ function mselect(opts) {
     // Flip up when near the bottom of the viewport.
     const rect = btn.getBoundingClientRect();
     const spaceBelow = window.innerHeight - rect.bottom;
-    menu.classList.toggle("up", spaceBelow < 280);
+    menu.classList.toggle("up", spaceBelow < 280 && rect.top > spaceBelow);
     wrap.classList.add("open");
+    btn.setAttribute("aria-expanded", "true");
     openMSelect = wrap;
-    const overlay = document.createElement("div");
-    overlay.className = "menu-overlay";
-    overlay.addEventListener("click", closeMSelects);
-    document.body.appendChild(overlay);
+  });
+
+  wrap.addEventListener("keydown", (e) => {
+    if (!["ArrowDown", "ArrowUp", "Home", "End"].includes(e.key)) return;
+    e.preventDefault();
+    if (!wrap.classList.contains("open")) btn.click();
+    const items = [...menu.querySelectorAll(".mselect-option")];
+    if (!items.length) return;
+    const index = items.indexOf(document.activeElement);
+    const next = e.key === "Home" ? 0 : e.key === "End" ? items.length - 1
+      : e.key === "ArrowDown" ? (index + 1) % items.length : (index <= 0 ? items.length : index) - 1;
+    items[next].focus();
   });
 
   wrap.mset = (v) => {
@@ -607,6 +697,8 @@ function mselect(opts) {
 function bindDropdown(btnId, menuId) {
   const btn = el(btnId), menu = el(menuId);
   if (!btn || !menu) return;
+  btn.setAttribute("aria-expanded", "false");
+  btn.setAttribute("aria-controls", menuId);
   btn.addEventListener("click", (e) => {
     e.stopPropagation();
     const wasOpen = menu.classList.contains("open");
@@ -614,19 +706,10 @@ function bindDropdown(btnId, menuId) {
     if (!wasOpen) {
       // Flip up when near the bottom.
       const rect = btn.getBoundingClientRect();
-      if (window.innerHeight - rect.bottom < 300 && rect.top > 320) {
-        menu.classList.add("up");
-        menu.style.top = "auto";
-        menu.style.bottom = "calc(100% + 6px)";
-      } else {
-        menu.style.top = "";
-        menu.style.bottom = "";
-      }
+      menu.classList.toggle("up", window.innerHeight - rect.bottom < 300 && rect.top > 320);
       menu.classList.add("open");
-      const overlay = document.createElement("div");
-      overlay.className = "menu-overlay";
-      overlay.addEventListener("click", closeMSelects);
-      document.body.appendChild(overlay);
+      btn.parentElement.classList.add("open");
+      btn.setAttribute("aria-expanded", "true");
     }
   });
 }
@@ -647,64 +730,90 @@ async function loadZones() {
 
 async function loadRecords() {
   if (!state.zoneId) { state.records = []; state.recordsTotal = 0; state.recordsZoneId = null; return; }
+  const zoneId = state.zoneId;
+  const generation = pageGeneration;
+  const authentication = authGeneration;
+  const request = ++recordsRequest;
+  const current = () => request === recordsRequest && generation === pageGeneration && authentication === authGeneration
+    && state.authed && state.route === "records" && state.zoneId === zoneId;
   state.recordsLoading = true;
+  state.recordsAttemptedZoneId = zoneId;
+  state.recordsError = null;
+  state.selection.clear();
   renderRecordsTable();
   try {
-    const data = await api(`/api/zones/${state.zoneId}/records`);
+    const data = await api(`/api/zones/${zoneId}/records`);
+    if (!current()) return;
     state.records = data.records || [];
     state.recordsTotal = data.total ?? state.records.length;
-    state.recordsZoneId = state.zoneId;
+    state.recordsZoneId = zoneId;
     state.selection.clear();
     state.page = 1;
+  } catch (e) {
+    if (current()) state.recordsError = e.message;
   } finally {
-    state.recordsLoading = false;
+    if (current()) state.recordsLoading = false;
   }
 }
 
 async function loadDdns() {
+  const generation = pageGeneration;
+  const authentication = authGeneration;
+  const request = ++ddnsRequest;
+  const current = () => request === ddnsRequest && generation === pageGeneration && authentication === authGeneration
+    && state.authed && state.route === "dashboard";
   state.ddnsLoading = true;
   renderDashboardCards();
   try {
-    state.ddns = await api("/api/ddns/status");
+    const status = await api("/api/ddns/status");
+    if (current()) state.ddns = status;
   } catch (e) {
-    state.ddns = { error: e.message, domains: [] };
+    if (current()) state.ddns = { error: e.message, domains: [] };
   } finally {
-    state.ddnsLoading = false;
+    if (current()) state.ddnsLoading = false;
   }
 }
 
 /* ================= Render: root ================= */
 
 function render() {
+  closeMSelects();
   const app = el("app");
   if (!state.configured) { renderSetup(app); return; }
   if (!state.authed) { renderLogin(app); return; }
   const route = state.route;
   app.innerHTML = `
-    <div class="layout ${state.sidebarCollapsed ? "collapsed" : ""}" id="layout">
-      <aside class="sidebar">
+    <div class="layout ${state.sidebarCollapsed ? "collapsed" : ""} ${state.mobileNavOpen ? "mobile-open" : ""}" id="layout">
+      <aside class="sidebar" id="sidebar">
         <div class="sidebar-brand">
           <img src="/static/favicon.svg?v=${state.config?.version || "1"}" alt="logo">
           <span>${esc(t("app.name"))}</span>
         </div>
         <nav class="sidebar-nav">
-          <button class="nav-item ${route === "dashboard" ? "active" : ""}" data-nav="dashboard">${I.dashboard}<span class="nav-label">${esc(t("nav.dashboard"))}</span></button>
-          <button class="nav-item ${route === "records" ? "active" : ""}" data-nav="records">${I.dns}<span class="nav-label">${esc(t("nav.records"))}</span></button>
-          <button class="nav-item ${route === "settings" ? "active" : ""}" data-nav="settings">${I.settings}<span class="nav-label">${esc(t("nav.settings"))}</span></button>
+          <button class="nav-item ${route === "dashboard" ? "active" : ""}" data-nav="dashboard" aria-label="${esc(t("nav.dashboard"))}">${I.dashboard}<span class="nav-label">${esc(t("nav.dashboard"))}</span></button>
+          <button class="nav-item ${route === "records" ? "active" : ""}" data-nav="records" aria-label="${esc(t("nav.records"))}">${I.dns}<span class="nav-label">${esc(t("nav.records"))}</span></button>
+          <button class="nav-item ${route === "settings" ? "active" : ""}" data-nav="settings" aria-label="${esc(t("nav.settings"))}">${I.settings}<span class="nav-label">${esc(t("nav.settings"))}</span></button>
         </nav>
         <div class="sidebar-footer">
           <button class="nav-item" id="collapse-btn" title="${esc(t("nav.collapse"))}">${I.collapse}<span class="nav-label">${esc(t("nav.collapse"))}</span></button>
-          <button class="nav-item" id="logout-btn">${I.logout}<span class="nav-label">${esc(t("nav.logout"))}</span></button>
+          <button class="nav-item" id="logout-btn" aria-label="${esc(t("nav.logout"))}">${I.logout}<span class="nav-label">${esc(t("nav.logout"))}</span></button>
         </div>
       </aside>
+      <button class="mobile-nav-backdrop" id="mobile-nav-backdrop" aria-label="${esc(t("common.close"))}" tabindex="-1"></button>
       <div class="main">
         <header class="topbar">
+          <button class="btn icon mobile-menu-btn" id="mobile-menu-btn" aria-label="${esc(t("nav.menu"))}" aria-controls="sidebar" aria-expanded="${state.mobileNavOpen}">${I.collapse}</button>
           <h1>${esc(t(route === "dashboard" ? "dash.title" : route === "records" ? "records.title" : "settings.title"))}</h1>
           <div class="topbar-actions" id="topbar-actions"></div>
         </header>
+        <div id="recovery-notice"></div>
         <main class="content" id="page"></main>
       </div>
     </div>`;
+
+  el("mobile-menu-btn").addEventListener("click", () => toggleMobileNav(!state.mobileNavOpen));
+  el("mobile-nav-backdrop").addEventListener("click", () => toggleMobileNav(false));
+  app.querySelector(".main").inert = state.mobileNavOpen;
 
   app.querySelectorAll("[data-nav]").forEach((btn) =>
     btn.addEventListener("click", () => navigate(btn.dataset.nav))
@@ -717,6 +826,11 @@ function render() {
   el("logout-btn").addEventListener("click", async () => {
     try { await api("/api/auth/logout", { method: "POST" }); } catch { /* ignore */ }
     state.authed = false;
+    state.ddnsUpdating = false;
+    invalidatePageRequests();
+    state.records = []; state.recordsZoneId = null; state.recordsAttemptedZoneId = null;
+    state.ddns = null; state.ddnsUpdateResult = null;
+    state.pendingBackupCodes = null;
     navigate("dashboard");
     render();
   });
@@ -725,9 +839,26 @@ function render() {
   if (route === "dashboard") renderDashboard();
   else if (route === "records") renderRecords();
   else renderSettings();
+  renderRecoveryNotice();
 }
 
+function toggleMobileNav(open) {
+  state.mobileNavOpen = open;
+  el("layout")?.classList.toggle("mobile-open", open);
+  el("mobile-menu-btn")?.setAttribute("aria-expanded", String(open));
+  const main = el("layout")?.querySelector(".main");
+  if (main) main.inert = open;
+  if (open) el("sidebar")?.querySelector(".nav-item.active")?.focus();
+  else el("mobile-menu-btn")?.focus();
+}
+
+window.addEventListener("resize", () => {
+  if (window.innerWidth > 900 && state.mobileNavOpen) toggleMobileNav(false);
+  closeMSelects();
+});
+
 function navigate(route) {
+  invalidatePageRequests();
   state.route = route;
   location.hash = `#/${route}`;
   render();
@@ -735,7 +866,7 @@ function navigate(route) {
 
 window.addEventListener("hashchange", () => {
   const route = location.hash.replace("#/", "") || "dashboard";
-  if (route !== state.route) { state.route = route; render(); }
+  if (route !== state.route) { invalidatePageRequests(); state.route = route; render(); }
 });
 
 function renderTopbarActions() {
@@ -745,10 +876,12 @@ function renderTopbarActions() {
   if (state.route === "records" && state.zones.length > 0) {
     const zoneSelect = mselect({
       id: "zone-select",
+      label: t("modal.zone"),
       cls: "u-zone-select",
       options: state.zones.map((z) => ({ value: z.id, label: z.name })),
       value: state.zoneId,
       onChange: async (v) => {
+        closeModal();
         state.zoneId = v;
         localStorage.setItem("cfddns.zone", v);
         state.search = ""; state.typeFilter = "";
@@ -936,12 +1069,27 @@ function renderLogin2fa(app) {
 /* ================= Render: dashboard ================= */
 
 function renderDashboard() {
+  if (!state.authed || state.route !== "dashboard") return;
   const page = el("page");
+  if (!page) return;
   page.innerHTML = `
     <div class="stat-grid" id="stat-grid"></div>
     <div id="ddns-section"></div>`;
   renderDashboardCards();
-  if (state.ddns === null) loadDdns().then(renderDashboard);
+  if (state.ddns === null && !state.ddnsLoading) loadDdns().then(renderDashboard);
+}
+
+function ddnsUpdateLog() {
+  const result = state.ddnsUpdateResult;
+  if (!result) return "";
+  const lines = [...(result.log || [])];
+  for (const outcome of result.outcomes || []) {
+    lines.push(`${outcome.domain} ${outcome.record_type}: ${outcome.status}${outcome.error ? ` - ${outcome.error}` : ""}`);
+  }
+  return `<div id="ddns-log" class="u-logbox visible" role="status">
+    <div class="card-title">${esc(t("dash.ddns.last_update"))}</div>
+    <div class="${result.success ? "login-notice" : "login-error visible"}">${esc(t(result.success ? "toast.updated_ddns" : "dash.ddns.update_failed"))}</div>
+    <div class="log-output">${esc(lines.join("\n"))}</div></div>`;
 }
 
 function renderDashboardCards() {
@@ -975,7 +1123,7 @@ function renderDashboardCards() {
           <h4>${esc(t("dash.ddns.not_configured"))}</h4>
           <p>${esc(t("dash.ddns.hint"))}</p>
         </div>
-      </div></div>`;
+      </div>${ddnsUpdateLog()}</div>`;
     return;
   }
   const rows = (d && d.domains ? d.domains : []).map((dom) => {
@@ -997,9 +1145,11 @@ function renderDashboardCards() {
       <div class="toolbar">
         <div class="card-title u-mb0">${esc(t("dash.ddns.title"))}</div>
         <div class="u-flex1"></div>
-        <button class="btn ghost sm" id="ddns-refresh">${I.refresh} ${esc(t("records.refresh"))}</button>
-        <button class="btn primary sm" id="ddns-update">${I.bolt} ${esc(t("dash.ddns.update_now"))}</button>
+        <button class="btn ghost sm" id="ddns-refresh" ${state.ddnsLoading ? "disabled" : ""}>${I.refresh} ${esc(t("records.refresh"))}</button>
+        <button class="btn primary sm" id="ddns-update" ${state.ddnsUpdating || state.ddnsLoading || !d || d.error || d.manual_updates_enabled === false ? "disabled" : ""}>${I.bolt} ${esc(t(state.ddnsUpdating ? "dash.ddns.updating" : "dash.ddns.update_now"))}</button>
       </div>
+      ${d?.error ? `<div class="card-pad login-error visible" role="alert">${esc(d.error)}</div>` : ""}
+      ${d?.contract_version ? `<div class="card-pad cell-muted">${esc(t("dash.ddns.contract", { contract: d.contract_version }))}</div>` : ""}
       <div class="table-wrap">
         <table class="data">
           <thead><tr>
@@ -1012,32 +1162,47 @@ function renderDashboardCards() {
           <tbody>${state.ddnsLoading ? `<tr><td colspan="5"><div class="skeleton"></div></td></tr>` : rows || `<tr><td colspan="5" class="cell-muted u-cell-empty">${esc(t("dash.ddns.not_configured"))}</td></tr>`}</tbody>
         </table>
       </div>
-      <div id="ddns-log" class="u-logbox"></div>
+      ${ddnsUpdateLog()}
     </div>`;
 
   const refreshBtn = el("ddns-refresh");
   if (refreshBtn) refreshBtn.addEventListener("click", async () => { await loadDdns(); renderDashboard(); });
   const updateBtn = el("ddns-update");
   if (updateBtn) updateBtn.addEventListener("click", async () => {
-    updateBtn.disabled = true;
-    updateBtn.innerHTML = `<div class="spinner small"></div> ${esc(t("dash.ddns.updating"))}`;
+    if (state.ddnsUpdating) return;
+    const authentication = authGeneration;
+    const current = () => authentication === authGeneration && state.authed;
+    state.ddnsUpdating = true;
+    renderDashboardCards();
     try {
       const res = await api("/api/ddns/update", { method: "POST", json: {} });
-      const logBox = el("ddns-log");
-      logBox.style.display = "block";
-      logBox.innerHTML = `<div class="log-output">${esc(res.log.join("\n"))}</div>`;
-      toast(t("toast.updated_ddns"));
+      if (!current()) return;
+      state.ddnsUpdateResult = res;
+      toast(t(res.success ? "toast.updated_ddns" : "dash.ddns.update_failed"), res.success ? "ok" : "error");
     } catch (e) {
+      if (!current()) return;
+      state.ddnsUpdateResult = { success: false, log: [e.message], outcomes: [] };
       toast(e.message, "error");
+    } finally {
+      if (current()) {
+        state.ddnsUpdating = false;
+        if (state.route === "dashboard") renderDashboardCards();
+      }
     }
-    await loadDdns();
-    renderDashboard();
+    if (current()) {
+      if (state.route === "dashboard") {
+        renderDashboardCards();
+        await loadDdns();
+        if (current()) renderDashboard();
+      } else state.ddns = null;
+    }
   });
 }
 
 /* ================= Render: records page ================= */
 
 async function refreshRecords() {
+  if (!state.authed || state.route !== "records") return;
   await loadRecords();
   renderRecords();
 }
@@ -1073,15 +1238,15 @@ function filteredRecords() {
 }
 
 function renderRecords() {
+  if (!state.authed || state.route !== "records") return;
   const page = el("page");
+  if (!page) return;
   if (state.zones.length === 0) {
     page.innerHTML = `<div class="card"><div class="empty-state">${I.file}<h4>${esc(t("records.empty.title"))}</h4><p>${esc(t("records.no_zones"))}</p></div></div>`;
     return;
   }
-  if (state.zoneId && state.recordsZoneId !== state.zoneId && !state.recordsLoading) {
-    loadRecords()
-      .then(renderRecords)
-      .catch((e) => { toast(e.message, "error"); renderRecords(); });
+  if (state.zoneId && state.recordsZoneId !== state.zoneId && state.recordsAttemptedZoneId !== state.zoneId && !state.recordsLoading) {
+    loadRecords().then(renderRecords);
   }
   page.innerHTML = `
     <div class="page-head">
@@ -1158,6 +1323,13 @@ function renderRecordsTable() {
     wrap.innerHTML = `<table class="data"><tbody>
       ${Array.from({ length: 5 }).map(() => `<tr class="skeleton-row"><td colspan="8"><div class="skeleton"></div></td></tr>`).join("")}
     </tbody></table>`;
+    el("pagination").innerHTML = "";
+    updateBulkbar();
+    return;
+  }
+
+  if (state.recordsError || state.recordsZoneId !== state.zoneId) {
+    wrap.innerHTML = `<div class="card-pad login-error visible" role="alert">${esc(state.recordsError || t("records.empty.desc"))}</div>`;
     el("pagination").innerHTML = "";
     updateBulkbar();
     return;
@@ -1313,11 +1485,16 @@ function updateBulkbar() {
 
 /* ================= Modals ================= */
 
+let modalReturnFocus = null;
+
 function openModal(html, wide) {
+  closeMSelects();
   const root = el("modal-root");
+  if (root.firstElementChild) closeModal(true);
+  if (!root.firstElementChild) modalReturnFocus = document.activeElement;
   root.innerHTML = `
     <div class="modal-overlay" id="modal-overlay">
-      <div class="modal ${wide ? "wide" : ""}" role="dialog" aria-modal="true">
+      <div class="modal ${wide ? "wide" : ""}" role="dialog" aria-modal="true" aria-labelledby="modal-title">
         ${html}
       </div>
     </div>`;
@@ -1326,17 +1503,72 @@ function openModal(html, wide) {
   });
   document.addEventListener("keydown", escClose);
   root.querySelectorAll("[data-close]").forEach((b) => b.addEventListener("click", closeModal));
+  (root.querySelector("input:not([disabled]):not([type=file])") || root.querySelector("button"))?.focus();
   return root.querySelector(".modal");
 }
 
-function escClose(e) { if (e.key === "Escape") closeModal(); }
-function closeModal() {
+function escClose(e) {
+  if (e.key === "Escape" && !e.defaultPrevented) closeModal();
+  if (e.key !== "Tab") return;
+  const items = [...el("modal-root").querySelectorAll("button:not([disabled]), input:not([disabled]), textarea, a[href], [tabindex='0']")]
+    .filter((item) => item.getClientRects().length > 0);
+  if (!items.length) return;
+  const first = items[0], last = items[items.length - 1];
+  if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+  else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+}
+function closeModal(force = false) {
+  const modal = el("modal-root").querySelector(".modal");
+  if (modal?.closeBlocked && force !== true) return;
+  if (modal?.onDismiss) modal.onDismiss();
+  closeMSelects();
   el("modal-root").innerHTML = "";
   document.removeEventListener("keydown", escClose);
+  if (modalReturnFocus?.isConnected) modalReturnFocus.focus();
+  modalReturnFocus = null;
+}
+
+function renderRecoveryNotice() {
+  const notice = el("recovery-notice");
+  if (!notice) return;
+  notice.innerHTML = state.authed && state.pendingBackupCodes ? `<div class="login-notice recovery-notice" role="status">
+    <p>${esc(t("settings.2fa.backup.pending"))}</p>
+    <button class="btn sm" id="backup-codes-reopen">${esc(t("settings.2fa.backup.reopen"))}</button></div>` : "";
+  el("backup-codes-reopen")?.addEventListener("click", () => showBackupCodesModal(state.pendingBackupCodes));
 }
 
 function modalHead(title) {
-  return `<div class="modal-head"><h3>${esc(title)}</h3><button class="modal-close" data-close>${I.close}</button></div>`;
+  return `<div class="modal-head"><h3 id="modal-title">${esc(title)}</h3><button class="modal-close" data-close aria-label="${esc(t("common.close"))}">${I.close}</button></div>`;
+}
+
+function metadataPatch(field, mode, raw) {
+  if (mode === "keep") return {};
+  if (mode === "clear") return { [field]: field === "tags" ? [] : "" };
+  const value = field === "tags" ? raw.split(",").map((tag) => tag.trim()).filter(Boolean) : raw.trim();
+  if (!value.length) throw new Error(t("modal.metadata.empty"));
+  return { [field]: value };
+}
+
+function metadataFields(prefix, rec, keep) {
+  return ["comment", "tags"].map((field) => `<div class="field metadata-field">
+    <span>${esc(t("modal." + field))}</span>
+    ${keep ? `<span id="${prefix}-${field}-mode"></span>` : ""}
+    <label class="field ${keep ? "u-hidden" : ""}" id="${prefix}-${field}-wrap">
+      <input class="input" id="${prefix}-${field}" aria-label="${esc(t("modal." + field))}" value="${esc(field === "tags" ? (rec?.tags || []).join(", ") : rec?.comment || "")}" ${field === "comment" ? 'maxlength="100"' : 'placeholder="owner:test"'}>
+      ${field === "tags" ? `<div class="field-hint">${esc(t("modal.tags.hint"))}</div>` : ""}
+    </label></div>`).join("");
+}
+
+function wireMetadata(modal, prefix) {
+  for (const field of ["comment", "tags"]) {
+    modal.querySelector(`#${prefix}-${field}-mode`).replaceWith(mselect({
+      id: `${prefix}-${field}-mode`,
+      label: t("modal." + field),
+      options: ["keep", "set", "clear"].map((mode) => ({ value: mode, label: t("modal.metadata." + mode) })),
+      value: "keep",
+      onChange: (mode) => modal.querySelector(`#${prefix}-${field}-wrap`).classList.toggle("u-hidden", mode !== "set"),
+    }));
+  }
 }
 
 /* ----- Add / edit record ----- */
@@ -1450,6 +1682,7 @@ function markValidity(modal, input) {
 function openRecordModal(rec) {
   const isEdit = !!rec;
   const zone = currentZone();
+  const zoneId = state.zoneId;
   const zoneName = zone ? zone.name : "";
   const type = rec ? rec.type : "A";
   const initialProxied = rec ? !!rec.proxied : false;
@@ -1477,11 +1710,7 @@ function openRecordModal(rec) {
           </div>
         </div>
       </div>
-      <label class="field"><span>${esc(t("modal.tags"))}</span>
-        <input class="input" id="f-tags" value="${esc(rec && rec.tags ? rec.tags.join(", ") : "")}" placeholder="cf-proxied:true">
-        <div class="field-hint">${esc(t("modal.tags.hint"))}</div></label>
-      <label class="field"><span>${esc(t("modal.comment"))}</span>
-        <input class="input" id="f-comment" value="${esc(rec && rec.comment ? rec.comment : "")}" maxlength="100"></label>
+      ${metadataFields("f", rec, isEdit)}
     </div>
     <div class="modal-foot">
       <button class="btn" data-close>${esc(t("modal.cancel"))}</button>
@@ -1490,6 +1719,7 @@ function openRecordModal(rec) {
 
   modal.dataset.caaTag = (rec && rec.data && rec.data.tag) || "issue";
   let currentType = type;
+  if (isEdit) wireMetadata(modal, "f");
 
   // Type modern select.
   const typeSlot = modal.querySelector("#f-type-slot");
@@ -1546,14 +1776,14 @@ function openRecordModal(rec) {
     saveBtn.innerHTML = `<div class="spinner small"></div>`;
     try {
       if (isEdit) {
-        await api(`/api/zones/${state.zoneId}/records/${rec.id}`, { method: "PUT", json: payload });
+        await api(`/api/zones/${zoneId}/records/${rec.id}`, { method: "PUT", json: payload });
         toast(t("toast.saved"));
       } else {
-        await api(`/api/zones/${state.zoneId}/records`, { method: "POST", json: payload });
+        await api(`/api/zones/${zoneId}/records`, { method: "POST", json: payload });
         toast(t("toast.created"));
       }
-      closeModal();
-      await refreshRecords();
+      if (modal.isConnected) closeModal();
+      if (state.zoneId === zoneId) await refreshRecords();
     } catch (e) {
       toast(e.message, "error");
       saveBtn.disabled = false;
@@ -1598,11 +1828,17 @@ function buildPayload(modal, type, zoneName, rec, ttlSelect) {
   const name = isEdit ? rec.name : fullName(nameRaw, zoneName);
   const proxied = PROXIABLE.includes(type) ? modal.querySelector("#f-proxied").checked : false;
   const ttl = proxied ? 1 : parseInt(ttlSelect.mget(), 10) || 1;
-  const comment = val("#f-comment") || null;
-  const tagsRaw = val("#f-tags");
-  const tags = tagsRaw ? tagsRaw.split(",").map((x) => x.trim()).filter(Boolean) : null;
-
-  const payload = { type, name, ttl, proxied, comment, tags };
+  const payload = { type, name, ttl, proxied };
+  try {
+    for (const field of ["comment", "tags"]) {
+      const raw = val(`#f-${field}`);
+      const mode = isEdit ? modal.querySelector(`#f-${field}-mode`).mget() : raw ? "set" : "keep";
+      Object.assign(payload, metadataPatch(field, mode, raw));
+    }
+  } catch (e) {
+    toast(e.message, "error");
+    return null;
+  }
   if (type === "MX") {
     payload.content = val("#f-content");
     payload.priority = parseInt(val("#f-priority"), 10);
@@ -1631,6 +1867,7 @@ function buildPayload(modal, type, zoneName, rec, ttlSelect) {
 /* ----- Bulk edit ----- */
 
 function openBulkEditModal() {
+  const zoneId = state.zoneId;
   const selected = state.records.filter((r) => state.selection.has(r.id));
   if (selected.length === 0) return;
   const allProxiable = selected.every((r) => PROXIABLE.includes(r.type));
@@ -1644,9 +1881,7 @@ function openBulkEditModal() {
         <div class="field"><span>${esc(t("modal.bulk.proxy"))}</span><span id="b-proxy-slot"></span></div>
       </div>
       ${allProxiable ? "" : `<div class="login-error visible u-mb16">${esc(t("modal.bulk.proxy.blocked"))} (${esc(nonProxiableTypes.join(", "))})</div>`}
-      <div class="field"><span>${esc(t("modal.bulk.comment"))}</span><span id="b-comment-mode-slot"></span></div>
-      <label class="field u-hidden" id="b-comment-wrap">
-        <input class="input" id="b-comment" maxlength="100"></label>
+      ${metadataFields("b", null, true)}
     </div>
     <div class="modal-foot">
       <button class="btn" data-close>${esc(t("modal.cancel"))}</button>
@@ -1670,21 +1905,7 @@ function openBulkEditModal() {
   });
   modal.querySelector("#b-proxy-slot").replaceWith(proxySelect);
 
-  let commentMode = "keep";
-  const commentWrap = modal.querySelector("#b-comment-wrap");
-  const commentModeSelect = mselect({
-    options: [
-      { value: "keep", label: t("modal.bulk.comment.keep") },
-      { value: "replace", label: t("modal.bulk.comment.replace") },
-      { value: "clear", label: t("modal.bulk.comment.clear") },
-    ],
-    value: "keep",
-    onChange: (v) => {
-      commentMode = v;
-      commentWrap.classList.toggle("u-hidden", v !== "replace");
-    },
-  });
-  modal.querySelector("#b-comment-mode-slot").replaceWith(commentModeSelect);
+  wireMetadata(modal, "b");
 
   modal.querySelector("#b-apply").addEventListener("click", async () => {
     const applyBtn = modal.querySelector("#b-apply");
@@ -1693,21 +1914,25 @@ function openBulkEditModal() {
     if (ttlV) patch.ttl = parseInt(ttlV, 10);
     const proxV = proxySelect.mget();
     if (proxV) patch.proxied = proxV === "true";
-    if (commentMode !== "keep") {
-      patch.comment_set = true;
-      patch.comment = commentMode === "replace" ? modal.querySelector("#b-comment").value.trim() : "";
+    try {
+      for (const field of ["comment", "tags"]) {
+        Object.assign(patch, metadataPatch(field, modal.querySelector(`#b-${field}-mode`).mget(), modal.querySelector(`#b-${field}`).value));
+      }
+    } catch (e) {
+      toast(e.message, "error");
+      return;
     }
     if (Object.keys(patch).length === 0) { closeModal(); return; }
     applyBtn.disabled = true;
     applyBtn.innerHTML = `<div class="spinner small"></div>`;
     try {
-      const res = await api(`/api/zones/${state.zoneId}/records/bulk`, {
+      const res = await api(`/api/zones/${zoneId}/records/bulk`, {
         method: "POST",
-        json: { action: "update", ids: [...state.selection], patch },
+        json: { action: "update", ids: selected.map((record) => record.id), patch },
       });
       toast(t("toast.bulk_update", { ok: res.succeeded, fail_part: res.failed ? t("toast.fail_suffix", { n: res.failed }) : "" }), res.failed ? "info" : "ok");
-      closeModal();
-      await refreshRecords();
+      if (modal.isConnected) closeModal();
+      if (state.zoneId === zoneId) await refreshRecords();
     } catch (e) {
       toast(e.message, "error");
       applyBtn.disabled = false;
@@ -1719,6 +1944,8 @@ function openBulkEditModal() {
 /* ----- Delete (single or bulk) ----- */
 
 function openBulkDeleteModal() {
+  const zoneId = state.zoneId;
+  const ids = [...state.selection];
   const n = state.selection.size;
   if (n === 0) return;
   const modal = openModal(`
@@ -1735,13 +1962,13 @@ function openBulkDeleteModal() {
     btn.disabled = true;
     btn.innerHTML = `<div class="spinner small"></div>`;
     try {
-      const res = await api(`/api/zones/${state.zoneId}/records/bulk`, {
+      const res = await api(`/api/zones/${zoneId}/records/bulk`, {
         method: "POST",
-        json: { action: "delete", ids: [...state.selection] },
+        json: { action: "delete", ids },
       });
       toast(t("toast.bulk_delete", { ok: res.succeeded, fail_part: res.failed ? t("toast.fail_suffix", { n: res.failed }) : "" }), res.failed ? "info" : "ok");
-      closeModal();
-      await refreshRecords();
+      if (modal.isConnected) closeModal();
+      if (state.zoneId === zoneId) await refreshRecords();
     } catch (e) {
       toast(e.message, "error");
       btn.disabled = false;
@@ -1753,6 +1980,7 @@ function openBulkDeleteModal() {
 /* ----- Import / export ----- */
 
 function openImportModal() {
+  const zoneId = state.zoneId;
   const modal = openModal(`
     ${modalHead(t("modal.import.title"))}
     <div class="modal-body">
@@ -1779,8 +2007,10 @@ function openImportModal() {
   function setFile(f) {
     errBox.classList.remove("visible");
     if (!f) return;
-    if (f.size > 15 * 1024 * 1024) {
-      errBox.textContent = "File too large (max 15 MB).";
+    file = null;
+    submit.disabled = true;
+    if (f.size > 2 * 1024 * 1024) {
+      errBox.textContent = "File too large (max 2 MiB).";
       errBox.classList.add("visible");
       return;
     }
@@ -1802,21 +2032,14 @@ function openImportModal() {
 
   submit.addEventListener("click", async () => {
     if (!file) return;
+    const selectedFile = file;
     submit.disabled = true;
     submit.innerHTML = `<div class="spinner small"></div>`;
     try {
-      const text = await file.text();
-      // Pre-flight: warn early when the file has no DNS lines at all.
-      const hasRecords = /^\S+\s+\d+\s+IN\s+\S+/m.test(text);
-      if (!hasRecords) {
-        errBox.textContent = t("modal.import.empty");
-        errBox.classList.add("visible");
-        submit.disabled = false;
-        submit.innerHTML = `${I.upload} ${esc(t("modal.import.submit"))}`;
-        return;
-      }
-      const res = await api(`/api/zones/${state.zoneId}/import?filename=${encodeURIComponent(file.name)}`, {
-        method: "POST", raw: text,
+      const bytes = await selectedFile.arrayBuffer();
+      if (!modal.isConnected) return;
+      const res = await api(`/api/zones/${zoneId}/import?filename=${encodeURIComponent(selectedFile.name)}`, {
+        method: "POST", raw: bytes,
       });
       const added = res.recs_added ?? 0;
       const parsed = res.total_records_parsed ?? 0;
@@ -1824,8 +2047,8 @@ function openImportModal() {
       if (parsed > added) {
         toast(t("modal.import.skipped", { n: parsed - added }), "info");
       }
-      closeModal();
-      await refreshRecords();
+      if (modal.isConnected) closeModal();
+      if (state.zoneId === zoneId) await refreshRecords();
     } catch (e) {
       errBox.textContent = e.message;
       errBox.classList.add("visible");
@@ -1894,7 +2117,7 @@ function renderSettings() {
           <img class="icon-preview" id="icon-preview" src="/static/favicon.svg" alt="icon">
           <button class="btn sm" id="icon-upload">${I.upload} ${esc(t("settings.icon.upload"))}</button>
           <button class="btn sm ghost" id="icon-reset">${esc(t("settings.icon.reset"))}</button>
-          <input type="file" id="icon-input" accept="image/png,image/jpeg,image/webp,image/gif,image/svg+xml" class="u-hidden">
+          <input type="file" id="icon-input" accept="image/png,image/jpeg,image/webp,image/gif" class="u-hidden">
         </div>
       </div></div>
 
@@ -2002,7 +2225,7 @@ function wireIconSettings() {
     if (!input.files.length) return;
     const f = input.files[0];
     if (f.size > 512 * 1024) { toast(t("settings.icon.too_big"), "error"); input.value = ""; return; }
-    const okTypes = ["image/png", "image/jpeg", "image/webp", "image/gif", "image/svg+xml"];
+    const okTypes = ["image/png", "image/jpeg", "image/webp", "image/gif"];
     if (!okTypes.includes(f.type)) { toast(t("settings.icon.bad_type"), "error"); input.value = ""; return; }
     try {
       const buf = await f.arrayBuffer();
@@ -2072,14 +2295,54 @@ function renderSecurityBody() {
 
 /* ----- 2FA setup ----- */
 
-async function open2faSetupModal() {
-  let begin;
-  try {
-    begin = await api("/api/auth/2fa/begin", { method: "POST", json: {} });
-  } catch (e) {
-    toast(e.message, "error");
-    return;
-  }
+let enrollmentOperation = Promise.resolve();
+
+function withEnrollmentOperation(operation) {
+  const pending = enrollmentOperation.then(operation);
+  enrollmentOperation = pending.catch(() => {});
+  return pending;
+}
+
+function open2faSetupModal() {
+  const modal = openModal(`
+    ${modalHead(t("settings.2fa.enable"))}
+    <div class="modal-body">
+      <div class="login-error" id="begin-2fa-error" role="alert"></div>
+      <label class="field"><span>${esc(t("settings.password.current"))}</span>
+        <input class="input" id="begin-2fa-password" type="password" autocomplete="current-password"></label>
+    </div>
+    <div class="modal-foot">
+      <button class="btn" data-close>${esc(t("modal.cancel"))}</button>
+      <button class="btn primary" id="begin-2fa-submit">${esc(t("settings.2fa.enable"))}</button>
+    </div>`);
+  modal.querySelector("#begin-2fa-submit").addEventListener("click", async () => {
+    const authentication = authGeneration;
+    const btn = modal.querySelector("#begin-2fa-submit");
+    const error = modal.querySelector("#begin-2fa-error");
+    const password = modal.querySelector("#begin-2fa-password").value;
+    if (!password) { error.textContent = t("modal.required"); error.classList.add("visible"); return; }
+    btn.disabled = true;
+    error.classList.remove("visible");
+    try {
+      await withEnrollmentOperation(async () => {
+        if (authentication !== authGeneration || !modal.isConnected || !state.authed) return;
+        const begin = await api("/api/auth/2fa/begin", { method: "POST", json: { password } });
+        if (authentication !== authGeneration) return;
+        if (modal.isConnected && state.authed && state.route === "settings") show2faEnrollment(begin);
+        else await api("/api/auth/2fa/cancel", { method: "POST", json: {} });
+      });
+    } catch (e) {
+      error.textContent = e.message;
+      error.classList.add("visible");
+      btn.disabled = false;
+    }
+  });
+}
+
+function show2faEnrollment(begin) {
+  const authentication = authGeneration;
+  let confirming = false;
+  let completed = false;
   const modal = openModal(`
     ${modalHead(t("settings.2fa.enable"))}
     <div class="modal-body">
@@ -2101,34 +2364,54 @@ async function open2faSetupModal() {
   modal.querySelector("#copy-secret").addEventListener("click", async () => {
     try { await navigator.clipboard.writeText(begin.secret); toast(t("common.copied")); } catch { /* no clipboard */ }
   });
-  const cancel = async () => {
-    try { await api("/api/auth/2fa/cancel", { method: "POST", json: {} }); } catch { /* ignore */ }
-    closeModal();
+  modal.onDismiss = () => {
+    if (!confirming && !completed && authentication === authGeneration) {
+      completed = true;
+      withEnrollmentOperation(() => authentication === authGeneration
+        ? api("/api/auth/2fa/cancel", { method: "POST", json: {} }) : undefined).catch((e) => toast(e.message, "error"));
+    }
   };
-  modal.querySelector("#t2fa-cancel").addEventListener("click", cancel);
+  modal.querySelector("#t2fa-cancel").addEventListener("click", () => closeModal());
 
   modal.querySelector("#t2fa-confirm").addEventListener("click", async () => {
+    if (confirming || authentication !== authGeneration || !state.authed) return;
+    confirming = true;
+    modal.closeBlocked = true;
+    modal.querySelectorAll("[data-close], #t2fa-cancel").forEach((button) => { button.disabled = true; });
     const btn = modal.querySelector("#t2fa-confirm");
     const errBox = modal.querySelector("#t2fa-error");
     errBox.classList.remove("visible");
     btn.disabled = true;
+    const session = { generation: authentication };
     try {
-      const res = await api("/api/auth/2fa/confirm", {
-        method: "POST",
-        json: { code: modal.querySelector("#t2fa-code").value.trim() },
+      const code = modal.querySelector("#t2fa-code").value.trim();
+      const res = await withEnrollmentOperation(() => {
+        if (authentication !== authGeneration || !state.authed) throw new Error("Authentication changed. Sign in again.");
+        return api("/api/auth/2fa/confirm", { method: "POST", json: { code }, authContext: session });
       });
+      completed = true;
+      if (session.generation !== authGeneration || !state.authed) return;
+      state.pendingBackupCodes = [...res.backup_codes];
       state.totpEnabled = true;
       state.backupCodesRemaining = res.backup_codes.length;
-      showBackupCodesModal(res.backup_codes);
+      modal.closeBlocked = false;
+      renderRecoveryNotice();
+      if (modal.isConnected && state.authed) showBackupCodesModal(state.pendingBackupCodes);
     } catch (e) {
       errBox.textContent = e.message;
       errBox.classList.add("visible");
       btn.disabled = false;
+    } finally {
+      confirming = false;
+      modal.closeBlocked = false;
+      modal.querySelectorAll("[data-close], #t2fa-cancel").forEach((button) => { button.disabled = false; });
+      if (!modal.isConnected && !completed) modal.onDismiss();
     }
   });
 }
 
 function showBackupCodesModal(codes) {
+  if (!codes || !state.authed) return;
   const modal = openModal(`
     ${modalHead(t("settings.2fa.backup.title"))}
     <div class="modal-body">
@@ -2161,7 +2444,9 @@ ${codes.join("\n")}
     URL.revokeObjectURL(url);
   });
   modal.querySelector("#bc-done").addEventListener("click", () => {
-    closeModal();
+    state.pendingBackupCodes = null;
+    if (modal.isConnected) closeModal();
+    renderRecoveryNotice();
     toast(t("toast.2fa.enabled"));
     renderSecurityBody();
   });
@@ -2183,6 +2468,7 @@ function open2faDisableModal() {
       <button class="btn danger" id="d2fa-confirm">${esc(t("settings.2fa.disable"))}</button>
     </div>`);
   modal.querySelector("#d2fa-confirm").addEventListener("click", async () => {
+    const session = { generation: authGeneration };
     const btn = modal.querySelector("#d2fa-confirm");
     const errBox = modal.querySelector("#d2fa-error");
     errBox.classList.remove("visible");
@@ -2191,10 +2477,12 @@ function open2faDisableModal() {
       await api("/api/auth/2fa/disable", {
         method: "POST",
         json: { code: modal.querySelector("#d2fa-code").value.trim() },
+        authContext: session,
       });
+      if (session.generation !== authGeneration || !state.authed) return;
       state.totpEnabled = false;
       state.backupCodesRemaining = 0;
-      closeModal();
+      if (modal.isConnected) closeModal();
       toast(t("toast.2fa.disabled"));
       renderSecurityBody();
     } catch (e) {
@@ -2229,6 +2517,7 @@ function openPasswordModal() {
       <button class="btn primary" id="pw-submit">${esc(t("settings.password.submit"))}</button>
     </div>`);
   modal.querySelector("#pw-submit").addEventListener("click", async () => {
+    const session = { generation: authGeneration };
     const btn = modal.querySelector("#pw-submit");
     const errBox = modal.querySelector("#pw-error");
     errBox.classList.remove("visible");
@@ -2245,8 +2534,10 @@ function openPasswordModal() {
           new_password: val("#pw-new"),
           confirm: val("#pw-confirm"),
         },
+        authContext: session,
       });
-      closeModal();
+      if (session.generation !== authGeneration || !state.authed) return;
+      if (modal.isConnected) closeModal();
       toast(t("toast.password"));
     } catch (e) {
       errBox.textContent = e.message;
@@ -2272,11 +2563,6 @@ async function bootAuthed() {
   }
   state.ddns = null;
   render();
-  if (state.route === "records") {
-    state.recordsLoading = true;
-    renderRecordsTable();
-    loadRecords().then(renderRecords).catch((e) => { toast(e.message, "error"); renderRecords(); });
-  }
 }
 
 (async function boot() {

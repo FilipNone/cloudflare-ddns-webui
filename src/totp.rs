@@ -37,21 +37,29 @@ pub fn base32_decode(input: &str) -> Result<Vec<u8>, String> {
     let mut bits: u64 = 0;
     let mut bit_count: u32 = 0;
     let mut out = Vec::new();
+    let mut symbols = 0;
     for c in input.chars() {
         let c = c.to_ascii_uppercase();
         if c == '=' || c == ' ' {
             continue;
+        }
+        if !c.is_ascii() {
+            return Err("invalid base32 character".to_string());
         }
         let val = BASE32_ALPHABET
             .iter()
             .position(|&a| a == c as u8)
             .ok_or_else(|| format!("invalid base32 character '{c}'"))? as u64;
         bits = (bits << 5) | val;
+        symbols += 1;
         bit_count += 5;
         if bit_count >= 8 {
             bit_count -= 8;
             out.push(((bits >> bit_count) & 0xff) as u8);
         }
+    }
+    if matches!(symbols % 8, 1 | 3 | 6) || (bits & ((1 << bit_count) - 1)) != 0 {
+        return Err("invalid base32 trailing bits".to_string());
     }
     Ok(out)
 }
@@ -76,7 +84,10 @@ pub fn totp_at(secret: &[u8], timestamp_secs: u64) -> u32 {
 
 /// Verify a user-supplied 6-digit code, allowing ±1 time step drift.
 pub fn totp_verify(secret: &[u8], code: &str, timestamp_secs: u64) -> bool {
-    let code: u32 = match code.trim().parse() {
+    if secret.is_empty() || code.len() != 6 || !code.bytes().all(|byte| byte.is_ascii_digit()) {
+        return false;
+    }
+    let code: u32 = match code.parse() {
         Ok(c) => c,
         Err(_) => return false,
     };
@@ -143,6 +154,30 @@ mod tests {
         assert_eq!(base32_encode(b"f"), "MY");
     }
 
+    #[test]
+    fn security_base32_rejects_non_ascii_aliases_and_partial_bytes() {
+        for input in ["\u{141}\u{141}", "A", "MZ", "AAA", "AAAAAA"] {
+            assert!(base32_decode(input).is_err(), "invalid base32 accepted");
+        }
+    }
+
+    #[test]
+    fn security_totp_requires_six_ascii_digits() {
+        let secret = b"12345678901234567890";
+        let timestamp = 1111111109;
+        let code = format!("{:06}", totp_at(secret, timestamp));
+        assert!(code.starts_with('0'));
+        assert!(totp_verify(secret, &code, timestamp));
+        for malformed in [
+            code[1..].to_string(),
+            format!("+{code}"),
+            format!("0{code}"),
+            format!(" {code} "),
+        ] {
+            assert!(!totp_verify(secret, &malformed, timestamp));
+        }
+    }
+
     // RFC 6238 Appendix B test vectors (SHA-1, 8-digit codes).
     // We produce 6-digit codes, so compare against the last 6 digits.
     #[test]
@@ -150,7 +185,7 @@ mod tests {
         let secret = b"12345678901234567890";
         let cases = [
             (59u64, 94287082u32),
-            (1111111109, 07081804),
+            (1111111109, 7081804),
             (1111111111, 14050471),
             (1234567890, 89005924),
             (2000000000, 69279037),
@@ -169,8 +204,16 @@ mod tests {
         let code = format!("{:06}", totp_at(secret, ts));
         assert!(totp_verify(secret, &code, ts));
         // ±30s drift accepted
-        assert!(totp_verify(secret, &format!("{:06}", totp_at(secret, ts - 30)), ts));
-        assert!(totp_verify(secret, &format!("{:06}", totp_at(secret, ts + 30)), ts));
+        assert!(totp_verify(
+            secret,
+            &format!("{:06}", totp_at(secret, ts - 30)),
+            ts
+        ));
+        assert!(totp_verify(
+            secret,
+            &format!("{:06}", totp_at(secret, ts + 30)),
+            ts
+        ));
         // Wrong code rejected
         assert!(!totp_verify(secret, "000000", ts) || totp_at(secret, ts) == 0);
     }
