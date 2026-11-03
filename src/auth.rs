@@ -639,24 +639,43 @@ fn generate_backup_codes() -> Vec<String> {
         .collect()
 }
 
-fn backup_salt(normalized: &str) -> [u8; SALT_LEN] {
+/// Salt used by hashes saved before codes had their own random salt. It only
+/// exists so those codes keep working; new hashes never use it.
+fn legacy_backup_salt(normalized: &str) -> [u8; SALT_LEN] {
     let mut s = [0u8; SALT_LEN];
     let h = derive_key(&format!("backup-salt:{normalized}"), b"cfddnswebui-salt");
     s.copy_from_slice(&h[..SALT_LEN]);
     s
 }
 
-fn hash_backup_code(code: &str) -> String {
-    let normalized: String = code.to_uppercase().chars().filter(|c| *c != '-').collect();
-    hex(&derive_key(&normalized, &backup_salt(&normalized)))
-}
-
-fn verify_backup_code(hash_hex: &str, code: &str) -> bool {
-    let normalized: String = code
-        .to_ascii_uppercase()
+fn normalize_backup_code(code: &str) -> String {
+    code.to_ascii_uppercase()
         .chars()
         .filter(|c| *c != '-')
-        .collect();
+        .collect()
+}
+
+/// Stored as `<salt hex>:<key hex>` with a fresh random salt for each code.
+fn hash_backup_code(code: &str) -> String {
+    let normalized = normalize_backup_code(code);
+    let salt = random_bytes::<SALT_LEN>();
+    format!("{}:{}", hex(&salt), hex(&derive_key(&normalized, &salt)))
+}
+
+fn valid_hex(value: &str, len: usize) -> bool {
+    value.len() == len * 2 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// Accepts `<salt hex>:<key hex>`, or a bare key hex written by older versions.
+fn valid_backup_hash(stored: &str) -> bool {
+    match stored.split_once(':') {
+        Some((salt, key)) => valid_hex(salt, SALT_LEN) && valid_hex(key, KEY_LEN),
+        None => valid_hex(stored, KEY_LEN),
+    }
+}
+
+fn verify_backup_code(stored: &str, code: &str) -> bool {
+    let normalized = normalize_backup_code(code);
     if normalized.len() != 8
         || !normalized
             .bytes()
@@ -664,14 +683,20 @@ fn verify_backup_code(hash_hex: &str, code: &str) -> bool {
     {
         return false;
     }
-    let expected: [u8; KEY_LEN] = match hex_decode_key(hash_hex) {
-        Some(e) => e,
-        None => return false,
+    let (salt, expected) = match stored.split_once(':') {
+        Some((salt, key)) => match (hex_decode_salt(salt), hex_decode_key(key)) {
+            (Some(salt), Some(key)) => (salt, key),
+            _ => return false,
+        },
+        None => match hex_decode_key(stored) {
+            Some(key) => (legacy_backup_salt(&normalized), key),
+            None => return false,
+        },
     };
     pbkdf2::verify(
         pbkdf2::PBKDF2_HMAC_SHA256,
         NonZeroU32::new(PBKDF2_ITERATIONS).unwrap(),
-        &backup_salt(&normalized),
+        &salt,
         normalized.as_bytes(),
         &expected,
     )
@@ -700,9 +725,6 @@ fn load_state(path: &str) -> Result<AuthState, String> {
     }
     let state: AuthState =
         serde_json::from_str(&text).map_err(|_| "invalid auth state JSON".to_string())?;
-    let valid_hex = |value: &str, len: usize| {
-        value.len() == len * 2 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
-    };
     match (&state.password_salt, &state.password_key) {
         (None, None) => return Err("auth state is missing a password".to_string()),
         (Some(salt), Some(key)) if valid_hex(salt, SALT_LEN) && valid_hex(key, KEY_LEN) => {}
@@ -729,7 +751,7 @@ fn load_state(path: &str) -> Result<AuthState, String> {
     if state
         .backup_code_hashes
         .iter()
-        .any(|hash| !valid_hex(hash, KEY_LEN))
+        .any(|hash| !valid_backup_hash(hash))
     {
         return Err("invalid auth recovery hash".to_string());
     }
@@ -1462,6 +1484,15 @@ mod tests {
             &"0".repeat(KEY_LEN * 2 + 2),
             &"g".repeat(KEY_LEN * 2),
             &"+0".repeat(KEY_LEN),
+            &format!("{}:", hex(&[1; SALT_LEN])),
+            &format!(":{}", hex(&[2; KEY_LEN])),
+            &format!("{}:{}", hex(&[1; SALT_LEN - 1]), hex(&[2; KEY_LEN])),
+            &format!(
+                "{}:{}:{}",
+                hex(&[1; SALT_LEN]),
+                hex(&[2; KEY_LEN]),
+                hex(&[3; 1])
+            ),
         ] {
             file.write(
                 serde_json::json!({
@@ -1522,6 +1553,48 @@ mod tests {
             assert!(verify_backup_code(&h, &nodash));
             assert!(!verify_backup_code(&h, "AAAA-AAAA"));
         }
+    }
+
+    #[test]
+    fn backup_code_hashes_use_a_random_salt_per_code() {
+        let code = "ABCD-EFGH";
+        let first = hash_backup_code(code);
+        let second = hash_backup_code(code);
+        assert_ne!(first, second);
+        for stored in [&first, &second] {
+            let (salt, key) = stored.split_once(':').expect("salt:key format");
+            assert_eq!(salt.len(), SALT_LEN * 2);
+            assert_eq!(key.len(), KEY_LEN * 2);
+            assert!(verify_backup_code(stored, code));
+            assert!(verify_backup_code(stored, "abcdefgh"));
+            assert!(!verify_backup_code(stored, "ABCD-EFGJ"));
+        }
+    }
+
+    #[test]
+    fn legacy_backup_code_hashes_still_verify() {
+        // Hashes saved before per-code salts used a salt derived from the code.
+        let normalized = "ABCDEFGH";
+        let derived = derive_key(&format!("backup-salt:{normalized}"), b"cfddnswebui-salt");
+        let legacy = hex(&derive_key(normalized, &derived[..SALT_LEN]));
+        assert!(verify_backup_code(&legacy, "abcd-efgh"));
+        assert!(!verify_backup_code(&legacy, "ABCD-EFGJ"));
+    }
+
+    #[test]
+    fn startup_accepts_salted_and_legacy_recovery_hashes() {
+        let file = TestState::new();
+        let salted = format!("{}:{}", hex(&[1; SALT_LEN]), hex(&[2; KEY_LEN]));
+        file.write(
+            serde_json::json!({
+                "password_salt": hex(&[0; SALT_LEN]),
+                "password_key": hex(&[0; KEY_LEN]),
+                "totp_secret": crate::totp::base32_encode(&[0; TOTP_SECRET_LEN]),
+                "backup_code_hashes": [hex(&[0; KEY_LEN]), salted]
+            })
+            .to_string(),
+        );
+        assert_eq!(file.load().unwrap().backup_codes_remaining(), 2);
     }
 
     #[test]
