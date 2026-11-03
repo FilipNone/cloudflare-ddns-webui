@@ -1582,7 +1582,7 @@ def main():
                 request(app.port, "POST", "/api/auth/setup",
                         {"password": PASSWORD, "confirm": PASSWORD})
                 print(f"URL: http://127.0.0.1:{app.port}", flush=True)
-                print(f"Synthetic password: {PASSWORD}", flush=True)
+                print("Password: the PASSWORD constant in scripts/smoke-test.py", flush=True)
                 threading.Event().wait()
             finally:
                 app.close()
