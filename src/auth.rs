@@ -1582,6 +1582,38 @@ mod tests {
     }
 
     #[test]
+    fn legacy_recovery_hash_from_state_file_logs_in_once_after_restart() {
+        let file = TestState::new();
+        let password_salt = [7; SALT_LEN];
+        let normalized = "ABCDEFGH";
+        let derived = derive_key(&format!("backup-salt:{normalized}"), b"cfddnswebui-salt");
+        let legacy = hex(&derive_key(normalized, &derived[..SALT_LEN]));
+        file.write(
+            serde_json::json!({
+                "password_salt": hex(&password_salt),
+                "password_key": hex(&derive_key("synthetic-password", &password_salt)),
+                "totp_secret": crate::totp::base32_encode(&[0; TOTP_SECRET_LEN]),
+                "backup_code_hashes": [legacy]
+            })
+            .to_string(),
+        );
+        let auth = file.load().unwrap();
+        let ip = "127.0.0.1".parse().unwrap();
+        let challenge = auth.login_step1(ip, "synthetic-password").unwrap().unwrap();
+        assert!(matches!(
+            auth.login_step2(ip, &challenge, "abcd-efgh"),
+            Ok(Login2faOutcome::BackupCode { remaining: 0 })
+        ));
+        let restarted = file.load().unwrap();
+        assert_eq!(restarted.backup_codes_remaining(), 0);
+        let challenge = restarted
+            .login_step1(ip, "synthetic-password")
+            .unwrap()
+            .unwrap();
+        assert!(restarted.login_step2(ip, &challenge, "ABCD-EFGH").is_err());
+    }
+
+    #[test]
     fn startup_accepts_salted_and_legacy_recovery_hashes() {
         let file = TestState::new();
         let salted = format!("{}:{}", hex(&[1; SALT_LEN]), hex(&[2; KEY_LEN]));
