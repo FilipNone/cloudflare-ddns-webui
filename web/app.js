@@ -71,6 +71,12 @@ const I18N = {
     "records.all_types": "All types",
     "records.columns": "Columns",
     "records.refresh": "Refresh",
+    "records.view": "View",
+    "records.view.list": "List",
+    "records.view.card": "Cards",
+    "records.select_all": "Select all on this page",
+    "records.select": "Select {name}",
+    "records.sort": "Sort by",
     "records.selected": "{n} selected",
     "records.edit": "Edit",
     "records.delete": "Delete",
@@ -331,6 +337,7 @@ const state = {
   sort: { key: "name", dir: 1 },
   page: 1,
   perPage: parseInt(localStorage.getItem("cfddns.perPage") || "20", 10),
+  view: localStorage.getItem("cfddns.view") === "card" ? "card" : "list",
   selection: new Set(),
   columns: { ...DEFAULT_COLUMNS, ...JSON.parse(localStorage.getItem("cfddns.columns") || "{}") },
   sidebarCollapsed: localStorage.getItem("cfddns.sidebar") === "collapsed",
@@ -351,6 +358,28 @@ let pageGeneration = 0;
 let recordsRequest = 0;
 let ddnsRequest = 0;
 
+const viewMedia = window.matchMedia("(max-width: 600px)");
+viewMedia.addEventListener("change", () => {
+  if (state.authed && ["dashboard", "records"].includes(state.route)) render();
+});
+
+function currentView() { return viewMedia.matches ? "card" : state.view; }
+
+function viewControls() {
+  if (viewMedia.matches) return "";
+  return `<div class="view-switch" role="group" aria-label="${esc(t("records.view"))}">
+    ${["list", "card"].map((view) => `<button class="btn sm ${currentView() === view ? "active" : ""}" data-view="${view}" aria-pressed="${currentView() === view}">${esc(t("records.view." + view))}</button>`).join("")}</div>`;
+}
+
+function wireViewControls(redraw) {
+  document.querySelectorAll("[data-view]").forEach((button) => button.addEventListener("click", () => {
+    state.view = button.dataset.view;
+    localStorage.setItem("cfddns.view", state.view);
+    redraw();
+    document.querySelector(`[data-view="${state.view}"]`)?.focus();
+  }));
+}
+
 function invalidatePageRequests() {
   pageGeneration++;
   recordsRequest++;
@@ -367,6 +396,8 @@ function invalidatePageRequests() {
 
 const themeMedia = window.matchMedia("(prefers-color-scheme: dark)");
 themeMedia.addEventListener("change", () => applyTheme());
+let themeTransition = null;
+let iconRevision = Date.now();
 
 function currentTheme() { return localStorage.getItem("cfddns.theme") || "system"; }
 
@@ -374,11 +405,89 @@ function applyTheme() {
   const mode = currentTheme();
   const dark = mode === "dark" || (mode === "system" && themeMedia.matches);
   document.documentElement.classList.toggle("dark", dark);
+  if (state.config) applyAccent(state.config.accent);
 }
 
-function setTheme(mode) {
+function setTheme(mode, origin) {
+  if (!["system", "light", "dark"].includes(mode)) return;
   localStorage.setItem("cfddns.theme", mode);
-  applyTheme();
+  themeTransition?.skipTransition();
+  const root = document.documentElement;
+  const dark = mode === "dark" || (mode === "system" && themeMedia.matches);
+  if (!origin || root.classList.contains("dark") === dark
+    || window.matchMedia("(prefers-reduced-motion: reduce)").matches
+    || !document.startViewTransition || !root.animate) {
+    applyTheme();
+    return;
+  }
+  const rect = origin.getBoundingClientRect();
+  const x = rect.left + rect.width / 2, y = rect.top + rect.height / 2;
+  const radius = Math.hypot(Math.max(x, window.innerWidth - x), Math.max(y, window.innerHeight - y));
+  root.classList.add("theme-changing");
+  try {
+    const transition = document.startViewTransition(applyTheme);
+    themeTransition = transition;
+    transition.ready.then(() => {
+      root.animate({ clipPath: [`circle(0px at ${x}px ${y}px)`, `circle(${radius}px at ${x}px ${y}px)`] }, {
+        duration: 450, easing: "ease-in-out", pseudoElement: "::view-transition-new(root)",
+      });
+    }).catch(() => { applyTheme(); transition.skipTransition(); });
+    transition.finished.catch(() => {}).finally(() => {
+      if (themeTransition !== transition) return;
+      themeTransition = null;
+      root.classList.remove("theme-changing");
+    });
+  } catch {
+    root.classList.remove("theme-changing");
+    applyTheme();
+  }
+}
+
+function applyAccent(color) {
+  const accent = /^#[0-9a-f]{6}$/i.test(color || "") ? color.toLowerCase() : "#f6821f";
+  const rgb = [1, 3, 5].map((offset) => parseInt(accent.slice(offset, offset + 2), 16));
+  const luminance = (values) => {
+    const linear = values.map((value) => value / 255 <= 0.04045 ? value / 255 / 12.92 : ((value / 255 + 0.055) / 1.055) ** 2.4);
+    return linear[0] * 0.2126 + linear[1] * 0.7152 + linear[2] * 0.0722;
+  };
+  const light = luminance(rgb) > 0.179;
+  const hover = rgb.map((value) => Math.round(value * 0.88 + (light ? 255 : 0) * 0.12));
+  const dark = document.documentElement.classList.contains("dark");
+  const surfaces = dark ? [[9, 9, 11], [13, 13, 16], [16, 16, 19], [20, 20, 23], [26, 26, 31]] : [[244, 244, 246], [255, 255, 255], [240, 240, 243]];
+  const backgrounds = surfaces.flatMap((surface) => [surface, surface.map((value, i) => value * 0.88 + rgb[i] * 0.12)]);
+  let foreground = rgb;
+  for (let step = 0; step <= 100; step++) {
+    foreground = rgb.map((value) => Math.round(value * (1 - step / 100) + (dark ? 255 : 0) * step / 100));
+    const text = luminance(foreground);
+    if (backgrounds.every((background) => {
+      const surface = luminance(background);
+      return (Math.max(text, surface) + 0.05) / (Math.min(text, surface) + 0.05) >= 4.5;
+    })) break;
+  }
+  const style = document.documentElement.style;
+  style.setProperty("--accent", accent);
+  style.setProperty("--accent-hover", `rgb(${hover.join(", ")})`);
+  style.setProperty("--accent-text", `rgb(${foreground.join(", ")})`);
+  style.setProperty("--accent-soft", `rgba(${rgb.join(", ")}, 0.12)`);
+  style.setProperty("--accent-contrast", light ? "#000000" : "#ffffff");
+}
+
+function iconUrl() { return `/static/favicon.svg?v=${iconRevision}`; }
+
+function brandLogo(cls = "", id = "") {
+  const custom = !!state.config?.has_icon;
+  return `<span class="brand-logo ${custom ? "brand-custom" : "brand-default"} ${cls}"><img data-brand-logo ${id ? `id="${id}"` : ""} src="${custom ? iconUrl() : `/static/default-logo.svg?v=${iconRevision}`}" alt="logo"></span>`;
+}
+
+function refreshBranding() {
+  iconRevision++;
+  const custom = !!state.config?.has_icon;
+  document.querySelectorAll("[data-brand-logo]").forEach((img) => {
+    img.src = custom ? iconUrl() : `/static/default-logo.svg?v=${iconRevision}`;
+    img.parentElement?.classList.toggle("brand-custom", custom);
+    img.parentElement?.classList.toggle("brand-default", !custom);
+  });
+  document.querySelectorAll('link[rel="icon"]').forEach((link) => { link.href = iconUrl(); });
 }
 
 function themeIcon() {
@@ -386,10 +495,10 @@ function themeIcon() {
   return mode === "dark" ? I.moon : mode === "light" ? I.sun : I.monitor;
 }
 
-function cycleTheme() {
+function cycleTheme(event) {
   const order = ["system", "light", "dark"];
   const next = order[(order.indexOf(currentTheme()) + 1) % order.length];
-  setTheme(next);
+  setTheme(next, event?.currentTarget);
   document.querySelectorAll("[data-theme-btn]").forEach((b) => {
     b.innerHTML = themeIcon();
     b.title = t("settings.theme." + (next === "system" ? "system" : next));
@@ -457,6 +566,22 @@ const V = {
 
 /* ================= API ================= */
 
+function resetSessionData() {
+  recordsRequest++;
+  ddnsRequest++;
+  state.records = [];
+  state.recordsTotal = 0;
+  state.recordsZoneId = null;
+  state.recordsAttemptedZoneId = null;
+  state.recordsError = null;
+  state.recordsLoading = false;
+  state.selection.clear();
+  state.ddns = null;
+  state.ddnsLoading = false;
+  state.ddnsUpdating = false;
+  state.ddnsUpdateResult = null;
+}
+
 async function api(path, opts = {}) {
   const authentication = authGeneration;
   const page = pageGeneration;
@@ -483,8 +608,7 @@ async function api(path, opts = {}) {
     if (authentication === authGeneration && page === pageGeneration && zoneId === state.zoneId) {
       authGeneration++;
       state.authed = false;
-      state.ddnsUpdating = false;
-      state.ddnsUpdateResult = null;
+      resetSessionData();
       state.pendingBackupCodes = null;
       invalidatePageRequests();
       render();
@@ -495,13 +619,7 @@ async function api(path, opts = {}) {
   if (resp.ok && init.method === "POST" && sameAuthentication
     && ["/api/auth/setup", "/api/auth/login", "/api/auth/login/2fa", "/api/auth/logout", "/api/auth/password", "/api/auth/2fa/confirm", "/api/auth/2fa/disable"].includes(path)) {
     authGeneration++;
-    recordsRequest++;
-    ddnsRequest++;
-    if (state.recordsLoading) state.recordsAttemptedZoneId = null;
-    state.recordsLoading = false;
-    state.ddnsLoading = false;
-    state.ddnsUpdating = false;
-    state.ddnsUpdateResult = null;
+    resetSessionData();
     if (["/api/auth/setup", "/api/auth/login", "/api/auth/login/2fa", "/api/auth/logout"].includes(path)) {
       state.pendingBackupCodes = null;
     }
@@ -717,7 +835,10 @@ function bindDropdown(btnId, menuId) {
 /* ================= Data loading ================= */
 
 async function loadZones() {
-  state.zones = await api("/api/zones");
+  const authentication = authGeneration;
+  const zones = await api("/api/zones");
+  if (authentication !== authGeneration || !state.authed) return;
+  state.zones = zones;
   const preferred = localStorage.getItem("cfddns.zone");
   if (preferred && state.zones.some((z) => z.id === preferred)) {
     state.zoneId = preferred;
@@ -786,7 +907,7 @@ function render() {
     <div class="layout ${state.sidebarCollapsed ? "collapsed" : ""} ${state.mobileNavOpen ? "mobile-open" : ""}" id="layout">
       <aside class="sidebar" id="sidebar">
         <div class="sidebar-brand">
-          <img src="/static/favicon.svg?v=${state.config?.version || "1"}" alt="logo">
+          ${brandLogo()}
           <span>${esc(t("app.name"))}</span>
         </div>
         <nav class="sidebar-nav">
@@ -826,10 +947,8 @@ function render() {
   el("logout-btn").addEventListener("click", async () => {
     try { await api("/api/auth/logout", { method: "POST" }); } catch { /* ignore */ }
     state.authed = false;
-    state.ddnsUpdating = false;
+    resetSessionData();
     invalidatePageRequests();
-    state.records = []; state.recordsZoneId = null; state.recordsAttemptedZoneId = null;
-    state.ddns = null; state.ddnsUpdateResult = null;
     state.pendingBackupCodes = null;
     navigate("dashboard");
     render();
@@ -890,13 +1009,6 @@ function renderTopbarActions() {
     });
     box.appendChild(zoneSelect);
   }
-  const themeBtn = document.createElement("button");
-  themeBtn.className = "btn icon";
-  themeBtn.dataset.themeBtn = "1";
-  themeBtn.title = t("settings.theme." + currentTheme());
-  themeBtn.innerHTML = themeIcon();
-  themeBtn.addEventListener("click", cycleTheme);
-  box.appendChild(themeBtn);
 }
 
 /* ================= Render: first-run setup ================= */
@@ -905,7 +1017,7 @@ function renderSetup(app) {
   app.innerHTML = loginShell(`
     <form class="login-card" id="setup-form">
       <div class="login-logo">
-        <img src="/static/favicon.svg" alt="logo">
+        ${brandLogo()}
         <h1>${esc(t("app.name"))}</h1>
       </div>
       <p class="login-sub">${esc(t("setup.subtitle"))}</p>
@@ -921,6 +1033,7 @@ function renderSetup(app) {
       </label>
       <button class="btn primary u-w100" type="submit" id="setup-submit">${esc(t("setup.submit"))}</button>
     </form>`);
+  wireLoginShell();
 
   el("setup-form").addEventListener("submit", async (e) => {
     e.preventDefault();
@@ -951,7 +1064,7 @@ function loginShell(cardHtml) {
   return `
     <div class="login-wrap">
       <div class="login-corner">
-        <button class="btn icon" data-theme-btn="1" title="${esc(t("settings.theme." + currentTheme()))}">${themeIcon()}</button>
+        <button class="btn icon" type="button" data-theme-btn="1" title="${esc(t("settings.theme." + currentTheme()))}" aria-label="${esc(t("settings.theme"))}">${themeIcon()}</button>
         <div class="dropdown">
           <button class="btn icon" id="login-lang-btn" title="${esc(t("settings.lang.title"))}">${I.globe}</button>
           <div class="menu" id="login-lang-menu">
@@ -984,7 +1097,7 @@ function renderLogin(app) {
   app.innerHTML = loginShell(`
     <form class="login-card" id="login-form">
       <div class="login-logo">
-        <img src="/static/favicon.svg" alt="logo">
+        ${brandLogo()}
         <h1>${esc(t("app.name"))}</h1>
       </div>
       <p class="login-sub">${esc(t("login.subtitle"))}</p>
@@ -1026,7 +1139,7 @@ function renderLogin2fa(app) {
   app.innerHTML = loginShell(`
     <form class="login-card" id="login2fa-form">
       <div class="login-logo">
-        <img src="/static/favicon.svg" alt="logo">
+        ${brandLogo()}
         <h1>${esc(t("login.2fa.title"))}</h1>
       </div>
       <p class="login-sub">${esc(t("login.2fa.subtitle"))}</p>
@@ -1132,6 +1245,14 @@ function renderDashboardCards() {
     else if (dom.in_sync) statusBadge = `<span class="badge green">${esc(t("dash.ddns.synced"))}</span>`;
     else if (dom.dns_ips.length === 0) statusBadge = `<span class="badge yellow">${esc(t("dash.ddns.missing"))}</span>`;
     else statusBadge = `<span class="badge yellow">${esc(t("dash.ddns.out_of_sync"))}</span>`;
+    if (currentView() === "card") return `<article class="ddns-card">
+      <div class="record-card-head"><strong>${esc(dom.domain)}</strong><span class="badge">${esc(dom.record_type)}</span></div>
+      <dl class="record-details">
+        <div><dt>${esc(t("dash.ddns.detected"))}</dt><dd class="mono">${esc(dom.detected_ip || "-")}</dd></div>
+        <div><dt>${esc(t("dash.ddns.dns"))}</dt><dd class="mono">${esc(dom.dns_ips.join(", ") || "-")}</dd></div>
+      </dl>
+      <div class="record-card-foot">${statusBadge}</div>
+      ${dom.error ? `<p class="cell-muted record-error">${esc(dom.error)}</p>` : ""}</article>`;
     return `<tr>
       <td class="name-cell">${esc(dom.domain)}</td>
       <td><span class="badge">${esc(dom.record_type)}</span></td>
@@ -1145,12 +1266,13 @@ function renderDashboardCards() {
       <div class="toolbar">
         <div class="card-title u-mb0">${esc(t("dash.ddns.title"))}</div>
         <div class="u-flex1"></div>
+        ${viewControls()}
         <button class="btn ghost sm" id="ddns-refresh" ${state.ddnsLoading ? "disabled" : ""}>${I.refresh} ${esc(t("records.refresh"))}</button>
         <button class="btn primary sm" id="ddns-update" ${state.ddnsUpdating || state.ddnsLoading || !d || d.error || d.manual_updates_enabled === false ? "disabled" : ""}>${I.bolt} ${esc(t(state.ddnsUpdating ? "dash.ddns.updating" : "dash.ddns.update_now"))}</button>
       </div>
       ${d?.error ? `<div class="card-pad login-error visible" role="alert">${esc(d.error)}</div>` : ""}
       ${d?.contract_version ? `<div class="card-pad cell-muted">${esc(t("dash.ddns.contract", { contract: d.contract_version }))}</div>` : ""}
-      <div class="table-wrap">
+      ${currentView() === "card" ? `<div class="ddns-cards">${state.ddnsLoading ? '<div class="skeleton"></div>' : rows || `<p class="cell-muted">${esc(t("dash.ddns.not_configured"))}</p>`}</div>` : `<div class="table-wrap">
         <table class="data">
           <thead><tr>
             <th>${esc(t("dash.ddns.domain"))}</th>
@@ -1161,10 +1283,11 @@ function renderDashboardCards() {
           </tr></thead>
           <tbody>${state.ddnsLoading ? `<tr><td colspan="5"><div class="skeleton"></div></td></tr>` : rows || `<tr><td colspan="5" class="cell-muted u-cell-empty">${esc(t("dash.ddns.not_configured"))}</td></tr>`}</tbody>
         </table>
-      </div>
+      </div>`}
       ${ddnsUpdateLog()}
     </div>`;
 
+  wireViewControls(renderDashboardCards);
   const refreshBtn = el("ddns-refresh");
   if (refreshBtn) refreshBtn.addEventListener("click", async () => { await loadDdns(); renderDashboard(); });
   const updateBtn = el("ddns-update");
@@ -1261,7 +1384,8 @@ function renderRecords() {
       <div class="toolbar" id="records-toolbar">
         <div class="search-box">${I.search}<input class="input" id="search-input" placeholder="${esc(t("records.search"))}" value="${esc(state.search)}"></div>
         <div class="u-flex1"></div>
-        <div class="dropdown">
+        ${viewControls()}
+        <div class="dropdown ${currentView() === "card" ? "u-hidden" : ""}">
           <button class="btn" id="columns-btn">${I.columns} ${esc(t("records.columns"))}</button>
           <div class="menu" id="columns-menu">
             <div class="menu-label">${esc(t("records.columns"))}</div>
@@ -1295,6 +1419,15 @@ function renderRecords() {
     state.page = 1;
     renderRecordsTable();
   });
+  wireViewControls(renderRecords);
+  if (currentView() === "card") {
+    el("records-toolbar").insertBefore(mselect({
+      label: t("records.sort"),
+      options: ["name", "type", "content", "ttl", "updated", "created"].flatMap((key) => [1, -1].map((dir) => ({ value: `${key}:${dir}`, label: `${t("col." + key)} ${dir === 1 ? "\u2191" : "\u2193"}` }))),
+      value: `${state.sort.key}:${state.sort.dir}`,
+      onChange: (value) => { const [key, dir] = value.split(":"); state.sort = { key, dir: Number(dir) }; renderRecordsTable(); },
+    }), el("refresh-btn"));
+  }
   bindDropdown("columns-btn", "columns-menu");
   document.querySelectorAll("#columns-menu [data-col]").forEach((b) =>
     b.addEventListener("click", () => {
@@ -1320,7 +1453,7 @@ function renderRecordsTable() {
   if (!wrap) return;
 
   if (state.recordsLoading) {
-    wrap.innerHTML = `<table class="data"><tbody>
+    wrap.innerHTML = currentView() === "card" ? `<div class="record-cards">${Array.from({ length: 3 }, () => '<div class="record-card"><div class="skeleton"></div></div>').join("")}</div>` : `<table class="data"><tbody>
       ${Array.from({ length: 5 }).map(() => `<tr class="skeleton-row"><td colspan="8"><div class="skeleton"></div></td></tr>`).join("")}
     </tbody></table>`;
     el("pagination").innerHTML = "";
@@ -1394,7 +1527,8 @@ function renderRecordsTable() {
 
   wrap.innerHTML = rows.length === 0
     ? `<div class="empty-state">${I.file}<h4>${esc(t("records.empty.title"))}</h4><p>${esc(t("records.empty.desc"))}</p></div>`
-    : `<table class="data"><thead><tr>${headCols.join("")}</tr></thead><tbody>${bodyRows}</tbody></table>`;
+    : currentView() === "card" ? `<label class="card-select-all"><input type="checkbox" id="select-all">${esc(t("records.select_all"))}</label><div class="record-cards">${rows.map((r) => recordCard(r)).join("")}</div>`
+      : `<table class="data"><thead><tr>${headCols.join("")}</tr></thead><tbody>${bodyRows}</tbody></table>`;
 
   const selectAll = el("select-all");
   if (selectAll) {
@@ -1402,18 +1536,24 @@ function renderRecordsTable() {
     const selectedOnPage = pageIds.filter((id) => state.selection.has(id)).length;
     selectAll.classList.toggle("checked", selectedOnPage > 0 && selectedOnPage === pageIds.length);
     selectAll.classList.toggle("indeterminate", selectedOnPage > 0 && selectedOnPage < pageIds.length);
+    selectAll.checked = selectedOnPage > 0 && selectedOnPage === pageIds.length;
+    selectAll.indeterminate = selectedOnPage > 0 && selectedOnPage < pageIds.length;
     selectAll.addEventListener("click", () => {
+      const focused = document.activeElement === selectAll;
       if (selectedOnPage === pageIds.length) pageIds.forEach((id) => state.selection.delete(id));
       else pageIds.forEach((id) => state.selection.add(id));
       renderRecordsTable();
+      if (focused) el("select-all")?.focus();
     });
   }
   wrap.querySelectorAll("[data-select]").forEach((cb) =>
     cb.addEventListener("click", () => {
       const id = cb.dataset.select;
+      const focused = document.activeElement === cb;
       if (state.selection.has(id)) state.selection.delete(id);
       else state.selection.add(id);
       renderRecordsTable();
+      if (focused) [...wrap.querySelectorAll("[data-select]")].find((item) => item.dataset.select === id)?.focus();
     })
   );
   wrap.querySelectorAll("[data-sort]").forEach((th) =>
@@ -1444,6 +1584,28 @@ function renderRecordsTable() {
 
   renderPagination(total, from, rows.length);
   updateBulkbar();
+}
+
+function recordCard(r) {
+  const selected = state.selection.has(r.id);
+  const content = r.type === "SRV" && r.data ? `${r.data.priority ?? ""} ${r.data.weight ?? ""} ${r.data.port ?? ""} ${r.data.target ?? r.content}` : r.content;
+  return `<article class="record-card ${selected ? "selected" : ""}" data-row="${esc(r.id)}">
+    <div class="record-card-head">
+      <input type="checkbox" data-select="${esc(r.id)}" aria-label="${esc(t("records.select", { name: r.name }))}" ${selected ? "checked" : ""}>
+      <strong>${esc(r.name)}</strong><span class="badge">${esc(r.type)}</span>
+    </div>
+    <button class="record-content mono cell-copy" data-copy="${esc(r.content)}" title="${esc(t("common.copy"))}">${esc(content)}</button>
+    <dl class="record-details">
+      <div><dt>${esc(t("col.proxy"))}</dt><dd><span class="proxy-pill ${r.proxiable ? r.proxied ? "on" : "off" : ""}">${r.proxied ? I.cloudFill : I.cloud} ${esc(t(r.proxiable ? r.proxied ? "proxy.proxied" : "proxy.dns_only" : "proxy.na"))}</span></dd></div>
+      <div><dt>${esc(t("col.ttl"))}</dt><dd>${esc(fmtTtl(r.ttl))}</dd></div>
+      ${r.comment ? `<div class="record-detail-full"><dt>${esc(t("col.comment"))}</dt><dd>${esc(r.comment)}</dd></div>` : ""}
+      ${r.tags?.length ? `<div class="record-detail-full"><dt>${esc(t("col.tags"))}</dt><dd>${r.tags.map((tag) => `<span class="tag-chip">${esc(tag)}</span>`).join("")}</dd></div>` : ""}
+      ${["updated", "created"].filter((key) => state.columns[key]).map((key) => `<div class="record-detail-full"><dt>${esc(t("col." + key))}</dt><dd>${esc(fmtDate(key === "updated" ? r.modified_on : r.created_on))}</dd></div>`).join("")}
+    </dl>
+    <div class="record-card-foot">
+      <button class="btn sm" data-edit="${esc(r.id)}">${I.edit} ${esc(t("records.edit"))}</button>
+      <button class="btn sm danger" data-delete="${esc(r.id)}">${I.trash} ${esc(t("records.delete"))}</button>
+    </div></article>`;
 }
 
 function renderPagination(total, from, shown) {
@@ -2114,7 +2276,7 @@ function renderSettings() {
             <div class="lbl">${esc(t("settings.icon"))}</div>
             <div class="hint">${esc(t("settings.icon.hint"))}</div>
           </div>
-          <img class="icon-preview" id="icon-preview" src="/static/favicon.svg" alt="icon">
+          ${brandLogo("icon-preview", "icon-preview")}
           <button class="btn sm" id="icon-upload">${I.upload} ${esc(t("settings.icon.upload"))}</button>
           <button class="btn sm ghost" id="icon-reset">${esc(t("settings.icon.reset"))}</button>
           <input type="file" id="icon-input" accept="image/png,image/jpeg,image/webp,image/gif" class="u-hidden">
@@ -2153,15 +2315,18 @@ function renderSettings() {
     </div>`;
 
   // Theme select
-  el("settings-theme-slot").replaceWith(mselect({
+  const themeSelect = mselect({
+    id: "settings-theme-select",
+    label: t("settings.theme"),
     options: [
       { value: "system", label: t("settings.theme.system") },
       { value: "light", label: t("settings.theme.light") },
       { value: "dark", label: t("settings.theme.dark") },
     ],
     value: currentTheme(),
-    onChange: (v) => { setTheme(v); renderTopbarActions(); },
-  }));
+    onChange: (v) => setTheme(v, themeSelect.querySelector(".mselect-btn")),
+  });
+  el("settings-theme-slot").replaceWith(themeSelect);
 
   // Language select
   el("settings-lang-slot").replaceWith(mselect({
@@ -2184,17 +2349,26 @@ function renderAccentRow() {
   ACCENT_PRESETS.forEach((color, i) => {
     const b = document.createElement("button");
     b.className = `swatch sw-${i} ${current.toLowerCase() === color ? "selected" : ""}`;
+    b.type = "button";
     b.title = color;
+    b.setAttribute("aria-label", color);
+    b.setAttribute("aria-pressed", String(current.toLowerCase() === color));
     b.addEventListener("click", () => saveAccent(color));
     row.appendChild(b);
   });
+  const custom = document.createElement("label");
+  custom.className = `swatch swatch-custom ${ACCENT_PRESETS.includes(current.toLowerCase()) ? "" : "selected"}`;
+  custom.style.setProperty("--swatch-color", current);
+  custom.innerHTML = I.edit;
   const picker = document.createElement("input");
   picker.type = "color";
   picker.className = "color-input";
   picker.value = /^#[0-9a-fA-F]{6}$/.test(current) ? current : "#f6821f";
   picker.title = "Custom color";
+  picker.setAttribute("aria-label", "Custom color");
   picker.addEventListener("change", () => saveAccent(picker.value));
-  row.appendChild(picker);
+  custom.appendChild(picker);
+  row.appendChild(custom);
   const reset = document.createElement("button");
   reset.className = "btn sm ghost";
   reset.textContent = "Default";
@@ -2206,10 +2380,8 @@ async function saveAccent(color) {
   try {
     await api("/api/ui/accent", { method: "POST", json: { accent: color } });
     state.config.accent = color;
-    document.documentElement.style.setProperty("--accent", color || "");
-    if (color) document.documentElement.style.setProperty("--accent", color);
-    else document.documentElement.style.removeProperty("--accent");
-    // Recompute hover color minimally: keep hover as-is (server injects on next load).
+    applyAccent(color);
+    // Refresh the derived palette without waiting for a reload.
     toast(t("toast.accent"));
     renderAccentRow();
   } catch (e) {
@@ -2219,7 +2391,6 @@ async function saveAccent(color) {
 
 function wireIconSettings() {
   const input = el("icon-input");
-  const preview = el("icon-preview");
   el("icon-upload").addEventListener("click", () => input.click());
   input.addEventListener("change", async () => {
     if (!input.files.length) return;
@@ -2233,9 +2404,9 @@ function wireIconSettings() {
         method: "POST", raw: buf, rawType: f.type,
       });
       toast(t("toast.icon"));
-      preview.src = `/static/favicon.svg?v=${Date.now()}`;
+      state.config.has_icon = true;
       // Update favicon immediately.
-      document.querySelectorAll('link[rel="icon"]').forEach((l) => { l.href = `/static/favicon.svg?v=${Date.now()}`; });
+      refreshBranding();
     } catch (e) {
       toast(e.message, "error");
     }
@@ -2245,8 +2416,8 @@ function wireIconSettings() {
     try {
       await api("/api/ui/icon", { method: "DELETE" });
       toast(t("toast.icon"));
-      preview.src = "/static/favicon.svg";
-      document.querySelectorAll('link[rel="icon"]').forEach((l) => { l.href = "/static/favicon.svg"; });
+      state.config.has_icon = false;
+      refreshBranding();
     } catch (e) {
       toast(e.message, "error");
     }
@@ -2264,8 +2435,10 @@ function renderSecurityBody() {
       <tr><td>${esc(t("settings.security.session"))}</td><td class="mono">${state.sessionTtl ? `${Math.round(state.sessionTtl / 3600)} h` : "-"}</td></tr>
       <tr><td>${esc(t("settings.security.cookies"))}</td><td><span class="cell-muted">${esc(t("settings.security.cookies.hint"))}</span></td></tr>
       <tr><td>${esc(t("settings.2fa.title"))}</td><td>
+        <div class="security-factor-status">
         <span class="badge ${totpOn ? "green" : "grey"}">${esc(totpOn ? t("settings.2fa.status.on") : t("settings.2fa.status.off"))}</span>
-        ${totpOn ? `<span class="cell-muted u-ml8">${esc(t("settings.2fa.backup_count", { n: state.backupCodesRemaining }))}</span>` : ""}
+        ${totpOn ? `<span class="cell-muted">${esc(t("settings.2fa.backup_count", { n: state.backupCodesRemaining }))}</span>` : ""}
+        </div>
       </td></tr>
     </table>
     <div class="settings-sep"></div>
@@ -2550,18 +2723,24 @@ function openPasswordModal() {
 /* ================= Boot ================= */
 
 async function bootAuthed() {
+  const authentication = authGeneration;
+  const current = () => authentication === authGeneration && state.authed;
   try {
     const me = await api("/api/auth/me");
+    if (!current()) return;
     state.sessionTtl = me.session_ttl;
     state.totpEnabled = !!me.totp_enabled;
     state.backupCodesRemaining = me.backup_codes_remaining ?? 0;
   } catch { /* non-fatal */ }
+  if (!current()) return;
   try {
     await loadZones();
   } catch (e) {
-    toast(e.message, "error");
+    if (current()) toast(e.message, "error");
   }
+  if (!current()) return;
   state.ddns = null;
+  state.ddnsLoading = false;
   render();
 }
 
@@ -2570,9 +2749,8 @@ async function bootAuthed() {
   try {
     state.config = await api("/api/config");
     state.configured = state.config.configured !== false;
-    if (state.config.accent) {
-      document.documentElement.style.setProperty("--accent", state.config.accent);
-    }
+    applyAccent(state.config.accent);
+    refreshBranding();
   } catch { /* server may still be starting */ }
   if (!state.configured) { render(); return; }
   try {
