@@ -198,19 +198,22 @@ pub async fn handle(state: Arc<AppState>, req: Request) -> Response {
     if method == "GET" || method == "HEAD" {
         match path {
             "/" => {
-                let accent = state
-                    .ui
-                    .accent()
-                    .map(|a| format!("<style>:root{{--accent:{a};}}</style>"))
-                    .unwrap_or_default();
-                let html = INDEX_HTML
-                    .replace("<!--__ACCENT_STYLE__-->", &accent)
-                    .replace("__VERSION__", VERSION);
+                let html = INDEX_HTML.replace("__VERSION__", VERSION);
                 return security_headers(Response::new(200, "text/html; charset=utf-8", html))
                     .header("Cache-Control", "no-cache");
             }
             "/static/style.css" => {
-                return security_headers(Response::new(200, "text/css; charset=utf-8", STYLE_CSS))
+                let css = state
+                    .ui
+                    .accent()
+                    .map(|accent| format!("{STYLE_CSS}\n:root{{--accent:{accent};}}"))
+                    .unwrap_or_else(|| STYLE_CSS.to_owned());
+                return security_headers(Response::new(200, "text/css; charset=utf-8", css))
+                    .header("Cache-Control", "no-cache");
+            }
+            "/static/default-logo.svg" => {
+                // Always the built-in cloud, even after a custom favicon upload.
+                return security_headers(Response::new(200, "image/svg+xml", FAVICON_SVG))
                     .header("Cache-Control", "no-cache");
             }
             "/static/app.js" => {
@@ -1050,6 +1053,103 @@ mod tests {
             body: vec![],
             remote: "127.0.0.1:12345".parse().unwrap(),
         }
+    }
+
+    struct AppearanceFixture {
+        dir: std::path::PathBuf,
+        state: Arc<AppState>,
+    }
+
+    impl AppearanceFixture {
+        fn new() -> Self {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let dir = std::env::temp_dir().join(format!(
+                "ddns-appearance-test-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+            std::fs::create_dir(&dir).unwrap();
+            let mut cfg = fixture_config();
+            cfg.data_dir = dir.to_str().unwrap().to_owned();
+            let state = Arc::new(AppState {
+                cf: CloudflareClient::new(
+                    "synthetic",
+                    cfg.update_timeout,
+                    Some("http://127.0.0.1:1"),
+                ),
+                auth: Auth::new(cfg.session_ttl, dir.join("state.json").to_str().unwrap()).unwrap(),
+                ui: UiStore::new(&cfg.data_dir),
+                pp: PP::new(false, true),
+                ddns_running: std::sync::atomic::AtomicBool::new(false),
+                cfg,
+            });
+            Self { dir, state }
+        }
+
+        async fn get(&self, path: &str) -> Response {
+            let mut req = fixture_request("localhost:8888", None);
+            req.method = "GET".into();
+            req.path = path.into();
+            handle(self.state.clone(), req).await
+        }
+    }
+
+    impl Drop for AppearanceFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    #[tokio::test]
+    async fn appearance_static_accent_is_csp_safe_and_refreshes_after_reset() {
+        let fixture = AppearanceFixture::new();
+        fixture.state.ui.set_accent(Some("#123456".into())).unwrap();
+        let css = fixture.get("/static/style.css").await;
+        assert_eq!(css.status, 200);
+        assert!(String::from_utf8(css.body)
+            .unwrap()
+            .ends_with(":root{--accent:#123456;}"));
+        let html = fixture.get("/").await;
+        assert!(!String::from_utf8(html.body).unwrap().contains("<style>"));
+        let csp = html
+            .headers
+            .iter()
+            .find(|(name, _)| name == "Content-Security-Policy")
+            .unwrap();
+        assert!(csp.1.contains("style-src 'self'"));
+        assert!(!csp.1.contains("unsafe-inline"));
+        assert!(fixture
+            .state
+            .ui
+            .set_accent(Some("red;}</style>".into()))
+            .is_err());
+        fixture.state.ui.set_accent(None).unwrap();
+        let reset = fixture.get("/static/style.css").await;
+        assert_eq!(reset.body, STYLE_CSS.as_bytes());
+    }
+
+    #[tokio::test]
+    async fn appearance_default_logo_is_independent_of_uploaded_favicon() {
+        let fixture = AppearanceFixture::new();
+        let png = vec![
+            137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1,
+            8, 4, 0, 0, 0, 181, 28, 12, 2, 0, 0, 0, 11, 73, 68, 65, 84, 120, 218, 99, 100, 248, 15,
+            0, 1, 5, 1, 1, 39, 24, 227, 102, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
+        ];
+        fixture.state.ui.set_icon("image/png", png.clone()).unwrap();
+        let logo = fixture.get("/static/default-logo.svg").await;
+        assert_eq!(logo.status, 200);
+        assert_eq!(logo.content_type, "image/svg+xml");
+        assert_eq!(logo.body, FAVICON_SVG.as_bytes());
+        let favicon = fixture.get("/static/favicon.svg").await;
+        assert_eq!(favicon.content_type, "image/png");
+        assert_eq!(favicon.body, png);
+        fixture.state.ui.reset_icon().unwrap();
+        assert_eq!(
+            fixture.get("/static/favicon.svg").await.body,
+            FAVICON_SVG.as_bytes()
+        );
     }
 
     #[test]

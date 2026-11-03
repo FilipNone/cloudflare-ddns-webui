@@ -5,6 +5,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const test = require("node:test");
 const vm = require("node:vm");
+require("./appearance.test.cjs");
 
 function app() {
   const nodes = new Map();
@@ -26,7 +27,7 @@ function app() {
   });
   const source = fs.readFileSync(path.join(__dirname, "app.js"), "utf8");
   vm.runInContext(source.slice(0, source.indexOf("(async function boot()")), context);
-  vm.runInContext("state.authed = true; state.zoneId = 'zone-a'; const actualRender = render; const actualRenderDashboardCards = renderDashboardCards; renderRecordsTable = () => {}; renderDashboardCards = () => {};", context);
+  vm.runInContext("state.authed = true; state.zoneId = 'zone-a'; const actualRender = render; const actualRenderRecordsTable = renderRecordsTable; const actualRenderDashboardCards = renderDashboardCards; renderRecordsTable = () => {}; renderDashboardCards = () => {};", context);
   return { context, nodes, run: (code) => vm.runInContext(code, context) };
 }
 
@@ -641,4 +642,291 @@ test("current DDNS unauthorized response clears the expired session's outcome an
   assert.equal(run("state.ddnsUpdating"), false);
   assert.equal(run("state.ddnsUpdateResult"), null);
   assert.deepEqual(toasts, []);
+});
+
+test("phones force cards without replacing the saved desktop view", () => {
+  const { run } = app();
+  run("state.view = 'list'; viewMedia.matches = true");
+  assert.equal(run("currentView()"), "card");
+  assert.equal(run("state.view"), "list");
+  assert.doesNotMatch(run("viewControls()"), /data-view="list"/);
+  run("viewMedia.matches = false");
+  assert.equal(run("currentView()"), "list");
+  assert.match(run("viewControls()"), /data-view="card"/);
+});
+
+for (const view of ["list", "card"]) {
+  test(`record ${view} view renders escaped content and preserves action controls`, () => {
+    const { nodes, run } = app();
+    const wrap = { innerHTML: "", querySelectorAll: () => [] };
+    nodes.set("table-wrap", wrap);
+    run(`state.view = '${view}'; state.recordsZoneId = state.zoneId; state.records = [{id:'synthetic', type:'TXT', name:'review.example.com', content:'<img src=x>', ttl:300, tags:['<tag>'], comment:'<comment>'}]; renderPagination = () => {}; actualRenderRecordsTable()`);
+    assert.match(wrap.innerHTML, view === "card" ? /class="record-cards"/ : /<table class="data">/);
+    assert.match(wrap.innerHTML, /&lt;img src=x&gt;/);
+    assert.match(wrap.innerHTML, /&lt;comment&gt;/);
+    assert.match(wrap.innerHTML, /data-edit="synthetic"/);
+    assert.match(wrap.innerHTML, /data-delete="synthetic"/);
+    assert.match(wrap.innerHTML, /data-select="synthetic"/);
+    assert.doesNotMatch(wrap.innerHTML, /<img src=x>/);
+  });
+}
+
+test("phone DDNS cards retain status, addresses and update controls", () => {
+  const { run, section } = ddnsApp();
+  run("viewMedia.matches = true; state.ddns.domains = [{domain:'example.com', record_type:'A', detected_ip:'192.0.2.1', dns_ips:['192.0.2.2'], error:'<provider error>'}]; renderDashboardCards()");
+  assert.match(section.innerHTML, /class="ddns-cards"/);
+  assert.match(section.innerHTML, /192\.0\.2\.1/);
+  assert.match(section.innerHTML, /192\.0\.2\.2/);
+  assert.match(section.innerHTML, /&lt;provider error&gt;/);
+  assert.match(section.innerHTML, /id="ddns-update"/);
+  assert.doesNotMatch(section.innerHTML, /<table class="data">/);
+});
+
+test("card selection, editing and deletion use the same record identity", () => {
+  const { context, nodes, run } = app();
+  const controls = Object.fromEntries(["select", "edit", "delete"].map((action) => [action, {
+    dataset: { [action]: "synthetic" }, addEventListener(_, callback) { this.click = callback; },
+    focus() { context.document.activeElement = this; },
+  }]));
+  nodes.set("table-wrap", { set innerHTML(_) { context.document.activeElement = null; }, querySelectorAll: (selector) => {
+    const action = selector.match(/^\[data-(select|edit|delete)\]$/)?.[1];
+    return action ? [controls[action]] : [];
+  } });
+  const edited = [];
+  let deleted = 0;
+  context.editRecord = (record) => edited.push(record.id);
+  context.deleteRecord = () => { deleted++; };
+  run("state.view = 'card'; state.recordsZoneId = state.zoneId; state.records = [{id:'synthetic', type:'A', name:'review.example.com', content:'192.0.2.1', ttl:300}]; renderPagination = () => {}; openRecordModal = editRecord; openBulkDeleteModal = deleteRecord; renderRecordsTable = actualRenderRecordsTable; renderRecordsTable()");
+  context.document.activeElement = controls.select;
+  controls.select.click();
+  assert.equal(run("state.selection.has('synthetic')"), true);
+  assert.equal(context.document.activeElement, controls.select);
+  controls.select.click();
+  assert.equal(run("state.selection.size"), 0);
+  controls.edit.click();
+  controls.delete.click();
+  assert.deepEqual(edited, ["synthetic"]);
+  assert.equal(deleted, 1);
+  assert.equal(run("JSON.stringify([...state.selection])"), '["synthetic"]');
+});
+
+test("view switching persists preference and focuses the replacement control", () => {
+  const { context, run } = app();
+  const button = { dataset: { view: "card" }, addEventListener(_, callback) { this.click = callback; } };
+  const replacement = { focus() { context.document.activeElement = this; } };
+  const writes = [];
+  context.document.querySelectorAll = () => [button];
+  context.document.querySelector = () => replacement;
+  context.redraw = () => { context.document.activeElement = null; };
+  context.localStorage.setItem = (...args) => writes.push(args);
+  run("wireViewControls(redraw)");
+  context.document.activeElement = button;
+  button.click();
+  assert.equal(run("state.view"), "card");
+  assert.deepEqual(writes, [["cfddns.view", "card"]]);
+  assert.equal(context.document.activeElement, replacement);
+});
+
+test("the security table separator does not add asymmetric status-row spacing", () => {
+  const css = fs.readFileSync(path.join(__dirname, "style.css"), "utf8");
+  assert.match(css, /#security-body\s*>\s*\.kv-table\s*\+\s*\.settings-sep\s*\{\s*margin-top:\s*0;/);
+});
+
+test("enabled security status keeps its badge centered beside wrapping backup text", () => {
+  const { context, nodes, run } = productionApp();
+  const body = { innerHTML: "" };
+  nodes.set("security-body", body);
+  nodes.set("pw-change-btn", context.document.createElement("button"));
+  run("state.totpEnabled = true; state.backupCodesRemaining = 8; renderSecurityBody()");
+  assert.match(body.innerHTML, /class="security-factor-status">\s*<span class="badge green">Enabled<\/span>\s*<span class="cell-muted">8 backup codes remaining<\/span>\s*<\/div>/);
+  const css = fs.readFileSync(path.join(__dirname, "style.css"), "utf8");
+  assert.match(css, /\.security-factor-status\s*\{[^}]*display:\s*flex;[^}]*align-items:\s*center;/);
+});
+
+test("cards share list filtering, sorting and pagination", () => {
+  const { nodes, run } = app();
+  const wrap = { innerHTML: "", querySelectorAll: () => [] };
+  nodes.set("table-wrap", wrap);
+  run("state.view = 'card'; state.recordsZoneId = state.zoneId; state.perPage = 1; state.typeFilter = 'A'; state.search = 'review'; state.sort = {key:'ttl',dir:-1}; state.records = [{id:'low',type:'A',name:'review-low.example.com',ttl:60},{id:'high',type:'A',name:'review-high.example.com',ttl:300},{id:'filtered',type:'TXT',name:'review.example.com',ttl:600}]; renderPagination = () => {}; actualRenderRecordsTable()");
+  assert.match(wrap.innerHTML, /data-row="high"/);
+  assert.doesNotMatch(wrap.innerHTML, /data-row="low"|data-row="filtered"/);
+  run("state.page = 2; actualRenderRecordsTable()");
+  assert.match(wrap.innerHTML, /data-row="low"/);
+  assert.doesNotMatch(wrap.innerHTML, /data-row="high"/);
+});
+
+test("obsolete zone boot cannot strand a new session's records load", async () => {
+  const { context, run } = app();
+  const oldZones = deferred(), records = deferred();
+  context.fetch = (url) => url === "/api/zones" ? oldZones.promise : url.includes("/records") ? records.promise : Promise.resolve(response(200));
+  const oldBoot = run("loadZones()");
+  await run("api('/api/auth/login', {method:'POST',json:{}})");
+  run("state.zoneId = 'zone-b'; state.zones = [{id:'zone-b',name:'new.example.com'}]");
+  const loading = run("loadRecords()");
+  oldZones.resolve(response(200, [{ id: "zone-a", name: "example.com" }]));
+  await oldBoot;
+  records.resolve(response(200, { records: [{ id: "current" }], total: 1 }));
+  await loading;
+  assert.equal(run("state.zoneId"), "zone-b");
+  assert.equal(run("state.records[0]?.id"), "current");
+  assert.equal(run("state.recordsLoading"), false);
+});
+
+test("old authentication metadata cannot overwrite a newer boot or dashboard", async () => {
+  const { context, run } = app();
+  const me = deferred();
+  let renders = 0;
+  context.redraw = () => { renders++; };
+  context.fetch = (url) => url === "/api/auth/me" ? me.promise : Promise.resolve(response(200, []));
+  run("render = redraw; toast = () => {}");
+  const boot = run("bootAuthed()");
+  await run("api('/api/auth/login', {method:'POST',json:{}})");
+  run("state.sessionTtl = 7200; state.totpEnabled = true; state.ddns = {configured:true, domains:[]}");
+  me.resolve(response(200, { authenticated: true, session_ttl: 300, totp_enabled: false }));
+  await boot;
+  assert.equal(run("state.sessionTtl"), 7200);
+  assert.equal(run("state.totpEnabled"), true);
+  assert.equal(run("state.ddns?.configured"), true);
+  assert.equal(renders, 0);
+});
+
+for (const boundary of ["expiry", "login"]) {
+  test(`${boundary} clears records cache and errors for a fresh authenticated load`, async () => {
+    const { context, run } = securityApp();
+    run("state.records = [{id:'old'}]; state.recordsZoneId = state.zoneId; state.recordsAttemptedZoneId = state.zoneId; state.recordsError = 'old error'; state.ddns = {error:'old error'}");
+    context.fetch = async () => response(boundary === "expiry" ? 401 : 200);
+    if (boundary === "expiry") await assert.rejects(run("api('/api/ddns/update', {method:'POST',json:{}})"));
+    else await run("api('/api/auth/login', {method:'POST',json:{}})");
+    assert.equal(run("state.records.length"), 0);
+    assert.equal(run("state.recordsZoneId"), null);
+    assert.equal(run("state.recordsAttemptedZoneId"), null);
+    assert.equal(run("state.recordsError"), null);
+    assert.equal(run("state.ddns"), null);
+  });
+}
+
+function productionApp() {
+  const nodes = new Map();
+  class Element {
+    constructor(id = "") {
+      this.id = id;
+      this.children = [];
+      this.handlers = {};
+      this.dataset = {};
+      this.value = "synthetic-password";
+      this.disabled = false;
+      this.classList = { remove() {}, add() {}, toggle() {}, contains() { return false; } };
+    }
+    set innerHTML(html) {
+      this.html = html;
+      for (const child of this.children) {
+        child.innerHTML = "";
+        if (nodes.get(child.id) === child) nodes.delete(child.id);
+      }
+      this.children = [];
+      for (const match of html.matchAll(/<([a-z][a-z0-9-]*)\b([^>]*)>/g)) {
+        const id = match[2].match(/\bid="([^"]+)"/);
+        if (!id) continue;
+        const child = new Element(id[1]);
+        child.disabled = /\bdisabled\b/.test(match[2]);
+        child.parentElement = this;
+        this.children.push(child);
+        nodes.set(child.id, child);
+      }
+    }
+    get innerHTML() { return this.html || ""; }
+    addEventListener(event, handler) { this.handlers[event] = handler; }
+    setAttribute() {}
+    querySelector(selector) { return selector === ".main" ? new Element() : null; }
+    querySelectorAll() { return []; }
+    appendChild(child) { this.children.push(child); child.parentElement = this; }
+    remove() {}
+    async click() { if (!this.disabled) return this.handlers.click?.({ preventDefault() {} }); }
+    async submit() { return this.handlers.submit?.({ preventDefault() {} }); }
+  }
+  for (const id of ["app", "modal-root", "toast-root"]) nodes.set(id, new Element(id));
+  const context = vm.createContext({
+    document: {
+      documentElement: { classList: { toggle() {} }, style: { setProperty() {} } },
+      getElementById: (id) => nodes.get(id) || null,
+      querySelectorAll: () => [], querySelector: () => null,
+      addEventListener() {}, removeEventListener() {}, createElement: () => new Element(),
+    },
+    localStorage: { getItem: () => null, setItem() {} },
+    location: { hash: "#/dashboard" },
+    window: { matchMedia: () => ({ matches: false, addEventListener() {} }), addEventListener() {} },
+    console,
+    setTimeout: (...args) => { const timer = setTimeout(...args); timer.unref(); return timer; },
+    clearTimeout,
+  });
+  const source = fs.readFileSync(path.join(__dirname, "app.js"), "utf8");
+  vm.runInContext(source.slice(0, source.indexOf("(async function boot()")), context);
+  return { context, nodes, run: (code) => vm.runInContext(code, context) };
+}
+
+test("production expiry, login and fresh status enable another Update Now without reload", async () => {
+  const { context, nodes, run } = productionApp();
+  let expired = true, updates = 0, statuses = 0;
+  const requests = [];
+  context.fetch = async (url, init) => {
+    requests.push({ url, method: init.method });
+    if (url === "/api/ddns/update") {
+      updates++;
+      return expired ? response(401, { error: "expired" }) : response(200, { success: true, log: [], outcomes: [] });
+    }
+    if (url === "/api/auth/login") return response(200);
+    if (url === "/api/auth/me") return response(200, { authenticated: true, session_ttl: 3600 });
+    if (url === "/api/zones") return response(200, [{ id: "zone-a", name: "example.com" }]);
+    if (url === "/api/ddns/status") {
+      statuses++;
+      return response(200, { configured: true, domains: [], manual_updates_enabled: true });
+    }
+    throw new Error(`unexpected path: ${url}`);
+  };
+  run("state.authed = true; state.zones = [{id:'zone-a',name:'example.com'}]; state.zoneId = 'zone-a'; state.ddns = {configured:true,domains:[],manual_updates_enabled:true}; render()");
+  assert.equal(nodes.get("ddns-update").disabled, false);
+  await nodes.get("ddns-update").click();
+  assert.equal(run("state.authed"), false);
+  assert.equal(run("state.ddnsUpdating || state.ddnsLoading"), false);
+  assert.ok(nodes.get("login-form"));
+  assert.equal(nodes.has("ddns-update"), false);
+  expired = false;
+  await nodes.get("login-form").submit();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(requests.slice(1).map((request) => request.url), ["/api/auth/login", "/api/auth/me", "/api/zones", "/api/ddns/status"]);
+  assert.equal(statuses, 1);
+  assert.equal(run("state.authed"), true);
+  assert.equal(nodes.get("ddns-update").disabled, false);
+  await nodes.get("ddns-update").click();
+  assert.equal(updates, 2);
+  assert.equal(statuses, 2);
+  assert.equal(run("state.ddnsUpdating || state.ddnsLoading"), false);
+  assert.equal(nodes.get("ddns-update").disabled, false);
+  assert.equal(run("state.ddnsUpdateResult.success"), true);
+  assert.equal(requests.filter((request) => request.url === "/api/ddns/update").every((request) => request.method === "POST"), true);
+});
+
+test("an obsolete boot's final continuation preserves a newer dashboard snapshot", async () => {
+  const { context, run } = productionApp();
+  const oldZones = deferred();
+  let listings = 0;
+  context.fetch = async (url) => {
+    if (url === "/api/zones") return ++listings === 1 ? oldZones.promise : response(200, [{ id: "zone-b", name: "new.example.com" }]);
+    if (url === "/api/ddns/status") return response(200, { configured: true, domains: [], ipv4: "192.0.2.2" });
+    return response(200, { authenticated: true });
+  };
+  run("state.authed = true");
+  const oldBoot = run("bootAuthed()");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(listings, 1);
+  await run("api('/api/auth/login', {method:'POST',json:{}})");
+  await run("bootAuthed()");
+  await new Promise((resolve) => setImmediate(resolve));
+  const latest = run("state.ddns");
+  assert.equal(latest.ipv4, "192.0.2.2");
+  oldZones.resolve(response(200, [{ id: "zone-a", name: "example.com" }]));
+  await oldBoot;
+  assert.equal(run("state.zoneId"), "zone-b");
+  assert.equal(run("state.ddns"), latest);
+  assert.equal(run("state.ddnsLoading"), false);
 });

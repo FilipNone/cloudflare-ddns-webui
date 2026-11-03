@@ -1,48 +1,21 @@
-<svg viewBox="0 0 400 240" xmlns="http://www.w3.org/2000/svg">
+<svg viewBox="0 0 222 106" xmlns="http://www.w3.org/2000/svg">
   <defs>
-    <linearGradient id="cloudGrad" x1="0%" y1="0%" x2="100%" y2="100%">
-      <stop offset="0%" stop-color="#FF8A3D"/>
-      <stop offset="100%" stop-color="#F4600C"/>
-    </linearGradient>
-
-    <!-- Mask: white = visible cloud, black = cut-out hole -->
-    <mask id="networkHole">
-      <!-- full cloud visible by default -->
-      <path d="
-        M 95 155
-        a 40 40 0 0 1 -5 -79.5
-        a 55 55 0 0 1 107 -18
-        a 45 45 0 0 1 58 43
-        a 38 38 0 0 1 -2 54.5
-        Z"
-        fill="white"/>
-
-      <!-- network lines + nodes punched out as black (transparent) -->
-      <g stroke="black" stroke-width="10" stroke-linecap="round" fill="black">
-        <line x1="120" y1="120" x2="160" y2="95"/>
-        <line x1="160" y1="95" x2="205" y2="115"/>
-        <line x1="205" y1="115" x2="245" y2="90"/>
-        <line x1="160" y1="95" x2="175" y2="140"/>
-        <line x1="205" y1="115" x2="220" y2="150"/>
-
-        <circle cx="120" cy="120" r="10"/>
-        <circle cx="160" cy="95" r="11"/>
-        <circle cx="205" cy="115" r="11"/>
-        <circle cx="245" cy="90" r="10"/>
-        <circle cx="175" cy="140" r="10"/>
-        <circle cx="220" cy="150" r="10"/>
+    <!-- Flat base with rounded bottom corners; the domes are trimmed to it -->
+    <clipPath id="base"><path d="M6 0H216V90A10 10 0 0 1 206 100H16A10 10 0 0 1 6 90Z"/></clipPath>
+    <!-- White keeps the cloud; the black diagonal cuts the gap between the two parts -->
+    <mask id="split">
+      <g fill="white" clip-path="url(#base)">
+        <circle cx="27" cy="82" r="21"/>
+        <circle cx="58" cy="54" r="23"/>
+        <circle cx="118" cy="56" r="48"/>
+        <circle cx="180" cy="82" r="36"/>
+        <path d="M6 82L58 54L118 56L180 82H216V106H6Z"/>
       </g>
+      <line x1="180.4" y1="0" x2="147" y2="110" stroke="black" stroke-width="3.5"/>
     </mask>
   </defs>
-
-  <!-- Original cloud silhouette with the network pattern cut out as negative space -->
-  <path d="
-    M 95 155
-    a 40 40 0 0 1 -5 -79.5
-    a 55 55 0 0 1 107 -18
-    a 45 45 0 0 1 58 43
-    a 38 38 0 0 1 -2 54.5
-    Z"
-    fill="url(#cloudGrad)"
-    mask="url(#networkHole)"/>
+  <g mask="url(#split)">
+    <path d="M0 0H180.4L147 110H0Z" fill="#F8BD1A"/>
+    <path d="M180.4 0H222V110H147Z" fill="#F56B3B"/>
+  </g>
 </svg>
