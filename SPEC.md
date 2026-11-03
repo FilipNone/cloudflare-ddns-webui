@@ -14,7 +14,7 @@ The GUI supports zone/record management, bulk edits, BIND import/export, manual 
 
 ## Supported development baseline
 
-- Rust 1.98.0, with rustfmt and Clippy, pinned in `rust-toolchain.toml`.
+- Rust 1.99.1, with rustfmt and Clippy, pinned in `rust-toolchain.toml`.
 - Dependencies resolved by the committed `Cargo.lock`; builds and tests use `--locked`.
 - Node.js 24 or newer for JavaScript syntax checks; no npm dependencies.
 - Python 3.12 or newer for the local mock and smoke harness; standard library only.
