@@ -8,7 +8,7 @@ const vm = require("node:vm");
 
 const html = fs.readFileSync(path.join(__dirname, "index.html"), "utf8");
 // index.html is the one list of scripts and their load order; /static/<file> is web/<file>.
-const scriptFiles = [...html.matchAll(/<script\b[^>]*\bsrc="\/static\/([^"?]+)/g)].map((match) => match[1]);
+const scriptFiles = [...html.matchAll(/<script\b[^>]*\bsrc="\/static\/([^"?]+)/gi)].map((match) => match[1]);
 const scriptSources = scriptFiles.map((file) => fs.readFileSync(path.join(__dirname, file), "utf8"));
 const source = scriptSources.join("\n");
 const css = fs.readFileSync(path.join(__dirname, "style.css"), "utf8");
@@ -20,6 +20,12 @@ function bootlessSource(text) {
   const end = text.indexOf(BOOT_MARKER);
   if (end < 0) throw new Error(`app.js no longer contains "${BOOT_MARKER}"; update the test loader`);
   return text.slice(0, end);
+}
+
+// Each match is [tag, attributes, body]. Browsers accept any case and
+// "</script >", so the pattern does too.
+function scriptTags(text) {
+  return [...text.matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script\b[^>]*>/gi)];
 }
 
 // Runs every script as one, in index.html order, stopping before app.js boots.
@@ -158,8 +164,13 @@ test("the test loader refuses an app.js without the boot marker", () => {
   assert.throws(() => bootlessSource("const a = 1;\n(async function start() {})();"), /boot/);
 });
 
+test("the script tag check sees tags in any case and end tags with spaces", () => {
+  const found = scriptTags('<SCRIPT>inline()</SCRIPT >\n<script src="/static/app.js"></script\n>');
+  assert.deepEqual(found.map(([, , body]) => body), ["inline()", ""]);
+});
+
 test("index.html loads every frontend script with defer, app.js last, and each one parses", () => {
-  const tags = [...html.matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script>/g)];
+  const tags = scriptTags(html);
   assert.equal(tags.length, scriptFiles.length, "every script tag needs a /static/ src");
   for (const [tag, attributes, body] of tags) {
     assert.match(attributes, /^ src="\/static\/[^"?]+\?v=__VERSION__" defer$/, tag);
