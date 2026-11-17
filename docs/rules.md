@@ -33,9 +33,11 @@ See [ddns.md](ddns.md) for the full behaviour.
 - Proxy and TTL rules match in backend and frontend: only A, AAAA and CNAME can be proxied, and proxied records use TTL 1.
 - After a session is revoked, multi-record operations stop unsent writes and report partial results.
 - Duplicate DDNS records fail closed. The GUI never deletes or reconciles records it doesn't own.
+- DDNS deletes records only when the admin turns on `DELETE_ON_STOP` or `DELETE_ON_FAILURE`, and only the records the active contract lets it touch (see ddns.md). `DELETE_ON_FAILURE` acts when a provider reports that there is no address of that family, never after a failed lookup.
 
 ## Scope
 
-- Don't claim daemon integration or full upstream compatibility without a tested contract. Unsupported updater settings are rejected at startup (`unsupported_setting` in `src/config.rs`); keep it that way.
+- Work listed in [roadmap.md](roadmap.md) is in scope, including the updater features it names: scheduled updates, record deletion, more IP providers, detection groups, per-domain proxy status, WAF lists, notifications and heartbeats. Build it within the rules above.
+- Don't claim daemon integration or full upstream compatibility without a tested contract. Updater settings the GUI doesn't implement yet are rejected at startup (`unsupported_setting` in `src/config.rs`). Take a setting off that list in the change that implements it.
 - Keep the dependency list short. Add a crate only when std or an existing crate can't do the job, and explain why in the PR. Don't upgrade dependencies inside an unrelated fix.
 - Tests run against `scripts/mock-cloudflare-api.py` and its synthetic `.example` zones, never the owner's account. Fixture names stay under the reserved `.example` TLD and addresses in the documentation ranges; the smoke test's fixture check enforces both.

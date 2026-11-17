@@ -13,6 +13,7 @@ Keep this file short. Details live in `docs/`.
 | [docs/architecture.md](docs/architecture.md) | Source map, request flow, API routes, data directory |
 | [docs/ddns.md](docs/ddns.md) | Update now, fail-closed rules, contracts, bulk batches, upstream copy |
 | [docs/frontend.md](docs/frontend.md) | Script order, CSP and escaping, conventions, design reference |
+| [docs/roadmap.md](docs/roadmap.md) | Planned work, which is in scope |
 | [README.md](README.md) | User-facing features, settings and deployment. Keep it accurate when behaviour changes |
 | [.env.example](.env.example) | Every supported setting |
 
