@@ -24,7 +24,7 @@ web/
   js/*.js, app.js                    frontend scripts, see frontend.md
   app.test.cjs appearance.test.cjs   Node test suites
 scripts/
-  mock-cloudflare-api.py   Cloudflare API mock with the synthetic example.com zone
+  mock-cloudflare-api.py   Cloudflare API mock with acme.example, homelab.example and rossi.example
   smoke-test.py            end-to-end harness against the mock
 ```
 

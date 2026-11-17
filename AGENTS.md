@@ -20,7 +20,7 @@ Keep this file short. Details live in `docs/`.
 
 ## Rules
 
-- Never read or copy `.env`, `data/`, tokens or real DNS exports. Test against `scripts/mock-cloudflare-api.py` and the synthetic `example.com` zone.
+- Never read or copy `.env`, `data/`, tokens or real DNS exports. Test against `scripts/mock-cloudflare-api.py` and its synthetic `.example` zones.
 - No new `unwrap`, `expect` or `panic!` in non-test code: the release build aborts on panic.
 - No package manager, framework or build step in `web/`, and no inline scripts or styles.
 

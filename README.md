@@ -304,7 +304,7 @@ The token cannot see the zone. Add **Zone › Zone › Read** and include the zo
 
 ## 🧪 Development
 
-[`scripts/mock-cloudflare-api.py`](scripts/mock-cloudflare-api.py) mocks the Cloudflare API with a synthetic `example.com` zone. The smoke harness runs the GUI against it with temporary state and never reads `.env` or `data/`:
+[`scripts/mock-cloudflare-api.py`](scripts/mock-cloudflare-api.py) mocks the Cloudflare API with three synthetic zones: `acme.example` (a business), `homelab.example` (self-hosting, where the smoke test runs DDNS) and `rossi.example` (personal use). The smoke harness runs the GUI against it with temporary state and never reads `.env` or `data/`:
 
 ```bash
 cargo build --locked --release

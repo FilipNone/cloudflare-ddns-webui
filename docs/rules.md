@@ -38,4 +38,4 @@ See [ddns.md](ddns.md) for the full behaviour.
 
 - Don't claim daemon integration or full upstream compatibility without a tested contract. Unsupported updater settings are rejected at startup (`unsupported_setting` in `src/config.rs`); keep it that way.
 - Keep the dependency list short. Add a crate only when std or an existing crate can't do the job, and explain why in the PR. Don't upgrade dependencies inside an unrelated fix.
-- Tests run against `scripts/mock-cloudflare-api.py` and the synthetic `example.com` zone, never the owner's account.
+- Tests run against `scripts/mock-cloudflare-api.py` and its synthetic `.example` zones, never the owner's account. Fixture names stay under the reserved `.example` TLD and addresses in the documentation ranges; the smoke test's fixture check enforces both.

@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Mock Cloudflare API v4 for local web UI development.
 
-Seeded only with example.com records and documentation-range addresses.
+Seeded with three zones under the reserved .example TLD and documentation-range
+addresses: acme.example (a business), homelab.example (self-hosting) and
+rossi.example (personal use).
 Usage: python3 scripts/mock-cloudflare-api.py [port]  (default 8787)
 Then run the web UI with CLOUDFLARE_API_BASE=http://127.0.0.1:8787/client/v4
 """
@@ -20,9 +22,17 @@ from urllib.parse import urlparse, parse_qs
 
 DEFAULT_PORT = 8787
 NOW = "2026-07-29T17:25:21.000000Z"
+ACME = "3c6f1d8a2b9e4f7c8d1a5e2b6f9c3d01"
+HOMELAB = "3c6f1d8a2b9e4f7c8d1a5e2b6f9c3d02"
+ROSSI = "3c6f1d8a2b9e4f7c8d1a5e2b6f9c3d03"
+# In name order, which is how the app asks Cloudflare for them.
 ZONES = [
-    {"id": "0123456789abcdef0123456789abcdef", "name": "example.com", "status": "active", "paused": False, "type": "full"},
+    {"id": ACME, "name": "acme.example", "status": "active", "paused": False, "type": "full"},
+    {"id": HOMELAB, "name": "homelab.example", "status": "active", "paused": False, "type": "full"},
+    {"id": ROSSI, "name": "rossi.example", "status": "active", "paused": False, "type": "full"},
 ]
+# Base64 of "synthetic-dkim-key".
+DKIM_KEY = "c3ludGhldGljLWRraW0ta2V5"
 
 
 def rec(rtype, name, content, proxied=None, ttl=1, comment=None, tags=None, priority=None, data=None):
@@ -44,27 +54,104 @@ def rec(rtype, name, content, proxied=None, ttl=1, comment=None, tags=None, prio
     }
 
 
+def srv(name, priority, weight, port, target, comment=None):
+    # Cloudflare leaves the priority out of an SRV record's content.
+    return rec("SRV", name, f"{weight} {port} {target}", ttl=3600, comment=comment, priority=priority,
+               data={"priority": priority, "weight": weight, "port": port, "target": target})
+
+
+def caa(name, tag, value):
+    return rec("CAA", name, f'0 {tag} "{value}"', ttl=3600,
+               data={"flags": 0, "tag": tag, "value": value})
+
+
 RECORDS = {
-    "0123456789abcdef0123456789abcdef": [
-        rec("A", "example.com", "203.0.113.10", False, 1),
-        rec("AAAA", "example.com", "2001:db8::10", False, 300),
-        rec("CNAME", "www.example.com", "example.com", True, 1),
+    # A business on a paid plan, so its records use tags. Hosted mail and office phones.
+    ACME: [
+        rec("A", "acme.example", "198.51.100.20", True, comment="Website load balancer",
+            tags=["team:web", "env:prod"]),
+        rec("AAAA", "acme.example", "2001:db8:20::20", True, tags=["team:web", "env:prod"]),
+        rec("CNAME", "www.acme.example", "acme.example", True, tags=["team:web", "env:prod"]),
+        rec("A", "shop.acme.example", "198.51.100.21", True, comment="Online shop",
+            tags=["team:web", "env:prod"]),
+        rec("A", "api.acme.example", "198.51.100.22", True, tags=["team:backend", "env:prod"]),
+        rec("A", "staging.acme.example", "198.51.100.23", True, comment="Staging, staff only",
+            tags=["team:web", "env:staging"]),
+        rec("A", "vpn.acme.example", "198.51.100.30", False, 300, "Office VPN gateway", ["team:it"]),
+        rec("CNAME", "status.acme.example", "acme.status-host.example", False, 3600, "Status page",
+            ["team:it"]),
+        rec("CNAME", "help.acme.example", "acme.helpdesk.example", False, 3600, "Customer helpdesk",
+            ["team:support"]),
+        rec("MX", "acme.example", "mx.mailcloud.example", ttl=3600, priority=0),
+        rec("TXT", "acme.example", '"v=spf1 include:spf.mailcloud.example include:mail.crm.example -all"',
+            ttl=3600),
+        rec("TXT", "acme.example", '"mailcloud-verification=synthetic-acme-0001"', ttl=3600),
+        rec("TXT", "_dmarc.acme.example", '"v=DMARC1; p=reject; rua=mailto:dmarc@acme.example"', ttl=3600),
+        rec("TXT", "selector1._domainkey.acme.example", f'"v=DKIM1; k=rsa; p={DKIM_KEY}"', ttl=3600),
+        rec("CNAME", "autodiscover.acme.example", "autodiscover.mailcloud.example", False, 3600),
+        rec("TXT", "_mta-sts.acme.example", '"v=STSv1; id=20260701"', ttl=3600),
+        srv("_sip._tls.acme.example", 100, 1, 443, "sip.voip.example", "Office phones"),
+        caa("acme.example", "issue", "ca.example"),
+        caa("acme.example", "iodef", "mailto:security@acme.example"),
+    ],
+    # Self-hosting from a home connection behind a reverse proxy, with mail on a VPS.
+    HOMELAB: [
+        # The smoke groups run DDNS against these three, so keep their values.
+        rec("A", "homelab.example", "203.0.113.10", False, 1),
+        rec("AAAA", "homelab.example", "2001:db8::10", False, 300),
+        rec("CNAME", "www.homelab.example", "homelab.example", True, 1),
+        rec("CNAME", "*.homelab.example", "homelab.example", False, 1, "Reverse proxy catch-all"),
+        rec("CNAME", "cloud.homelab.example", "homelab.example", True, 1, "Nextcloud"),
+        rec("CNAME", "photos.homelab.example", "homelab.example", True, 1, "Immich"),
+        rec("CNAME", "git.homelab.example", "homelab.example", True, 1, "Forgejo"),
+        rec("CNAME", "media.homelab.example", "homelab.example", False, 1, "Jellyfin, DNS only for video"),
+        rec("CNAME", "vpn.homelab.example", "homelab.example", False, 1, "WireGuard, UDP is not proxied"),
+        rec("CNAME", "matrix.homelab.example", "homelab.example", True, 1, "Synapse"),
+        srv("_matrix._tcp.homelab.example", 10, 5, 8448, "matrix.homelab.example", "Matrix federation"),
+        rec("CNAME", "mc.homelab.example", "homelab.example", False, 1, "Minecraft"),
+        srv("_minecraft._tcp.homelab.example", 0, 5, 25565, "mc.homelab.example"),
+        rec("A", "mail.homelab.example", "203.0.113.25", False, 3600, "Mail VPS with a static IP"),
+        rec("AAAA", "mail.homelab.example", "2001:db8:25::25", False, 3600, "Mail VPS with a static IP"),
+        rec("MX", "homelab.example", "mail.homelab.example", ttl=3600, priority=10),
+        rec("TXT", "homelab.example", '"v=spf1 mx -all"', ttl=3600),
+        rec("TXT", "_dmarc.homelab.example", '"v=DMARC1; p=reject; rua=mailto:postmaster@homelab.example"',
+            ttl=3600),
+        rec("TXT", "mail._domainkey.homelab.example", f'"v=DKIM1; k=rsa; p={DKIM_KEY}"', ttl=3600),
+        caa("homelab.example", "issue", "ca.example"),
+        caa("homelab.example", "issuewild", "ca.example"),
+    ],
+    # Personal use: a small website, a blog on a hosting service and hosted mail.
+    ROSSI: [
+        rec("A", "rossi.example", "192.0.2.10", True),
+        rec("AAAA", "rossi.example", "2001:db8:10::10", True),
+        rec("CNAME", "www.rossi.example", "rossi.example", True),
+        rec("CNAME", "blog.rossi.example", "rossi.blog-host.example", False, 1, "Blog"),
+        rec("MX", "rossi.example", "mx1.mailhost.example", ttl=3600, priority=10),
+        rec("MX", "rossi.example", "mx2.mailhost.example", ttl=3600, priority=20),
+        rec("TXT", "rossi.example", '"v=spf1 include:_spf.mailhost.example ~all"', ttl=3600),
+        rec("TXT", "rossi.example", '"site-verification=synthetic-rossi-0001"', ttl=3600),
+        rec("TXT", "_dmarc.rossi.example", '"v=DMARC1; p=quarantine; rua=mailto:dmarc@rossi.example"',
+            ttl=3600),
+        rec("CNAME", "mail1._domainkey.rossi.example", "mail1.dkim.mailhost.example", False, 3600),
     ],
 }
 # Handler threads share RECORDS. Hold LOCK for every read and write.
 LOCK = threading.Lock()
 
-EXPORT_BIND = """;;
-;; Domain: example.com.
-;; Synthetic local fixture
-;; SOA Record
-example.com. 3600 IN SOA ns.example.com. hostmaster.example.com. 1 10000 2400 604800 3600
+def bind_export(zone, records):
+    """Zone file with the SOA and the apex A and AAAA records. Cloudflare exports
+    every record; these are enough for the export and reimport checks."""
+    lines = [";;", f";; Domain: {zone}.", ";; Synthetic local fixture", ";; SOA Record",
+             f"{zone}. 3600 IN SOA ns.{zone}. hostmaster.{zone}. 1 10000 2400 604800 3600", ""]
+    for rtype in ("A", "AAAA"):
+        lines.append(f";; {rtype} Records")
+        lines += [f"{zone}. {r['ttl']} IN {rtype} {r['content']}"
+                  for r in records if r["name"] == zone and r["type"] == rtype]
+    return "\n".join(lines) + "\n"
 
-;; A Records
-example.com. 1 IN A 203.0.113.10
-;; AAAA Records
-example.com. 300 IN AAAA 2001:db8::10
-"""
+
+# Built from the seed, so later changes to RECORDS don't show up in it.
+EXPORT_BIND = {z["id"]: bind_export(z["name"], RECORDS[z["id"]]) for z in ZONES}
 
 
 def envelope(result, page=1, per_page=100):
@@ -369,7 +456,7 @@ class Handler(BaseHTTPRequestHandler):
                 return 400, error_envelope("request body must be a JSON object")
             r = rec(
                 payload.get("type", "A"),
-                payload.get("name", "x.example.com"),
+                payload.get("name", "x.homelab.example"),
                 payload.get("content", ""),
                 payload.get("proxied"),
                 payload.get("ttl", 1),
@@ -382,11 +469,15 @@ class Handler(BaseHTTPRequestHandler):
             return 201, envelope(r)
 
         if rest == ["export"] and method == "GET":
-            return 200, EXPORT_BIND
+            if zone_id not in EXPORT_BIND:
+                return 404, error_envelope("mock: unknown zone")
+            return 200, EXPORT_BIND[zone_id]
 
         if rest == ["import"] and method == "POST":
             # Extract the zone file from the multipart body (or raw body).
-            zone_name = next((z["name"] for z in ZONES if z["id"] == zone_id), "example.com")
+            zone_name = next((z["name"] for z in ZONES if z["id"] == zone_id), None)
+            if zone_name is None:
+                return 404, error_envelope("mock: unknown zone")
             try:
                 bind = import_body(body, self.headers.get("Content-Type", ""))
                 imported = parse_bind(bind.decode("utf-8"), zone_name)
