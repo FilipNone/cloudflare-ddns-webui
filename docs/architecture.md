@@ -18,6 +18,7 @@ src/
   customize.rs   accent colour, uploaded logo, ui-settings.json
   persist.rs     crash-safe file replacement shared by auth.rs and customize.rs
   pp.rs          log output (emoji, quiet mode, write errors ignored)
+  auth/tests.rs routes/tests.rs   unit tests for auth.rs and routes.rs
 web/
   index.html style.css favicon.svg   page, stylesheet, default logo
   js/*.js, app.js                    frontend scripts, see frontend.md

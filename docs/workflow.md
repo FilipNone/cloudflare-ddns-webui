@@ -51,6 +51,6 @@ Check documentation for third-party crates and APIs (tokio, reqwest, rustls, rin
 
 ## CI
 
-`.github/workflows/ci.yml` runs the checks above, the container build and smoke test, and `cargo audit`. CodeQL and dependency review have their own workflows; Dependabot is in `.github/dependabot.yml`. Propose CI changes in their own PR, not inside a fix.
+`.github/workflows/ci.yml` runs the checks above, the container build and smoke test, and `cargo audit`. CodeQL and dependency review have their own workflows; Dependabot is in `.github/dependabot.yml`. CodeQL skips `src/**/tests.rs`, so tests that use fixed passwords or salts go there instead of an inline `mod tests`. Propose CI changes in their own PR, not inside a fix.
 
 Branch protection, required checks and GitHub security features are owner settings. Adding a workflow does not turn them on.
