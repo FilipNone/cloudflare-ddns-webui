@@ -25,7 +25,7 @@ A web interface for Cloudflare DNS, written in Rust: one static binary in a `FRO
 - [Configuration](#-configuration)
 - [Environment variable reference](#-environment-variable-reference)
 - [Deployment](#-deployment)
-- [Two-factor authentication](#-two-factor-authentication)
+- [Two-factor authentication](#%EF%B8%8F-two-factor-authentication)
 - [Security notes](#-security-notes)
 - [Troubleshooting](#-troubleshooting)
 - [Development](#-development)
@@ -37,7 +37,7 @@ A web interface for Cloudflare DNS, written in Rust: one static binary in a `FRO
 In the Cloudflare dashboard go to [**My Profile › API Tokens › Create Token**](https://dash.cloudflare.com/profile/api-tokens) and start from the **Edit zone DNS** template, or grant:
 
 | Permission | Needed for |
-|------------|------------|
+| --- | --- |
 | **Zone › DNS › Edit** | Reading, changing, importing and exporting records |
 | **Zone › Zone › Read** | Listing zones and finding each domain's zone |
 
@@ -61,7 +61,7 @@ docker run -d \
   cloudflare-ddns-webui
 ```
 
-Open http://localhost:8080 and create the admin password. Do this over loopback before you allow remote access, because anyone who reaches a new instance can create the account. The `/data` volume keeps the account; without it, recreating the container resets it.
+Open <http://localhost:8080> and create the admin password. Do this over loopback before you allow remote access, because anyone who reaches a new instance can create the account. The `/data` volume keeps the account; without it, recreating the container resets it.
 
 ### 3. Or use Docker Compose
 
@@ -115,7 +115,7 @@ All settings are environment variables, and [`.env.example`](.env.example) is a 
 ### Authentication
 
 | Variable | Description |
-|----------|-------------|
+| --- | --- |
 | `CLOUDFLARE_API_TOKEN` | API token ([permissions](#1-create-an-api-token)) |
 | `CLOUDFLARE_API_TOKEN_FILE` | File holding the token, such as a Docker secret. Read only when `CLOUDFLARE_API_TOKEN` is unset; at most 4 KiB |
 
@@ -124,7 +124,7 @@ There is no password setting. You create the password in the browser on first ru
 ### Server
 
 | Variable | Default | Description |
-|----------|---------|-------------|
+| --- | --- | --- |
 | `LISTEN` | `0.0.0.0:8080` | Address and port to listen on |
 | `DATA_DIR` | `/data` | Where the account and UI settings are saved |
 | `SESSION_TTL` | `24h` | Session lifetime |
@@ -134,7 +134,7 @@ There is no password setting. You create the password in the browser on first ru
 ### Domains
 
 | Variable | Description |
-|----------|-------------|
+| --- | --- |
 | `DOMAINS` | Domains to show on the DDNS page and update with A and AAAA records |
 | `IP4_DOMAINS` | Domains for A records only |
 | `IP6_DOMAINS` | Domains for AAAA records only |
@@ -144,12 +144,12 @@ The lists are comma-separated and mean the same as in cloudflare-ddns, so you ca
 ### IP detection providers
 
 | Variable | Default | Description |
-|----------|---------|-------------|
+| --- | --- | --- |
 | `IP4_PROVIDER` | `ipify` | How to detect the IPv4 address |
 | `IP6_PROVIDER` | `cloudflare.trace` | How to detect the IPv6 address |
 
 | Provider | Description |
-|----------|-------------|
+| --- | --- |
 | `ipify` | Asks ipify.org |
 | `cloudflare.trace` | Reads Cloudflare's `/cdn-cgi/trace` |
 | `cloudflare.trace:<url>` | The same, from your own trace URL |
@@ -162,7 +162,7 @@ URLs must not contain credentials or a fragment. Interface binding (`ipify@eth1`
 ### DNS records
 
 | Variable | Default | Description |
-|----------|---------|-------------|
+| --- | --- | --- |
 | `TTL` | `1` (Auto) | TTL for records written by Update now: `1`, or `30` to `86400`. Cloudflare may require at least 60 outside Enterprise zones |
 | `PROXIED` | `false` | Proxy status for records created by Update now. Proxied records use TTL `1` |
 | `RECORD_COMMENT` | unset | Comment for records written by Update now. At most 500 bytes; Free zones allow 100 characters |
@@ -173,7 +173,7 @@ With `standalone-v1`, Update now updates the A and AAAA records of the configure
 ### Timeouts and output
 
 | Variable | Default | Description |
-|----------|---------|-------------|
+| --- | --- | --- |
 | `UPDATE_TIMEOUT` | `30s` | Timeout for each Cloudflare API request |
 | `DETECTION_TIMEOUT` | `5s` | Timeout for IP detection |
 | `EMOJI` | `true` | Emoji in log output |
@@ -192,7 +192,7 @@ The GUI refuses to start when it finds a cloudflare-ddns setting it does not imp
 ## 📋 Environment variable reference
 
 | Variable | Default | Description |
-|----------|---------|-------------|
+| --- | --- | --- |
 | `CLOUDFLARE_API_TOKEN` | required | API token, or use the file below |
 | `CLOUDFLARE_API_TOKEN_FILE` | unset | File holding the API token |
 | `LISTEN` | `0.0.0.0:8080` | Listen address |

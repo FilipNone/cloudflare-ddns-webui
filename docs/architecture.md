@@ -40,7 +40,7 @@ scripts/
 All routes are under `/api`.
 
 | Route | Notes |
-|---|---|
+| --- | --- |
 | `GET /config` | public |
 | `POST /auth/setup`, `/auth/login`, `/auth/login/2fa`, `/auth/logout` | public; logout works with an expired session |
 | `GET /auth/me`, `POST /auth/password`, `/auth/2fa/begin`, `/confirm`, `/cancel`, `/disable` | account |

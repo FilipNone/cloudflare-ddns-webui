@@ -7,7 +7,7 @@ Keep this file short. Details live in `docs/`.
 ## Read
 
 | File | Covers |
-|---|---|
+| --- | --- |
 | [docs/rules.md](docs/rules.md) | Owner rules, never crash, security, DDNS safety, scope |
 | [docs/workflow.md](docs/workflow.md) | Doing a task, checks, smoke harness, parallel agents, CI |
 | [docs/architecture.md](docs/architecture.md) | Source map, request flow, API routes, data directory |
