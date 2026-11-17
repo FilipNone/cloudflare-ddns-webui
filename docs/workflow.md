@@ -40,7 +40,7 @@ Toolchain: Rust 1.99.1 with rustfmt and Clippy (pinned in `rust-toolchain.toml` 
 
 ## Library docs
 
-Use Context7 for third-party crates and APIs (tokio, reqwest, rustls, ring, serde, the Cloudflare API). Prefer version-matched docs over memory: check the locked version in `Cargo.lock`.
+Check documentation for third-party crates and APIs (tokio, reqwest, rustls, ring, serde, the Cloudflare API). Prefer version-matched docs over memory: check the locked version in `Cargo.lock`.
 
 ## Parallel agents
 
