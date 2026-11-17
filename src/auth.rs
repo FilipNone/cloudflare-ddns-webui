@@ -22,8 +22,23 @@ use std::num::NonZeroU32;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-// The unwrap runs at compile time, so a zero count fails the build.
-const PBKDF2_ITERATIONS: NonZeroU32 = NonZeroU32::new(100_000).unwrap();
+// The unwraps run at compile time, so a zero count fails the build.
+/// Iterations for new password hashes. 600,000 is the OWASP Password
+/// Storage Cheat Sheet value for PBKDF2-HMAC-SHA256.
+const PASSWORD_ITERATIONS: NonZeroU32 = NonZeroU32::new(600_000).unwrap();
+/// Count for state files saved before `password_iterations` existed.
+const LEGACY_PASSWORD_ITERATIONS: NonZeroU32 = NonZeroU32::new(100_000).unwrap();
+/// Highest count a state file may ask for. A damaged or edited file must
+/// not make every login take minutes.
+const MAX_PASSWORD_ITERATIONS: NonZeroU32 = NonZeroU32::new(6_000_000).unwrap();
+/// Backup codes are random 40-bit codes, and a wrong code is checked against
+/// every stored hash, so they keep the lower count. 600,000 would make each
+/// attempt about six times slower for little gain.
+const BACKUP_CODE_ITERATIONS: NonZeroU32 = NonZeroU32::new(100_000).unwrap();
+/// How long to skip password hash upgrades after one fails to save. Each
+/// attempt costs a full rehash and a log line, and anyone who knows the
+/// password could otherwise repeat it on a full or read-only volume.
+const UPGRADE_RETRY_DELAY: Duration = Duration::from_secs(10 * 60);
 const KEY_LEN: usize = 32;
 const SALT_LEN: usize = 16;
 const SESSION_TOKEN_LEN: usize = 32;
@@ -86,11 +101,11 @@ impl AuthError {
 
 // --- Hashing ---
 
-fn derive_key(secret: &str, salt: &[u8]) -> [u8; KEY_LEN] {
+fn derive_key(secret: &str, salt: &[u8], iterations: NonZeroU32) -> [u8; KEY_LEN] {
     let mut key = [0u8; KEY_LEN];
     pbkdf2::derive(
         pbkdf2::PBKDF2_HMAC_SHA256,
-        PBKDF2_ITERATIONS,
+        iterations,
         salt,
         secret.as_bytes(),
         &mut key,
@@ -98,10 +113,10 @@ fn derive_key(secret: &str, salt: &[u8]) -> [u8; KEY_LEN] {
     key
 }
 
-fn key_matches(secret: &str, salt: &[u8], expected: &[u8]) -> bool {
+fn key_matches(secret: &str, salt: &[u8], iterations: NonZeroU32, expected: &[u8]) -> bool {
     pbkdf2::verify(
         pbkdf2::PBKDF2_HMAC_SHA256,
-        PBKDF2_ITERATIONS,
+        iterations,
         salt,
         secret.as_bytes(),
         expected,
@@ -141,6 +156,10 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 pub struct AuthState {
     pub password_salt: Option<String>,
     pub password_key: Option<String>,
+    /// PBKDF2 iterations behind `password_key`. Missing in files from older
+    /// versions, which used `LEGACY_PASSWORD_ITERATIONS`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub password_iterations: Option<u32>,
     pub totp_secret: Option<String>, // base32
     pub backup_code_hashes: Vec<String>,
 }
@@ -151,6 +170,17 @@ impl AuthState {
     }
     pub fn totp_enabled(&self) -> bool {
         self.totp_secret.is_some()
+    }
+
+    /// The iteration count to check the password with, or None when the
+    /// saved count is out of range.
+    fn password_hash_iterations(&self) -> Option<NonZeroU32> {
+        match self.password_iterations {
+            None => Some(LEGACY_PASSWORD_ITERATIONS),
+            Some(count) => NonZeroU32::new(count).filter(|count| {
+                (LEGACY_PASSWORD_ITERATIONS..=MAX_PASSWORD_ITERATIONS).contains(count)
+            }),
+        }
     }
 }
 
@@ -175,6 +205,9 @@ struct Flow {
     /// memory only, so a restart inside the ~90 s window of a used code
     /// forgets it.
     last_totp_step: Option<u64>,
+    /// After a password hash upgrade fails to save, upgrades are skipped
+    /// until this time. It lives in memory only, so a restart tries again.
+    upgrade_retry_after: Option<Instant>,
 }
 
 impl Flow {
@@ -231,6 +264,7 @@ impl Auth {
                 pending_totp: None,
                 factor_failures: (0, Instant::now()),
                 last_totp_step: None,
+                upgrade_retry_after: None,
             }),
             sessions: Mutex::new(HashMap::new()),
             limiter: LoginLimiter::new(),
@@ -244,25 +278,63 @@ impl Auth {
         lock(&self.state).clone()
     }
 
+    fn commit_state(&self, candidate: AuthState) -> Result<(), AuthError> {
+        self.save_and_swap(candidate).map_err(|error| {
+            self.pp.errorf(
+                crate::pp::EMOJI_ERROR,
+                format!("Cannot save auth state: {error}"),
+            );
+            AuthError::PersistenceFailed
+        })
+    }
+
     // Callers hold the flow lock, which keeps saves in order. The state lock
     // is only taken for the swap, so readers never wait for disk I/O.
-    fn commit_state(&self, candidate: AuthState) -> Result<(), AuthError> {
-        match save_state(&self.state_path, &candidate) {
-            Ok(SaveOutcome::Durable) => {}
-            Ok(SaveOutcome::DirectoryNotSynced) => self.pp.warningf(
+    // On error nothing changes and the caller decides how to log it.
+    fn save_and_swap(&self, candidate: AuthState) -> Result<(), String> {
+        match save_state(&self.state_path, &candidate)? {
+            SaveOutcome::Durable => {}
+            SaveOutcome::DirectoryNotSynced => self.pp.warningf(
                 crate::pp::EMOJI_LOCK,
                 "Saved auth state, but could not sync the data directory; a power loss may undo the change",
             ),
-            Err(error) => {
-                self.pp.errorf(
-                    crate::pp::EMOJI_ERROR,
-                    format!("Cannot save auth state: {error}"),
-                );
-                return Err(AuthError::PersistenceFailed);
-            }
         }
         *lock(&self.state) = candidate;
         Ok(())
+    }
+
+    /// Rehashes a password that has just been verified when its stored hash
+    /// uses fewer iterations than new hashes. Callers hold the flow lock.
+    /// Sessions and challenges stay valid, since the password is the same.
+    /// A failed save keeps the old hash and only logs a warning, so the
+    /// login still works. Upgrades then pause for `UPGRADE_RETRY_DELAY`.
+    fn upgrade_password_hash(&self, flow: &mut Flow, password: &str) {
+        if flow
+            .upgrade_retry_after
+            .is_some_and(|retry_after| Instant::now() < retry_after)
+        {
+            return;
+        }
+        let mut candidate = self.snapshot();
+        if candidate
+            .password_hash_iterations()
+            .is_none_or(|iterations| iterations >= PASSWORD_ITERATIONS)
+        {
+            return;
+        }
+        let result = set_password(&mut candidate, password)
+            .map_err(|_| "cannot generate a salt".to_string())
+            .and_then(|()| self.save_and_swap(candidate));
+        if let Err(error) = result {
+            flow.upgrade_retry_after = Instant::now().checked_add(UPGRADE_RETRY_DELAY);
+            self.pp.warningf(
+                crate::pp::EMOJI_LOCK,
+                format!(
+                    "Cannot upgrade the stored password hash; keeping the old hash and retrying at the first login after {} minutes: {error}",
+                    UPGRADE_RETRY_DELAY.as_secs() / 60
+                ),
+            );
+        }
     }
 
     fn revoke_authentication(&self, flow: &mut Flow) {
@@ -417,8 +489,10 @@ impl Auth {
                 .as_deref()
                 .and_then(hex_decode_salt)
                 .zip(state.password_key.as_deref().and_then(hex_decode_key))
+                .zip(state.password_hash_iterations())
         };
-        stored.is_some_and(|(salt, key)| key_matches(password, &salt, &key))
+        stored
+            .is_some_and(|((salt, key), iterations)| key_matches(password, &salt, iterations, &key))
     }
 
     // --- Login flow ---
@@ -440,6 +514,7 @@ impl Auth {
             self.limiter.record_failure(ip);
             return Err(AuthError::InvalidPassword);
         }
+        self.upgrade_password_hash(&mut flow, password);
         if !self.totp_enabled() {
             self.limiter.record_success(ip);
             return Ok(LoginStep1Outcome::Session(self.create_session()?));
@@ -499,6 +574,7 @@ impl Auth {
             self.factor_failure(&mut flow, Some(ip));
             return Err(AuthError::InvalidPassword);
         }
+        self.upgrade_password_hash(&mut flow, password);
         if !self.is_configured() {
             return Err(AuthError::NotConfigured);
         }
@@ -621,7 +697,8 @@ fn validate_password(password: &str) -> Result<(), AuthError> {
 fn set_password(state: &mut AuthState, password: &str) -> Result<(), AuthError> {
     let salt = random_bytes::<SALT_LEN>()?;
     state.password_salt = Some(hex(&salt));
-    state.password_key = Some(hex(&derive_key(password, &salt)));
+    state.password_key = Some(hex(&derive_key(password, &salt, PASSWORD_ITERATIONS)));
+    state.password_iterations = Some(PASSWORD_ITERATIONS.get());
     Ok(())
 }
 
@@ -655,7 +732,11 @@ fn generate_backup_codes() -> Result<Vec<String>, AuthError> {
 /// exists so those codes keep working; new hashes never use it.
 fn legacy_backup_salt(normalized: &str) -> [u8; SALT_LEN] {
     let mut s = [0u8; SALT_LEN];
-    let h = derive_key(&format!("backup-salt:{normalized}"), b"cfddnswebui-salt");
+    let h = derive_key(
+        &format!("backup-salt:{normalized}"),
+        b"cfddnswebui-salt",
+        BACKUP_CODE_ITERATIONS,
+    );
     s.copy_from_slice(&h[..SALT_LEN]);
     s
 }
@@ -663,7 +744,7 @@ fn legacy_backup_salt(normalized: &str) -> [u8; SALT_LEN] {
 /// Stored as `<salt hex>:<key hex>` with a fresh random salt for each code.
 fn hash_backup_code(code: &str) -> Result<String, AuthError> {
     let salt = random_bytes::<SALT_LEN>()?;
-    let key = derive_key(&normalize_code(code), &salt);
+    let key = derive_key(&normalize_code(code), &salt, BACKUP_CODE_ITERATIONS);
     Ok(format!("{}:{}", hex(&salt), hex(&key)))
 }
 
@@ -705,7 +786,7 @@ fn find_backup_code(hashes: &[String], code: &str) -> Option<usize> {
                 None => return false,
             },
         };
-        key_matches(code, &salt, &expected)
+        key_matches(code, &salt, BACKUP_CODE_ITERATIONS, &expected)
     })
 }
 
@@ -738,6 +819,9 @@ fn load_state(path: &str) -> Result<AuthState, String> {
         (None, None) => return Err("auth state is missing a password".to_string()),
         (Some(salt), Some(key)) if valid_hex(salt, SALT_LEN) && valid_hex(key, KEY_LEN) => {}
         _ => return Err("invalid auth password state".to_string()),
+    }
+    if state.password_hash_iterations().is_none() {
+        return Err("invalid auth password iteration count".to_string());
     }
     if let Some(secret) = &state.totp_secret {
         if !secret.is_ascii() {
@@ -968,8 +1052,12 @@ mod tests {
 
     /// Unsalted backup code hash in the format older versions wrote.
     fn legacy_hash(normalized: &str) -> String {
-        let derived = derive_key(&format!("backup-salt:{normalized}"), b"cfddnswebui-salt");
-        hex(&derive_key(normalized, &derived[..SALT_LEN]))
+        let derived = derive_key(
+            &format!("backup-salt:{normalized}"),
+            b"cfddnswebui-salt",
+            NonZeroU32::new(100_000).unwrap(),
+        );
+        pbkdf2_key(normalized, &derived[..SALT_LEN], 100_000)
     }
 
     fn backup_matches(stored: &str, code: &str) -> bool {
@@ -1598,7 +1686,7 @@ mod tests {
         file.write(
             serde_json::json!({
                 "password_salt": hex(&salt).to_uppercase(),
-                "password_key": hex(&derive_key(PASSWORD, &salt)).to_uppercase()
+                "password_key": pbkdf2_key(PASSWORD, &salt, 100_000).to_uppercase()
             })
             .to_string(),
         );
@@ -1614,7 +1702,7 @@ mod tests {
         let salt = [0xab; SALT_LEN];
         file.write(serde_json::json!({
             "password_salt": hex(&salt),
-            "password_key": hex(&derive_key(PASSWORD, &salt)),
+            "password_key": pbkdf2_key(PASSWORD, &salt, 100_000),
             "totp_secret": format!(" {}=== ", crate::totp::base32_encode(secret).to_lowercase()),
             "backup_code_hashes": []
         }).to_string());
@@ -1841,7 +1929,7 @@ mod tests {
         file.write(
             serde_json::json!({
                 "password_salt": hex(&password_salt),
-                "password_key": hex(&derive_key(PASSWORD, &password_salt)),
+                "password_key": pbkdf2_key(PASSWORD, &password_salt, 100_000),
                 "totp_secret": crate::totp::base32_encode(&[0; TOTP_SECRET_LEN]),
                 "backup_code_hashes": [legacy_hash("ABCDEFGH")]
             })
@@ -1883,6 +1971,415 @@ mod tests {
         assert!(auth.has_legacy_backup_hashes());
         file.write(state(vec![salted]));
         assert!(!file.load().unwrap().has_legacy_backup_hashes());
+    }
+
+    /// Hex PBKDF2-HMAC-SHA256 key, computed here so the tests do not rely
+    /// on the code under test.
+    fn pbkdf2_key(secret: &str, salt: &[u8], iterations: u32) -> String {
+        let mut key = [0u8; KEY_LEN];
+        pbkdf2::derive(
+            pbkdf2::PBKDF2_HMAC_SHA256,
+            NonZeroU32::new(iterations).unwrap(),
+            salt,
+            secret.as_bytes(),
+            &mut key,
+        );
+        hex(&key)
+    }
+
+    const LEGACY_SALT: [u8; SALT_LEN] = [7; SALT_LEN];
+
+    /// Writes a state file in the format older versions saved: no
+    /// `password_iterations`, and a key derived with 100,000 iterations.
+    fn write_legacy_state(file: &TestState, extra: serde_json::Value) {
+        let mut state = serde_json::json!({
+            "password_salt": hex(&LEGACY_SALT),
+            "password_key": pbkdf2_key(PASSWORD, &LEGACY_SALT, 100_000),
+        });
+        if let (Some(state), Some(extra)) = (state.as_object_mut(), extra.as_object()) {
+            state.extend(extra.clone());
+        }
+        file.write(state.to_string());
+    }
+
+    fn stored(file: &TestState) -> serde_json::Value {
+        serde_json::from_str(&std::fs::read_to_string(&file.path).unwrap()).unwrap()
+    }
+
+    /// Checks that the saved password hash is `password` at 600,000
+    /// iterations under a salt other than the legacy one.
+    fn assert_upgraded(file: &TestState, password: &str) {
+        let saved = stored(file);
+        assert_eq!(saved["password_iterations"], 600_000);
+        let salt = saved["password_salt"].as_str().unwrap();
+        assert_ne!(salt, hex(&LEGACY_SALT));
+        let salt = hex_decode_salt(salt).unwrap();
+        assert_eq!(saved["password_key"], pbkdf2_key(password, &salt, 600_000));
+    }
+
+    fn assert_legacy(state: &serde_json::Value) {
+        assert!(state.get("password_iterations").is_none_or(|n| n.is_null()));
+        assert_eq!(state["password_salt"], hex(&LEGACY_SALT));
+        assert_eq!(
+            state["password_key"],
+            pbkdf2_key(PASSWORD, &LEGACY_SALT, 100_000)
+        );
+    }
+
+    fn memory_state(auth: &Auth) -> serde_json::Value {
+        serde_json::to_value(&*lock(&auth.state)).unwrap()
+    }
+
+    #[test]
+    fn security_new_password_hashes_use_600000_iterations() {
+        let file = TestState::new();
+        let auth = configured_auth(&file);
+        let text = std::fs::read_to_string(&file.path).unwrap();
+        assert!(text.contains("\"password_iterations\": 600000"));
+        let salt = hex_decode_salt(stored(&file)["password_salt"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            stored(&file)["password_key"],
+            pbkdf2_key(PASSWORD, &salt, 600_000)
+        );
+        assert!(file.load().unwrap().verify_password(PASSWORD));
+        auth.change_password_verified(localhost(), PASSWORD, None, "replacement-password")
+            .unwrap();
+        let saved = stored(&file);
+        assert_eq!(saved["password_iterations"], 600_000);
+        let salt = hex_decode_salt(saved["password_salt"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            saved["password_key"],
+            pbkdf2_key("replacement-password", &salt, 600_000)
+        );
+        let restarted = file.load().unwrap();
+        assert!(restarted.verify_password("replacement-password"));
+        assert!(!restarted.verify_password(PASSWORD));
+    }
+
+    #[test]
+    fn security_legacy_password_hash_is_upgraded_at_login() {
+        let file = TestState::new();
+        write_legacy_state(&file, serde_json::json!({}));
+        let auth = file.load().unwrap();
+        let ip = localhost();
+        let session = auth.create_session().unwrap();
+        assert!(matches!(
+            auth.login_step1_session(ip, PASSWORD),
+            Ok(LoginStep1Outcome::Session(_))
+        ));
+        assert_upgraded(&file, PASSWORD);
+        assert_eq!(memory_state(&auth), stored(&file));
+        assert!(auth.session_valid(&session));
+        // A login with the upgraded hash leaves the file alone.
+        let upgraded = std::fs::read(&file.path).unwrap();
+        assert!(matches!(
+            auth.login_step1_session(ip, PASSWORD),
+            Ok(LoginStep1Outcome::Session(_))
+        ));
+        assert_eq!(std::fs::read(&file.path).unwrap(), upgraded);
+        let restarted = file.load().unwrap();
+        assert!(matches!(
+            restarted.login_step1_session(ip, PASSWORD),
+            Ok(LoginStep1Outcome::Session(_))
+        ));
+        assert!(matches!(
+            restarted.login_step1_session(ip, "wrong-password"),
+            Err(AuthError::InvalidPassword)
+        ));
+        assert_eq!(std::fs::read(&file.path).unwrap(), upgraded);
+    }
+
+    #[test]
+    fn security_legacy_password_hash_is_upgraded_on_the_challenge_path() {
+        let file = TestState::new();
+        let secret = crate::totp::base32_encode(b"synthetic totp key");
+        write_legacy_state(
+            &file,
+            serde_json::json!({
+                "totp_secret": secret,
+                "backup_code_hashes": [hash_backup_code("ABCD-EFGH").unwrap()]
+            }),
+        );
+        let auth = file.load().unwrap();
+        let ip = localhost();
+        let session = auth.create_session().unwrap();
+        lock(&auth.flow).challenges.insert(
+            "synthetic-challenge".to_string(),
+            Instant::now() + CHALLENGE_TTL,
+        );
+        let token = challenge(&auth, ip, PASSWORD);
+        assert_upgraded(&file, PASSWORD);
+        assert_eq!(memory_state(&auth), stored(&file));
+        assert!(auth.session_valid(&session));
+        assert!(lock(&auth.flow)
+            .challenges
+            .contains_key("synthetic-challenge"));
+        // This path never calls `record_success`, so an empty limiter shows
+        // the upgrade recorded no failure.
+        assert!(lock(&auth.limiter.state).is_empty());
+        assert_eq!(lock(&auth.flow).factor_failures.0, 0);
+        // Consuming a backup code saves the state again and keeps the upgrade.
+        assert!(matches!(
+            auth.login_step2_session(ip, &token, "abcd-efgh"),
+            Ok((Login2faOutcome::BackupCode { remaining: 0 }, _))
+        ));
+        assert_upgraded(&file, PASSWORD);
+        let restarted = file.load().unwrap();
+        let token = challenge(&restarted, ip, PASSWORD);
+        assert!(matches!(
+            restarted.login_step2_session(ip, &token, &totp_now(&secret)),
+            Ok((Login2faOutcome::Totp, _))
+        ));
+    }
+
+    #[test]
+    fn security_legacy_password_hash_is_upgraded_when_enrolling_2fa() {
+        let file = TestState::new();
+        write_legacy_state(&file, serde_json::json!({}));
+        let auth = file.load().unwrap();
+        let session = auth.create_session().unwrap();
+        let (secret, _, _) = auth
+            .totp_enroll_begin_verified(localhost(), PASSWORD)
+            .unwrap();
+        assert_upgraded(&file, PASSWORD);
+        assert!(auth.session_valid(&session));
+        assert!(lock(&auth.flow).pending_totp.is_some());
+        assert!(lock(&auth.limiter.state).is_empty());
+        assert_eq!(lock(&auth.flow).factor_failures.0, 0);
+        auth.totp_enroll_confirm_session(&totp_now(&secret))
+            .unwrap();
+        assert_upgraded(&file, PASSWORD);
+        assert!(file.load().unwrap().totp_enabled());
+    }
+
+    #[test]
+    fn security_stronger_password_hash_is_kept() {
+        let file = TestState::new();
+        let salt = [9; SALT_LEN];
+        file.write(
+            serde_json::json!({
+                "password_salt": hex(&salt),
+                "password_key": pbkdf2_key(PASSWORD, &salt, 700_000),
+                "password_iterations": 700_000
+            })
+            .to_string(),
+        );
+        let saved = std::fs::read(&file.path).unwrap();
+        let auth = file.load().unwrap();
+        assert!(matches!(
+            auth.login_step1_session(localhost(), PASSWORD),
+            Ok(LoginStep1Outcome::Session(_))
+        ));
+        assert_eq!(std::fs::read(&file.path).unwrap(), saved);
+        assert_eq!(memory_state(&auth)["password_iterations"], 700_000);
+    }
+
+    #[test]
+    fn security_wrong_password_does_not_rewrite_legacy_hash() {
+        let file = TestState::new();
+        write_legacy_state(&file, serde_json::json!({}));
+        let legacy = std::fs::read(&file.path).unwrap();
+        let auth = file.load().unwrap();
+        let ip = localhost();
+        assert!(matches!(
+            auth.login_step1_session(ip, "wrong-password"),
+            Err(AuthError::InvalidPassword)
+        ));
+        assert_eq!(
+            auth.totp_enroll_begin_verified(ip, "wrong-password")
+                .unwrap_err(),
+            AuthError::InvalidPassword
+        );
+        assert_eq!(std::fs::read(&file.path).unwrap(), legacy);
+        assert_legacy(&memory_state(&auth));
+        // The right password still upgrades afterwards.
+        assert!(matches!(
+            auth.login_step1_session(ip, PASSWORD),
+            Ok(LoginStep1Outcome::Session(_))
+        ));
+        assert_upgraded(&file, PASSWORD);
+    }
+
+    #[test]
+    fn security_legacy_upgrade_save_failure_still_logs_in() {
+        let file = TestState::new();
+        write_legacy_state(&file, serde_json::json!({}));
+        let auth = Auth::new(Duration::from_secs(60), &file.path, PP::new(true, true)).unwrap();
+        let ip = localhost();
+        let session = auth.create_session().unwrap();
+        let saved = block_saves(&file);
+        let (outcome, logged) =
+            crate::pp::capture_stderr(|| auth.login_step1_session(ip, PASSWORD));
+        assert!(matches!(outcome, Ok(LoginStep1Outcome::Session(_))));
+        assert_eq!(logged.lines().count(), 1, "{logged}");
+        assert!(logged.starts_with(crate::pp::EMOJI_LOCK), "{logged}");
+        for secret in [
+            PASSWORD.to_string(),
+            hex(&LEGACY_SALT),
+            pbkdf2_key(PASSWORD, &LEGACY_SALT, 100_000),
+        ] {
+            assert!(!logged.contains(&secret));
+        }
+        assert_legacy(&memory_state(&auth));
+        assert!(auth.session_valid(&session));
+        assert_eq!(lock(&auth.flow).factor_failures.0, 0);
+        // Nothing was written: the blocking directory is still empty and no
+        // temporary file was left next to it.
+        assert_eq!(std::fs::read_dir(&file.path).unwrap().count(), 0);
+        assert_eq!(std::fs::read_dir(&file.dir).unwrap().count(), 1);
+        restore_saves(&file, saved);
+        assert_legacy(&stored(&file));
+        assert!(file.load().unwrap().verify_password(PASSWORD));
+        // A login after the retry delay tries again.
+        lock(&auth.flow).upgrade_retry_after = Some(Instant::now());
+        assert!(matches!(
+            auth.login_step1_session(ip, PASSWORD),
+            Ok(LoginStep1Outcome::Session(_))
+        ));
+        assert_upgraded(&file, PASSWORD);
+        assert!(auth.session_valid(&session));
+    }
+
+    #[test]
+    fn security_legacy_upgrade_save_failure_still_issues_challenge() {
+        let file = TestState::new();
+        let secret = crate::totp::base32_encode(b"synthetic totp key");
+        write_legacy_state(&file, serde_json::json!({ "totp_secret": secret }));
+        let auth = file.load().unwrap();
+        let ip = localhost();
+        let session = auth.create_session().unwrap();
+        let saved = block_saves(&file);
+        let (token, logged) = crate::pp::capture_stderr(|| challenge(&auth, ip, PASSWORD));
+        assert_eq!(logged.lines().count(), 1, "{logged}");
+        assert!(!logged.contains(PASSWORD));
+        assert_legacy(&memory_state(&auth));
+        assert!(auth.session_valid(&session));
+        assert!(lock(&auth.limiter.state).is_empty());
+        assert_eq!(lock(&auth.flow).factor_failures.0, 0);
+        assert_eq!(std::fs::read_dir(&file.path).unwrap().count(), 0);
+        restore_saves(&file, saved);
+        assert_legacy(&stored(&file));
+        assert!(matches!(
+            auth.login_step2_session(ip, &token, &totp_now(&secret)),
+            Ok((Login2faOutcome::Totp, _))
+        ));
+        assert_legacy(&stored(&file));
+    }
+
+    #[test]
+    fn security_failed_upgrade_save_backs_off() {
+        let file = TestState::new();
+        write_legacy_state(&file, serde_json::json!({}));
+        let auth = file.load().unwrap();
+        let ip = localhost();
+        let saved = block_saves(&file);
+        // Each failed save logs one warning, so the line count is the number
+        // of save attempts.
+        let (outcomes, logged) = crate::pp::capture_stderr(|| {
+            [
+                auth.login_step1_session(ip, PASSWORD),
+                auth.login_step1_session(ip, PASSWORD),
+            ]
+        });
+        for outcome in outcomes {
+            assert!(matches!(outcome, Ok(LoginStep1Outcome::Session(_))));
+        }
+        assert_eq!(logged.lines().count(), 1, "{logged}");
+        assert_legacy(&memory_state(&auth));
+        let retry_after = lock(&auth.flow).upgrade_retry_after.unwrap();
+        assert!(retry_after > Instant::now() + Duration::from_secs(9 * 60));
+        assert!(retry_after <= Instant::now() + UPGRADE_RETRY_DELAY);
+        // Once the delay has passed, the next login tries again.
+        lock(&auth.flow).upgrade_retry_after = Some(Instant::now());
+        let (outcome, logged) =
+            crate::pp::capture_stderr(|| auth.login_step1_session(ip, PASSWORD));
+        assert!(matches!(outcome, Ok(LoginStep1Outcome::Session(_))));
+        assert_eq!(logged.lines().count(), 1, "{logged}");
+        // Saves work again, but the new delay still holds the upgrade back.
+        restore_saves(&file, saved);
+        let (outcome, logged) =
+            crate::pp::capture_stderr(|| auth.login_step1_session(ip, PASSWORD));
+        assert!(matches!(outcome, Ok(LoginStep1Outcome::Session(_))));
+        assert!(logged.is_empty(), "{logged}");
+        assert_legacy(&stored(&file));
+        // A restart forgets the delay.
+        let restarted = file.load().unwrap();
+        assert!(matches!(
+            restarted.login_step1_session(ip, PASSWORD),
+            Ok(LoginStep1Outcome::Session(_))
+        ));
+        assert_upgraded(&file, PASSWORD);
+    }
+
+    #[test]
+    fn startup_rejects_out_of_range_password_iterations() {
+        let file = TestState::new();
+        for (iterations, accepted) in [
+            (0, false),
+            (99_999, false),
+            (100_000, true),
+            (600_000, true),
+            (6_000_000, true),
+            (6_000_001, false),
+            (u32::MAX, false),
+        ] {
+            file.write(
+                serde_json::json!({
+                    "password_salt": hex(&[0; SALT_LEN]),
+                    "password_key": hex(&[0; KEY_LEN]),
+                    "password_iterations": iterations
+                })
+                .to_string(),
+            );
+            match file.load() {
+                Ok(_) => assert!(accepted, "{iterations} must fail startup"),
+                Err(error) => {
+                    assert!(!accepted, "{iterations} must be accepted");
+                    assert_eq!(error, "invalid auth password iteration count");
+                }
+            }
+        }
+        // Null loads like a missing field, as the other optional fields do.
+        file.write(
+            serde_json::json!({
+                "password_salt": hex(&LEGACY_SALT),
+                "password_key": pbkdf2_key(PASSWORD, &LEGACY_SALT, 100_000),
+                "password_iterations": null
+            })
+            .to_string(),
+        );
+        let auth = file.load().unwrap();
+        assert_eq!(
+            lock(&auth.state).password_hash_iterations(),
+            Some(LEGACY_PASSWORD_ITERATIONS)
+        );
+        assert_eq!(LEGACY_PASSWORD_ITERATIONS.get(), 100_000);
+        assert!(auth.verify_password(PASSWORD));
+        for value in [
+            serde_json::json!(-1),
+            serde_json::json!(600_000.5),
+            serde_json::json!("600000"),
+            serde_json::json!(u64::from(u32::MAX) + 1),
+        ] {
+            file.write(
+                serde_json::json!({
+                    "password_salt": hex(&[0; SALT_LEN]),
+                    "password_key": hex(&[0; KEY_LEN]),
+                    "password_iterations": value
+                })
+                .to_string(),
+            );
+            assert!(file.load().is_err(), "{value} must fail startup");
+        }
+    }
+
+    #[test]
+    fn backup_code_hashes_use_100000_iterations() {
+        let stored = hash_backup_code("ABCD-EFGH").unwrap();
+        let (salt, key) = stored.split_once(':').unwrap();
+        let salt = hex_decode_salt(salt).unwrap();
+        assert_eq!(key, pbkdf2_key("ABCDEFGH", &salt, 100_000));
+        assert!(backup_matches(&stored, "abcd-efgh"));
     }
 
     #[test]

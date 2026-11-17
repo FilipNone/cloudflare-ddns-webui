@@ -44,6 +44,17 @@ impl PP {
     }
 
     fn stderr(&self, emoji: &str, msg: impl Display) {
+        #[cfg(test)]
+        if CAPTURED.with_borrow_mut(|captured| {
+            if let Some(out) = captured.as_mut() {
+                self.write_line(out, emoji, &msg);
+                true
+            } else {
+                false
+            }
+        }) {
+            return;
+        }
         self.write_line(&mut std::io::stderr().lock(), emoji, msg);
     }
 
@@ -60,8 +71,40 @@ impl PP {
 }
 
 #[cfg(test)]
+thread_local! {
+    /// Stderr lines collected by `capture_stderr` on this thread.
+    static CAPTURED: std::cell::RefCell<Option<Vec<u8>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Runs `call` and returns what it logged to stderr from this thread,
+/// so tests can check warnings without reading the real stderr.
+#[cfg(test)]
+pub fn capture_stderr<R>(call: impl FnOnce() -> R) -> (R, String) {
+    CAPTURED.set(Some(Vec::new()));
+    let result = call();
+    let captured = CAPTURED.take().unwrap_or_default();
+    (result, String::from_utf8_lossy(&captured).into_owned())
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stderr_capture_collects_warnings_and_errors() {
+        let pp = PP::new(true, true);
+        let ((), logged) = capture_stderr(|| {
+            pp.warningf(EMOJI_LOCK, "synthetic warning");
+            pp.infof(EMOJI_GLOBE, "synthetic info");
+            pp.errorf(EMOJI_ERROR, "synthetic error");
+        });
+        assert_eq!(
+            logged,
+            format!("{EMOJI_LOCK} synthetic warning\n{EMOJI_ERROR} synthetic error\n")
+        );
+        let ((), logged) = capture_stderr(|| {});
+        assert!(logged.is_empty());
+    }
 
     struct BrokenPipe;
 
