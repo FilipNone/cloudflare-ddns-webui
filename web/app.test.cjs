@@ -145,6 +145,18 @@ test("metadata keep, set and clear have explicit distinct wire values", () => {
   assert.throws(() => run("metadataPatch('tags', 'set', ', ')"));
 });
 
+test("record comments follow the server's 500-byte limit", () => {
+  const { run } = app();
+  // The server counts UTF-8 bytes, so 250 two-byte letters fit and 251 do not.
+  assert.equal(run("metadataPatch('comment', 'set', 'a'.repeat(500)).comment.length"), 500);
+  assert.equal(run("metadataPatch('comment', 'set', '\\u00e9'.repeat(250)).comment.length"), 250);
+  assert.throws(() => run("metadataPatch('comment', 'set', 'a'.repeat(501))"), /500 bytes/);
+  assert.throws(() => run("metadataPatch('comment', 'set', '\\u00e9'.repeat(251))"), /500 bytes/);
+  assert.throws(() => run("metadataPatch('comment', 'set', 'tab\\there')"), /control characters/);
+  assert.equal(run("utf8Length('\\u{1F600}')"), 4);
+  assert.doesNotMatch(appSource, /maxlength="100"/);
+});
+
 test("DDNS failure evidence is retained and escaped after status refresh", async () => {
   const { context, run } = app();
   run("state.route = 'dashboard'; state.ddnsUpdateResult = { success:false, log:['<synthetic failure>'], outcomes:[] };");

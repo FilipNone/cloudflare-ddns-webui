@@ -155,6 +155,8 @@ const I18N = {
     "modal.tags": "Tags",
     "modal.tags.hint": "Comma-separated, e.g. cf-proxied:true",
     "modal.comment": "Comment",
+    "modal.comment.hint": "Up to 500 bytes. Free zones accept up to 100 characters.",
+    "modal.comment.invalid": "Comments can be at most {max} bytes, with no control characters.",
     "modal.save": "Save",
     "modal.create": "Create",
     "modal.cancel": "Cancel",
@@ -1787,11 +1789,27 @@ function modalHead(title) {
   return `<div class="modal-head"><h3 id="modal-title">${esc(title)}</h3><button class="modal-close" data-close aria-label="${esc(t("common.close"))}">${I.close}</button></div>`;
 }
 
+// Same limit as MAX_RECORD_COMMENT in src/config.rs, which counts UTF-8 bytes.
+const MAX_COMMENT_BYTES = 500;
+
+function utf8Length(s) {
+  let bytes = 0;
+  for (const ch of s) {
+    const cp = ch.codePointAt(0);
+    bytes += cp < 0x80 ? 1 : cp < 0x800 ? 2 : cp < 0x10000 ? 3 : 4;
+  }
+  return bytes;
+}
+
 function metadataPatch(field, mode, raw) {
   if (mode === "keep") return {};
   if (mode === "clear") return { [field]: field === "tags" ? [] : "" };
   const value = field === "tags" ? raw.split(",").map((tag) => tag.trim()).filter(Boolean) : raw.trim();
   if (!value.length) throw new Error(t("modal.metadata.empty"));
+  // The server rejects the same comments; checking here keeps the form open with the text intact.
+  if (field === "comment" && (utf8Length(value) > MAX_COMMENT_BYTES || /[\u0000-\u001f\u007f-\u009f]/.test(value))) {
+    throw new Error(t("modal.comment.invalid", { max: MAX_COMMENT_BYTES }));
+  }
   return { [field]: value };
 }
 
@@ -1800,8 +1818,8 @@ function metadataFields(prefix, rec, keep) {
     <span>${esc(t("modal." + field))}</span>
     ${keep ? `<span id="${prefix}-${field}-mode"></span>` : ""}
     <label class="field ${keep ? "u-hidden" : ""}" id="${prefix}-${field}-wrap">
-      <input class="input" id="${prefix}-${field}" aria-label="${esc(t("modal." + field))}" value="${esc(field === "tags" ? (rec?.tags || []).join(", ") : rec?.comment || "")}" ${field === "comment" ? 'maxlength="100"' : 'placeholder="owner:test"'}>
-      ${field === "tags" ? `<div class="field-hint">${esc(t("modal.tags.hint"))}</div>` : ""}
+      <input class="input" id="${prefix}-${field}" aria-label="${esc(t("modal." + field))}" value="${esc(field === "tags" ? (rec?.tags || []).join(", ") : rec?.comment || "")}" ${field === "comment" ? `maxlength="${MAX_COMMENT_BYTES}"` : 'placeholder="owner:test"'}>
+      <div class="field-hint">${esc(t(`modal.${field}.hint`))}</div>
     </label></div>`).join("");
 }
 
