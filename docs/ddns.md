@@ -1,6 +1,6 @@
 # DDNS and Cloudflare
 
-The GUI has no schedule and never starts, configures or watches cloudflare-ddns. It shows DDNS status and runs one update when the admin presses **Update now**.
+The GUI never starts, configures or watches cloudflare-ddns. Today it has no schedule: it shows DDNS status and runs one update when the admin presses **Update now**. Scheduled updates, record deletion and the other updater settings in [roadmap.md](roadmap.md) are planned; each one moves out of the rejected list when it is built.
 
 ## Update now (`ddns.rs`)
 

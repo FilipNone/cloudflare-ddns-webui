@@ -7,12 +7,13 @@ Keep this file short. Details live in `docs/`.
 ## Read
 
 | File | Covers |
-|---|---|
+| --- | --- |
 | [docs/rules.md](docs/rules.md) | Owner rules, never crash, security, DDNS safety, scope |
 | [docs/workflow.md](docs/workflow.md) | Doing a task, checks, smoke harness, parallel agents, CI |
 | [docs/architecture.md](docs/architecture.md) | Source map, request flow, API routes, data directory |
 | [docs/ddns.md](docs/ddns.md) | Update now, fail-closed rules, contracts, bulk batches, upstream copy |
 | [docs/frontend.md](docs/frontend.md) | Script order, CSP and escaping, conventions, design reference |
+| [docs/roadmap.md](docs/roadmap.md) | Planned work, which is in scope |
 | [README.md](README.md) | User-facing features, settings and deployment. Keep it accurate when behaviour changes |
 | [.env.example](.env.example) | Every supported setting |
 
@@ -20,7 +21,7 @@ Keep this file short. Details live in `docs/`.
 
 ## Rules
 
-- Never read or copy `.env`, `data/`, tokens or real DNS exports. Test against `scripts/mock-cloudflare-api.py` and the synthetic `example.com` zone.
+- Never read or copy `.env`, `data/`, tokens or real DNS exports. Test against `scripts/mock-cloudflare-api.py` and its synthetic `.example` zones.
 - No new `unwrap`, `expect` or `panic!` in non-test code: the release build aborts on panic.
 - No package manager, framework or build step in `web/`, and no inline scripts or styles.
 

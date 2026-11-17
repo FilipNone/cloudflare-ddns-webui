@@ -45,7 +45,11 @@ DEFAULT_PROVIDER = "literal:203.0.113.42"
 DOC_NETWORKS = tuple(ipaddress.ip_network(n) for n in (
     "192.0.2.0/24", "198.51.100.0/24", "203.0.113.0/24", "2001:db8::/32"
 ))
-BIND_FIXTURE = """$ORIGIN example.com.
+# The mock's zones, in the name order the app lists them in.
+SYNTHETIC_ZONES = ("acme.example", "homelab.example", "rossi.example")
+# The regression groups write to this zone, and DDNS updates its apex.
+TEST_ZONE = "homelab.example"
+BIND_FIXTURE = """$ORIGIN homelab.example.
 $TTL 300
 import-a IN A 192.0.2.71
     AAAA 2001:db8::71
@@ -96,6 +100,10 @@ def scrub(text):
     return text
 
 
+def test_zone_id(module):
+    return next(z["id"] for z in module.ZONES if z["name"] == TEST_ZONE)
+
+
 def find_record(records, message, **fields):
     """First record whose fields all match. Fails with `message` when there is none."""
     found = next((r for r in records if all(r.get(k) == v for k, v in fields.items())), None)
@@ -103,77 +111,75 @@ def find_record(records, message, **fields):
     return found
 
 
-def in_synthetic_zone(name):
+def in_zone(name, zone):
     name = name.rstrip(".")
-    return name == "example.com" or name.endswith(".example.com")
+    return name == zone or name.endswith("." + zone)
 
 
-def check_synthetic_record(record, source):
-    """Fail unless a mock record stays inside example.com and documentation addresses."""
-    require(in_synthetic_zone(record["name"]), f"{source} owner is outside the synthetic zone")
+def check_synthetic_record(record, zone, source):
+    """Fail unless a mock record stays inside `zone`, uses documentation addresses
+    and names no host outside the reserved .example TLD."""
+    require(in_zone(record["name"], zone), f"{source} owner is outside its synthetic zone")
+    text = [record.get("comment") or "", *(record.get("tags") or []), json.dumps(record.get("data"))]
     if record["type"] in ("A", "AAAA"):
         address = ipaddress.ip_address(record["content"])
         require(any(address in n for n in DOC_NETWORKS),
                 f"{source} address is outside documentation ranges")
-    elif record["type"] == "CNAME":
-        require(record["content"].rstrip(".") == "example.com",
-                f"{source} CNAME must target the synthetic zone")
     else:
-        require(False, f"{source} has an unexpected record type; review synthetic fixture")
+        text.append(record["content"])
+    # Every dotted word must end in .example, so an IPv4 address in a TXT record fails too.
+    for word in re.findall(r"[\w*-]+(?:\.[\w-]+)+", " ".join(text)):
+        require(word.rstrip(".").endswith(".example"),
+                f"{source} names a host outside the reserved .example TLD")
 
 
 def check_fixture_privacy(module):
-    require(
-        len(module.ZONES) == 1 and module.ZONES[0]["name"] == "example.com",
-        "mock fixture must contain only the synthetic example.com zone",
-    )
-    require(
-        set(module.RECORDS) == {module.ZONES[0]["id"]},
-        "mock fixture has unexpected record zones",
-    )
-    for records in module.RECORDS.values():
+    require([z["name"] for z in module.ZONES] == list(SYNTHETIC_ZONES),
+            "mock fixture must contain only the synthetic .example zones")
+    ids = {z["id"] for z in module.ZONES}
+    require(set(module.RECORDS) == ids and set(module.EXPORT_BIND) == ids,
+            "mock fixture has unexpected record or export zones")
+    for zone in module.ZONES:
+        records = module.RECORDS[zone["id"]]
         for record in records:
-            check_synthetic_record(record, "mock record")
-    exported = module.parse_bind(module.EXPORT_BIND, "example.com")
-    require([None if r is None else (r["name"], r["type"], r["ttl"], r["content"])
-             for r in exported] == [
-        None,  # SOA: parse_bind returns None for it
-        ("example.com", "A", 1, "203.0.113.10"),
-        ("example.com", "AAAA", 300, "2001:db8::10"),
-    ], "mock export does not parse to the expected synthetic records")
-    for record in exported:
-        if record is not None:
-            check_synthetic_record(record, "mock export")
-    # parse_bind drops the SOA data, so also check every host name in the text.
-    hosts = [word for word in module.EXPORT_BIND.split()
-             if re.fullmatch(r"[\w-]+(?:\.[\w-]+)+\.?", word) and re.search(r"[A-Za-z]", word)]
-    require(hosts and all(in_synthetic_zone(host) for host in hosts),
-            "mock export names a host outside the synthetic zone")
+            check_synthetic_record(record, zone["name"], "mock record")
+        text = module.EXPORT_BIND[zone["id"]]
+        exported = module.parse_bind(text, zone["name"])
+        seeded = [(r["name"], r["type"], r["ttl"], r["content"]) for r in records]
+        # parse_bind returns None for the SOA.
+        require(exported[0] is None and len(exported) > 1
+                and all((r["name"], r["type"], r["ttl"], r["content"]) in seeded for r in exported[1:]),
+                "mock export does not parse to records of its synthetic zone")
+        # parse_bind drops the SOA data, so also check every host name in the text.
+        hosts = [word for word in text.split()
+                 if re.fullmatch(r"[\w-]+(?:\.[\w-]+)+\.?", word) and re.search(r"[A-Za-z]", word)]
+        require(hosts and all(in_zone(host, zone["name"]) for host in hosts),
+                "mock export names a host outside its synthetic zone")
 
 
 def check_reference_parsers(module):
-    parsed = module.parse_bind(BIND_FIXTURE, "example.com")
+    parsed = module.parse_bind(BIND_FIXTURE, "homelab.example")
     require([(r["name"], r["type"], r["ttl"], r["content"]) for r in parsed] == [
-        ("import-a.example.com", "A", 300, "192.0.2.71"),
-        ("import-a.example.com", "AAAA", 300, "2001:db8::71"),
-        ("import-b.example.com", "A", 600, "192.0.2.72"),
-        ("import-c.example.com", "A", 900, "192.0.2.73"),
-        ("import-d.example.com", "A", 300, "192.0.2.74"),
-        ("import-alias.example.com", "CNAME", 300, "import-a.example.com"),
-        ("import-text.example.com", "TXT", 300, "synthetic; quoted text"),
+        ("import-a.homelab.example", "A", 300, "192.0.2.71"),
+        ("import-a.homelab.example", "AAAA", 300, "2001:db8::71"),
+        ("import-b.homelab.example", "A", 600, "192.0.2.72"),
+        ("import-c.homelab.example", "A", 900, "192.0.2.73"),
+        ("import-d.homelab.example", "A", 300, "192.0.2.74"),
+        ("import-alias.homelab.example", "CNAME", 300, "import-a.homelab.example"),
+        ("import-text.homelab.example", "TXT", 300, "synthetic; quoted text"),
     ], "mock BIND parser does not match the independently specified fixture")
     for invalid in ("$INCLUDE /synthetic", "$TTL 300\nx A not-an-ip",
                     "$TTL 300\nx AAAA 192.0.2.1", "$TTL 300\nx BOGUS content",
                     "$TTL 18446744073709551615h\nx A 192.0.2.1"):
         try:
-            module.parse_bind(invalid, "example.com")
+            module.parse_bind(invalid, "homelab.example")
         except ValueError:
             continue
         raise AssertionError("mock silently accepts an invalid synthetic import")
     require(totp("GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ", 59) == "287082",
             "stdlib TOTP does not match the independent RFC 6238 vector")
-    inherited = module.parse_bind("last.example.com. 600 IN A 192.0.2.1\nnext.example.com. IN A 192.0.2.2\n",
-                                  "example.com")
+    inherited = module.parse_bind("last.homelab.example. 600 IN A 192.0.2.1\n"
+                                  "next.homelab.example. IN A 192.0.2.2\n", "homelab.example")
     require([r["ttl"] for r in inherited] == [600, 600], "mock fails standard last explicit TTL inheritance")
 
 
@@ -232,6 +238,13 @@ PROVIDER_REPLIES = {
     "/provider/oversized": (200, " " * 20000 + "203.0.113.99"),
     "/provider/redirect-target": (200, "203.0.113.99"),
 }
+# Providers for --serve. Each answers with a new documentation address every
+# ROTATION_SECONDS, so Update now has a changed IP to write.
+ROTATING_PROVIDERS = {
+    "/provider/rotating-v4": "203.0.113.{}",
+    "/provider/rotating-v6": "2001:db8::{}",
+}
+ROTATION_SECONDS = 60
 # Malformed `result` values by fault kind. The kind "missing" leaves `result` out.
 MALFORMED_RESULTS = {
     "null": None,
@@ -255,7 +268,7 @@ class FaultInjection:
 
     def route(self, method, body):
         owner = self.server.owner
-        if self.path == PROVIDER_REDIRECT or self.path in PROVIDER_REPLIES:
+        if self.path == PROVIDER_REDIRECT or self.path in PROVIDER_REPLIES or self.path in ROTATING_PROVIDERS:
             return self._provider_reply(owner)
         if self.headers.get("Authorization") != "Bearer " + TOKEN:
             return self._json({"success": False, "errors": []}, 401)
@@ -272,6 +285,10 @@ class FaultInjection:
             self.send_header("Content-Length", "0")
             self.end_headers()
             return None
+        if self.path in ROTATING_PROVIDERS:
+            # 100 to 199 stays clear of the addresses the fixtures and other providers use.
+            host = 100 + int(time.time()) // ROTATION_SECONDS % 100
+            return self._text(ROTATING_PROVIDERS[self.path].format(host))
         status, text = PROVIDER_REPLIES[self.path]
         return self._text(text, status)
 
@@ -575,7 +592,7 @@ class App:
             "CLOUDFLARE_API_BASE": f"http://127.0.0.1:{self.mock.port}/client/v4",
             "LISTEN": f"127.0.0.1:{self.port}",
             "DATA_DIR": "/data" if self.image else str(self.state_dir),
-            "DOMAINS": "example.com", "IP4_PROVIDER": provider,
+            "DOMAINS": TEST_ZONE, "IP4_PROVIDER": provider,
             "IP6_PROVIDER": "none", "PROXIED": "false", "TTL": "300",
             "RECORD_COMMENT": "Synthetic smoke fixture", "SESSION_TTL": "300",
             "SECURE_COOKIES": "true" if self.secure else "false",
@@ -800,9 +817,9 @@ def setup_session(app, overrides=None):
 
 
 def add_synthetic_records(mock, zone, count, prefix):
-    """Add `count` A records under example.com with documentation addresses
+    """Add `count` A records under homelab.example with documentation addresses
     to the mock zone and return their IDs."""
-    rows = [mock.module.rec("A", f"{prefix}-{i}.example.com", f"198.51.100.{i % 254 + 1}", ttl=300)
+    rows = [mock.module.rec("A", f"{prefix}-{i}.homelab.example", f"198.51.100.{i % 254 + 1}", ttl=300)
             for i in range(count)]
     with mock.records() as records:
         records[zone].extend(rows)
@@ -1099,14 +1116,14 @@ def enrollment_storage_smoke(app, mock):
 
 def metadata_smoke(app, mock):
     cookie = setup_session(app)
-    zone = mock.module.ZONES[0]["id"]
+    zone = test_zone_id(mock.module)
     path = f"/api/zones/{zone}/records"
 
     def stored(record_id):
         return find_record(mock.snapshot()[1][zone], f"record {record_id} is missing from the mock",
                            id=record_id)
 
-    payload = {"type": "A", "name": "metadata.example.com", "content": "192.0.2.81",
+    payload = {"type": "A", "name": "metadata.homelab.example", "content": "192.0.2.81",
                "ttl": 300, "proxied": False, "comment": "seed-comment", "tags": ["test:seed"]}
     row, _ = request(app.port, "POST", path, payload, cookie=cookie, expected=201)
     rid = row["id"]
@@ -1143,7 +1160,7 @@ def metadata_smoke(app, mock):
             {"action": "update", "ids": [rid], "patch": {"proxied": False, "ttl": 600}}, cookie=cookie)
     row = stored(rid)
     require(row["ttl"] == 600 and not row["proxied"], "DNS-only bulk patch lost explicit TTL")
-    other, _ = request(app.port, "POST", path, {**basic, "name": "partial.example.com"},
+    other, _ = request(app.port, "POST", path, {**basic, "name": "partial.homelab.example"},
                         cookie=cookie, expected=201)
     mock.fail_ids.add(other["id"])
     # With the failing record, these fill the first batch and push rid into a second one.
@@ -1210,7 +1227,7 @@ def bulk_failure_checks(app, mock, cookie, zone, action, patch, error, failing, 
 
 def identifier_smoke(app, mock):
     cookie = setup_session(app)
-    zone = mock.module.ZONES[0]["id"]
+    zone = test_zone_id(mock.module)
     before = mock.snapshot()
     rid = before[1][zone][0]["id"]
     path = f"/api/zones/{zone}/records"
@@ -1228,9 +1245,9 @@ def identifier_smoke(app, mock):
     for patch in ({}, {"content": "192.0.2.1"}):
         request(app.port, "POST", path + "/bulk", {"action": "update", "ids": [rid], "patch": patch},
                 cookie=cookie, expected=400)
-    request(app.port, "POST", path, {"type": "A", "name": "x.example.com", "content": "192.0.2.1",
+    request(app.port, "POST", path, {"type": "A", "name": "x.homelab.example", "content": "192.0.2.1",
                                      "zone_id": zone}, cookie=cookie, expected=400)
-    request(app.port, "POST", path, {"type": "A", "name": "x.example.com", "content": "192.0.2.1",
+    request(app.port, "POST", path, {"type": "A", "name": "x.homelab.example", "content": "192.0.2.1",
                                      "data": {"priority": 1, "weight": 1, "port": 1, "target": "x"}},
             cookie=cookie, expected=400)
     for method in ("DELETE", "PUT", "GET"):
@@ -1242,7 +1259,7 @@ def identifier_smoke(app, mock):
     for invalid in ("bad.identifier", rid + "%3Fquery", rid + "%23fragment"):
         request(app.port, "DELETE", path + "/" + invalid, cookie=cookie, expected=400)
         require(mock.snapshot() == before, "unsafe record path reached upstream mutation")
-    bind = b"safe.example.com. 300 IN A 192.0.2.99\n"
+    bind = b"safe.homelab.example. 300 IN A 192.0.2.99\n"
     for filename in ("../zone.txt", "a/b.txt", "a\\b.txt", 'a".txt',
                      "a\r\nX-Synthetic: injected", "", ".."):
         wire_request(app.port, "POST", f"/api/zones/{zone}/import?filename={quote(filename, safe='')}",
@@ -1254,10 +1271,10 @@ def identifier_smoke(app, mock):
 
 def bind_smoke(app, mock):
     cookie = setup_session(app)
-    zone = mock.module.ZONES[0]["id"]
+    zone = test_zone_id(mock.module)
     path = f"/api/zones/{zone}/import?filename=synthetic-zone.txt"
     exported, headers = wire_request(app.port, "GET", f"/api/zones/{zone}/export", cookie=cookie)
-    require(exported.decode() == mock.module.EXPORT_BIND
+    require(exported.decode() == mock.module.EXPORT_BIND[zone]
             and "attachment" in headers.get("Content-Disposition", ""), "BIND export is wrong")
     before = mock.snapshot()
     content, _ = wire_request(app.port, "POST", path, exported, cookie, content_type="text/plain")
@@ -1269,7 +1286,7 @@ def bind_smoke(app, mock):
             "valid default-TTL/class/owner BIND fixture import counts are wrong")
     imported = [r for r in mock.snapshot()[1][zone] if r["name"].startswith("import-")]
     require(len(imported) == 7, "mock import did not actually create the expected records")
-    require(find_record(imported, "import lost import-b", name="import-b.example.com")["ttl"] == 600
+    require(find_record(imported, "import lost import-b", name="import-b.homelab.example")["ttl"] == 600
             and find_record(imported, "import lost the TXT record", type="TXT")["content"]
             == "synthetic; quoted text",
             "import lost explicit class-first TTL or quoted semicolon content")
@@ -1289,21 +1306,22 @@ def bind_smoke(app, mock):
 
 def bind_edge_smoke(app, mock):
     cookie = setup_session(app)
-    zone = mock.module.ZONES[0]["id"]
+    zone = test_zone_id(mock.module)
     path = f"/api/zones/{zone}/import?filename=synthetic-zone.txt"
-    bind = b"last.example.com. 600 IN A 192.0.2.31\nnext.example.com. IN A 192.0.2.32\n"
+    bind = b"last.homelab.example. 600 IN A 192.0.2.31\nnext.homelab.example. IN A 192.0.2.32\n"
     content, _ = wire_request(app.port, "POST", path, bind, cookie, content_type="text/plain")
     require(json.loads(content)["recs_added"] == 2, "last explicit TTL inheritance import count is wrong")
-    imported = [r for r in mock.snapshot()[1][zone] if r["name"] in ("last.example.com", "next.example.com")]
+    imported = [r for r in mock.snapshot()[1][zone]
+                if r["name"] in ("last.homelab.example", "next.homelab.example")]
     require(len(imported) == 2 and all(r["ttl"] == 600 for r in imported),
             "last explicit TTL inheritance did not reach correctly parsed records")
     for invalid in (
-        b"$TTL 300\nfoo..example.com. A 192.0.2.1\n",
-        b"$TTL 300\n@ CAA 0 !!! \"example.com\"\n",
+        b"$TTL 300\nfoo..homelab.example. A 192.0.2.1\n",
+        b"$TTL 300\n@ CAA 0 !!! \"homelab.example\"\n",
         b"$TTL 300\n@ HTTPS 1 . port=banana\n",
         b"$TTL 300\nx AAAA 2001:db8::1\nx AAAA 2001:0db8:0:0:0:0:0:1\n",
-        b"$TTL 300\nx CNAME WWW.EXAMPLE.COM.\nx CNAME www.example.com.\n",
-        b"$ORIGIN example.com.\n$TTL 300\nx A 192.0.2.1\nx.example.com. 600 IN A 192.0.2.1\n",
+        b"$TTL 300\nx CNAME WWW.HOMELAB.EXAMPLE.\nx CNAME www.homelab.example.\n",
+        b"$ORIGIN homelab.example.\n$TTL 300\nx A 192.0.2.1\nx.homelab.example. 600 IN A 192.0.2.1\n",
         ("$ORIGIN " + ".".join(["a" * 63, "b" * 63, "c" * 63, "com"]) + ".\n"
          "$ORIGIN " + "d" * 63 + "\n$TTL 300\n@ A 192.0.2.1\n").encode(),
         ("$ORIGIN " + ".".join(["a" * 63, "b" * 63, "c" * 63, "com"]) + ".\n"
@@ -1471,9 +1489,9 @@ def origin_smoke(app, mock):
     wire_request(app.port, "GET", "/api/config", expected=403, extra_headers={"Origin": "null"})
     _, headers = wire_request(app.port, "GET", "/")
     require("Strict-Transport-Security" not in headers, "HSTS sent without an HTTPS origin")
-    app.restart(overrides={"PUBLIC_ORIGIN": "https://admin.example.com"})
+    app.restart(overrides={"PUBLIC_ORIGIN": "https://admin.homelab.example"})
     _, headers = wire_request(app.port, "GET", "/api/config", extra_headers={
-        "Host": "admin.example.com", "Origin": "https://admin.example.com"})
+        "Host": "admin.homelab.example", "Origin": "https://admin.homelab.example"})
     require(headers.get("Strict-Transport-Security") == "max-age=31536000",
             "HTTPS public origin must send HSTS")
     wire_request(app.port, "GET", "/api/config", expected=403,
@@ -1482,7 +1500,7 @@ def origin_smoke(app, mock):
 
 
 def ddns_contract_smoke(app, mock):
-    zone = mock.module.ZONES[0]["id"]
+    zone = test_zone_id(mock.module)
     apex = standalone_ddns_checks(app, mock, zone)
     shared_ddns_checks(app, mock, zone, apex)
     print("PASS structured DDNS families, unchanged writes, partial failures, ownership and duplicate refusal")
@@ -1490,8 +1508,8 @@ def ddns_contract_smoke(app, mock):
 
 def standalone_ddns_checks(app, mock, zone):
     """Family domains, unchanged cycles and partial failures. Returns the live apex A record."""
-    cookie = setup_session(app, {"DOMAINS": "", "IP4_DOMAINS": "example.com",
-                                "IP6_DOMAINS": "www.example.com",
+    cookie = setup_session(app, {"DOMAINS": "", "IP4_DOMAINS": "homelab.example",
+                                "IP6_DOMAINS": "www.homelab.example",
                                 "IP6_PROVIDER": "literal:2001:db8::42"})
     status, _ = request(app.port, "GET", "/api/ddns/status", cookie=cookie)
     require(status["contract_version"] == "standalone-v1" and status["daemon_status"] == "not_observed"
@@ -1501,22 +1519,22 @@ def standalone_ddns_checks(app, mock, zone):
     require(result["success"] and result["outcomes"], "family-specific DDNS failed")
     records = mock.snapshot()[1][zone]
     require(find_record(records, "IP4_DOMAINS apex A record is missing",
-                        name="example.com", type="A")["content"]
+                        name="homelab.example", type="A")["content"]
             == "203.0.113.42", "IP4_DOMAINS not applied")
     require(find_record(records, "IP6_DOMAINS www AAAA record is missing",
-                        name="www.example.com", type="AAAA")["content"]
+                        name="www.homelab.example", type="AAAA")["content"]
             == "2001:db8::42", "IP6_DOMAINS not applied")
-    require([r for r in records if r["name"] == "example.com" and r["type"] == "AAAA"]
-            == [r for r in before[1][zone] if r["name"] == "example.com" and r["type"] == "AAAA"],
+    require([r for r in records if r["name"] == "homelab.example" and r["type"] == "AAAA"]
+            == [r for r in before[1][zone] if r["name"] == "homelab.example" and r["type"] == "AAAA"],
             "family-specific configuration touched excluded AAAA")
     before = mock.snapshot()
     result = ddns_update(app, cookie)
     require(result["success"] and all(o["status"] in ("unchanged", "skipped") for o in result["outcomes"])
             and mock.snapshot() == before, "unchanged DDNS performed unnecessary writes")
-    app.restart(overrides={"DOMAINS": "example.com,www.example.com"})
+    app.restart(overrides={"DOMAINS": "homelab.example,www.homelab.example"})
     cookie = login(app)
     with mock.records() as records:
-        apex = find_record(records[zone], "synthetic apex A record is missing", type="A", name="example.com")
+        apex = find_record(records[zone], "synthetic apex A record is missing", type="A", name="homelab.example")
         apex["content"] = "192.0.2.19"
     mock.fail_ids.add(apex["id"])
     result = ddns_update(app, cookie)
@@ -1591,10 +1609,10 @@ def provider_smoke(app, mock):
     before = mock.snapshot()
     result = ddns_update(app, cookie)
     require(result["success"], "valid loopback synthetic IPv6 detection failed")
-    zone = mock.module.ZONES[0]["id"]
+    zone = test_zone_id(mock.module)
     records = mock.snapshot()[1][zone]
     require(find_record(records, "apex AAAA record is missing",
-                        name="example.com", type="AAAA")["content"]
+                        name="homelab.example", type="AAAA")["content"]
             == "2001:db8::42", "IPv6 provider failed to update AAAA")
     require([r for r in records if r["type"] == "A"] == [r for r in before[1][zone] if r["type"] == "A"],
             "IPv4 disabled did not preserve A records")
@@ -1603,7 +1621,7 @@ def provider_smoke(app, mock):
 
 def malformed_upstream_smoke(app, mock):
     cookie = setup_session(app)
-    zone = mock.module.ZONES[0]["id"]
+    zone = test_zone_id(mock.module)
     for kind in ("missing", "null"):
         mock.malformed_zone_list = kind
         before = mock.snapshot()
@@ -1620,30 +1638,30 @@ def malformed_upstream_smoke(app, mock):
         result = ddns_update(app, cookie)
         require(not result["success"] and any(o["status"] == "failed" for o in result["outcomes"]),
                 "malformed upstream record list was treated as valid empty DNS")
-        require(mock.zone_queries == ["example.com"] and mock.record_list_calls == calls + 1,
+        require(mock.zone_queries == ["homelab.example"] and mock.record_list_calls == calls + 1,
                 "record-list failure fixture was not exercised after valid zone discovery")
         require(mock.snapshot() == before, "malformed upstream record list caused DNS creation")
         mock.malformed_record_list = None
-    app.restart(overrides={"DOMAINS": "sub.example.com"})
+    app.restart(overrides={"DOMAINS": "sub.homelab.example"})
     cookie = login(app)
     for kind in ("missing", "null"):
-        mock.malformed_zone_lookup = "sub.example.com"
+        mock.malformed_zone_lookup = "sub.homelab.example"
         mock.malformed_zone_result = kind
         mock.zone_queries.clear()
         before = mock.snapshot()
         result = ddns_update(app, cookie)
         require(not result["success"] and any(o["status"] == "failed" for o in result["outcomes"]),
                 "malformed exact zone lookup was treated as a legitimate empty zone")
-        require(mock.zone_queries == ["sub.example.com"] and mock.snapshot() == before,
+        require(mock.zone_queries == ["sub.homelab.example"] and mock.snapshot() == before,
                 "malformed exact zone lookup fell back to the parent or wrote DNS")
     mock.malformed_zone_lookup = None
     mock.zone_queries.clear()
     before = mock.snapshot()
     result = ddns_update(app, cookie)
-    require(result["success"] and mock.zone_queries == ["sub.example.com", "example.com"],
+    require(result["success"] and mock.zone_queries == ["sub.homelab.example", "homelab.example"],
             "valid empty exact zone lookup did not allow the supported parent lookup")
     after = mock.snapshot()
-    require(after[0] == before[0] + 1 and any(r["name"] == "sub.example.com" and r["type"] == "A"
+    require(after[0] == before[0] + 1 and any(r["name"] == "sub.homelab.example" and r["type"] == "A"
             and r["content"] == "203.0.113.42" for r in after[1][zone]),
             "valid parent-zone fallback did not create the requested synthetic subdomain")
     print("PASS malformed lists/exact-zone lookups fail closed; legitimate empty zone permits parent fallback")
@@ -1651,8 +1669,8 @@ def malformed_upstream_smoke(app, mock):
 
 def malformed_import_smoke(app, mock):
     cookie = setup_session(app)
-    zone = mock.module.ZONES[0]["id"]
-    bind = b"malformed-import.example.com. 300 IN A 192.0.2.87\n"
+    zone = test_zone_id(mock.module)
+    bind = b"malformed-import.homelab.example. 300 IN A 192.0.2.87\n"
     for kind in ("missing", "null", "empty", "missing-added", "missing-parsed"):
         mock.malformed_import = kind
         before = mock.snapshot()
@@ -1666,7 +1684,7 @@ def malformed_import_smoke(app, mock):
 
 def concurrent_ddns_smoke(app, mock):
     cookie = setup_session(app)
-    zone = mock.module.ZONES[0]["id"]
+    zone = test_zone_id(mock.module)
     with mock.records() as records:
         records[zone] = [r for r in records[zone] if r["type"] != "A"]
     before = mock.snapshot()
@@ -1694,7 +1712,7 @@ def concurrent_ddns_smoke(app, mock):
     require(isinstance(first.result, dict) and first.result.get("success") is True,
             "concurrent DDNS returned no successful update")
     after = mock.snapshot()
-    apex = [r for r in after[1][zone] if r["type"] == "A" and r["name"] == "example.com"]
+    apex = [r for r in after[1][zone] if r["type"] == "A" and r["name"] == "homelab.example"]
     require(after[0] == before[0] + 1 and len(apex) == 1 and apex[0]["content"] == "203.0.113.42",
             "two concurrent GUI DDNS cycles created duplicate records")
     result = ddns_update(app, cookie)
@@ -1705,7 +1723,7 @@ def concurrent_ddns_smoke(app, mock):
 
 def bulk_revocation_smoke(app, mock):
     cookie = setup_session(app)
-    zone = mock.module.ZONES[0]["id"]
+    zone = test_zone_id(mock.module)
     # More than one batch, so the session can end before the second is sent.
     ids = add_synthetic_records(mock, zone, BATCH_LIMIT + 50, "revoke")
     sent, unsent = ids[:BATCH_LIMIT], ids[BATCH_LIMIT:]
@@ -1738,9 +1756,9 @@ def bulk_revocation_smoke(app, mock):
 
 def ddns_revocation_smoke(app, mock):
     cookie = setup_session(app, {"IP6_PROVIDER": "literal:2001:db8::42"})
-    zone = mock.module.ZONES[0]["id"]
+    zone = test_zone_id(mock.module)
     with mock.records() as records:
-        apex = find_record(records[zone], "synthetic apex A record is missing", type="A", name="example.com")
+        apex = find_record(records[zone], "synthetic apex A record is missing", type="A", name="homelab.example")
     mock.hold_mutation_id = apex["id"]
     before = mock.snapshot()
     update = Background(lambda: ddns_update(app, cookie)).start()
@@ -1753,7 +1771,7 @@ def ddns_revocation_smoke(app, mock):
         update.join()
     require(update.ok(), "DDNS after revocation did not settle: " + background_errors(update))
     result = update.result
-    outcomes = {o["record_type"]: o for o in result["outcomes"] if o["domain"] == "example.com"}
+    outcomes = {o["record_type"]: o for o in result["outcomes"] if o["domain"] == "homelab.example"}
     require(not result["success"] and outcomes["A"]["status"] == "updated"
             and outcomes["AAAA"]["status"] == "failed" and outcomes["AAAA"]["error"],
             "DDNS hid the unsent family failure after session revocation")
@@ -1770,7 +1788,7 @@ def ddns_revocation_smoke(app, mock):
 
 def oversized_body_smoke(app, mock):
     cookie = setup_session(app)
-    zone = mock.module.ZONES[0]["id"]
+    zone = test_zone_id(mock.module)
     before = mock.snapshot()
     conn = http.client.HTTPConnection("127.0.0.1", app.port, timeout=HTTP_TIMEOUT)
     try:
@@ -1884,7 +1902,7 @@ def graceful_shutdown(app, mock):
     app.start(overrides={"QUIET": "false"})
     app.ready()
     cookie = create_admin(app)
-    zone = mock.module.ZONES[0]["id"]
+    zone = test_zone_id(mock.module)
     mock.hold_next_list = True
     slow = Background(lambda: request(app.port, "GET", f"/api/zones/{zone}/records", cookie=cookie)[0])
     slow.start()
@@ -1985,11 +2003,11 @@ def baseline_setup(app):
 def baseline_crud(app, mock, cookie):
     """Record create, update and delete through the API. Returns (zone ID, records path)."""
     zones, _ = request(app.port, "GET", "/api/zones", cookie=cookie)
-    require(len(zones) == 1 and zones[0]["name"] == "example.com",
-            "API must expose only the synthetic zone")
-    zone = zones[0]["id"]
+    require([z["name"] for z in zones] == list(SYNTHETIC_ZONES),
+            "API must expose only the synthetic zones, in name order")
+    zone = next(z["id"] for z in zones if z["name"] == TEST_ZONE)
     path = f"/api/zones/{zone}/records"
-    payload = {"type": "A", "name": "smoke.example.com", "content": "192.0.2.42",
+    payload = {"type": "A", "name": "smoke.homelab.example", "content": "192.0.2.42",
                "proxied": True, "ttl": 3600}
     before = mock.snapshot()
     request(app.port, "POST", path, payload, cookie=cookie, mutation=False, expected=403)
@@ -2025,7 +2043,7 @@ def baseline_ddns(app, mock, cookie, zone, path):
     ddns_update(app, cookie)
     require(mock.snapshot()[0] > before[0], "DDNS update did not issue a DNS write")
     listing, _ = request(app.port, "GET", path, cookie=cookie)
-    apex = [r for r in listing["records"] if r["type"] == "A" and r["name"] == "example.com"]
+    apex = [r for r in listing["records"] if r["type"] == "A" and r["name"] == "homelab.example"]
     require(apex and all(r["content"] == "203.0.113.42" for r in apex),
             "literal IPv4 DDNS did not update the synthetic apex")
     require([r for r in mock.snapshot()[1][zone] if r["type"] == "AAAA"]
@@ -2164,11 +2182,13 @@ def serve(module, image, port):
         app = App(temp, mock, image, True, port)
         try:
             app.secure = False
-            app.start()
+            ipv6 = f"url:http://[::1]:{mock.port6}/provider/rotating-v6" if mock.port6 else "none"
+            app.start(f"url:http://127.0.0.1:{mock.port}/provider/rotating-v4", {"IP6_PROVIDER": ipv6})
             app.ready()
             create_admin(app)
             print(f"URL: http://127.0.0.1:{app.port}", flush=True)
             print("Password: the PASSWORD constant in scripts/smoke-test.py", flush=True)
+            print("Public IPs: a new address every minute; press Update now to follow it", flush=True)
             threading.Event().wait()
         finally:
             app.close()

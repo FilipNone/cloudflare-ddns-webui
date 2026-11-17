@@ -41,6 +41,6 @@ The CSP is `default-src 'self'`, with no inline scripts or styles.
 
 ## Design reference
 
-The layout follows the Cloudflare dashboard's DNS records page and its add-record form. Copy structure, spacing and interaction only. Don't copy Cloudflare's scripts, stylesheets, fonts, icons or logos; colours and sizes live in `web/style.css`.
+The layout follows the Cloudflare dashboard's DNS records page and its add-record form. Copy structure, spacing and interaction only. Where roadmap.md asks for different labels, defaults or animations, follow the roadmap. Don't copy Cloudflare's scripts, stylesheets, fonts, icons or logos; colours and sizes live in `web/style.css`.
 
 Check visible changes in a browser at 1440x900 and 390x844 against a `--serve` instance (see workflow.md).
