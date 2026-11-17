@@ -25,7 +25,7 @@ python3 scripts/smoke-test.py
 
 - Build the release binary before the smoke test. `app.test.cjs` also loads `appearance.test.cjs`, so the command above runs both suites.
 - `python3 scripts/smoke-test.py --only <group>` runs one group (for example `baseline`, `auth`, `metadata`, `bulk-revocation`, `ddns-contract`, `http`, `shutdown`).
-- `--serve --port 8888` starts a disposable instance on loopback for manual checks. Log in with the `PASSWORD` constant from `scripts/smoke-test.py`.
+- `--serve --port 8888` starts a disposable instance on loopback for manual checks. Log in with the `PASSWORD` constant from `scripts/smoke-test.py`. Its public IPv4 and IPv6 change every minute (IPv6 needs a `::1` loopback), so the dashboard goes out of sync until you press Update now.
 
 For container changes:
 

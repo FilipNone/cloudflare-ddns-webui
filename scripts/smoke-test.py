@@ -237,7 +237,15 @@ PROVIDER_REPLIES = {
     "/provider/cloudflare": (200, "104.16.0.1"),
     "/provider/oversized": (200, " " * 20000 + "203.0.113.99"),
     "/provider/redirect-target": (200, "203.0.113.99"),
-}# Malformed `result` values by fault kind. The kind "missing" leaves `result` out.
+}
+# Providers for --serve. Each answers with a new documentation address every
+# ROTATION_SECONDS, so Update now has a changed IP to write.
+ROTATING_PROVIDERS = {
+    "/provider/rotating-v4": "203.0.113.{}",
+    "/provider/rotating-v6": "2001:db8::{}",
+}
+ROTATION_SECONDS = 60
+# Malformed `result` values by fault kind. The kind "missing" leaves `result` out.
 MALFORMED_RESULTS = {
     "null": None,
     "empty": {},
@@ -260,7 +268,7 @@ class FaultInjection:
 
     def route(self, method, body):
         owner = self.server.owner
-        if self.path == PROVIDER_REDIRECT or self.path in PROVIDER_REPLIES:
+        if self.path == PROVIDER_REDIRECT or self.path in PROVIDER_REPLIES or self.path in ROTATING_PROVIDERS:
             return self._provider_reply(owner)
         if self.headers.get("Authorization") != "Bearer " + TOKEN:
             return self._json({"success": False, "errors": []}, 401)
@@ -277,6 +285,10 @@ class FaultInjection:
             self.send_header("Content-Length", "0")
             self.end_headers()
             return None
+        if self.path in ROTATING_PROVIDERS:
+            # 100 to 199 stays clear of the addresses the fixtures and other providers use.
+            host = 100 + int(time.time()) // ROTATION_SECONDS % 100
+            return self._text(ROTATING_PROVIDERS[self.path].format(host))
         status, text = PROVIDER_REPLIES[self.path]
         return self._text(text, status)
 
@@ -2170,11 +2182,13 @@ def serve(module, image, port):
         app = App(temp, mock, image, True, port)
         try:
             app.secure = False
-            app.start()
+            ipv6 = f"url:http://[::1]:{mock.port6}/provider/rotating-v6" if mock.port6 else "none"
+            app.start(f"url:http://127.0.0.1:{mock.port}/provider/rotating-v4", {"IP6_PROVIDER": ipv6})
             app.ready()
             create_admin(app)
             print(f"URL: http://127.0.0.1:{app.port}", flush=True)
             print("Password: the PASSWORD constant in scripts/smoke-test.py", flush=True)
+            print("Public IPs: a new address every minute; press Update now to follow it", flush=True)
             threading.Event().wait()
         finally:
             app.close()
