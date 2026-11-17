@@ -1,12 +1,37 @@
 /* Cloudflare DDNS Web UI - vanilla JS SPA. No build step, no frameworks. */
 "use strict";
 
+const THEMES = ["system", "light", "dark"];
+
 /* Theme applied immediately at parse time (before first paint). */
 (function () {
-  var mode = localStorage.getItem("cfddns.theme") || "system";
+  var mode = currentTheme();
   var dark = mode === "dark" || (mode === "system" && window.matchMedia("(prefers-color-scheme: dark)").matches);
   document.documentElement.classList.toggle("dark", dark);
 })();
+
+/* ================= Saved preferences ================= */
+
+// Saved values are strings anyone can edit, and storage can be blocked, so a read never throws.
+// parse returns undefined to reject a value; the caller then gets the fallback.
+function readStored(key, fallback, parse = (raw) => raw) {
+  try {
+    const raw = localStorage.getItem(key);
+    const value = raw === null ? undefined : parse(raw);
+    return value === undefined ? fallback : value;
+  } catch {
+    return fallback;
+  }
+}
+
+// A blocked or full storage must not stop the action that saves a preference.
+function writeStored(key, value) {
+  try {
+    localStorage.setItem(key, value);
+  } catch {
+    // The preference just isn't remembered.
+  }
+}
 
 /* ================= i18n ================= */
 
@@ -19,7 +44,6 @@ const I18N = {
     "nav.collapse": "Collapse",
     "nav.logout": "Log out",
     "nav.menu": "Navigation menu",
-    "login.title": "Sign in",
     "login.subtitle": "Enter your admin password to manage your DNS.",
     "login.password": "Password",
     "login.submit": "Sign in",
@@ -32,7 +56,6 @@ const I18N = {
     "login.2fa.back": "Back to sign in",
     "login.2fa.backup_used": "Signed in with a backup code. {n} backup codes remaining.",
     "login.github": "View on GitHub",
-    "setup.title": "Welcome",
     "setup.subtitle": "Create the admin password for this installation. This only happens once.",
     "setup.password": "New password",
     "setup.confirm": "Confirm password",
@@ -129,7 +152,6 @@ const I18N = {
     "modal.ttl": "TTL",
     "modal.ttl.proxied": "TTL is managed by Cloudflare while the record is proxied.",
     "modal.proxy": "Proxy status",
-    "modal.proxy.hint": "Proxy this record through Cloudflare (orange cloud).",
     "modal.tags": "Tags",
     "modal.tags.hint": "Comma-separated, e.g. cf-proxied:true",
     "modal.comment": "Comment",
@@ -151,10 +173,6 @@ const I18N = {
     "modal.bulk.proxy.on": "Proxied",
     "modal.bulk.proxy.off": "DNS only",
     "modal.bulk.proxy.blocked": "Proxy cannot be changed: the selection contains record types that are not proxiable (only A, AAAA and CNAME are).",
-    "modal.bulk.comment": "Comment",
-    "modal.bulk.comment.keep": "Keep existing",
-    "modal.bulk.comment.replace": "Replace with",
-    "modal.bulk.comment.clear": "Clear comments",
     "modal.metadata.keep": "Keep existing",
     "modal.metadata.set": "Set value",
     "modal.metadata.clear": "Clear value",
@@ -166,12 +184,12 @@ const I18N = {
     "modal.delete.confirm": "Delete",
     "modal.import.title": "Import DNS records",
     "modal.import.desc": "Upload a BIND zone file. Cloudflare parses it natively and appends new records - existing records are never replaced. Comments and cf_tags (e.g. cf-proxied:true) are honoured, exactly like the dashboard import.",
-    "modal.import.drop": "Drop your zone file here, or <strong>browse</strong>",
+    "modal.import.drop.html": "Drop your zone file here, or <strong>browse</strong>",
+    "modal.import.too_big": "File too large (max 2 MiB).",
     "modal.import.file_selected": "Selected: {name} ({size})",
     "modal.import.submit": "Import",
     "modal.import.result": "Imported {added} of {parsed} records.",
     "modal.import.skipped": "{n} records were skipped (already existing or unsupported).",
-    "modal.import.empty": "The file contains no importable DNS records.",
     "settings.title": "Settings",
     "settings.appearance.title": "Appearance",
     "settings.appearance.desc": "Theme and branding of the interface.",
@@ -183,6 +201,8 @@ const I18N = {
     "settings.lang.desc": "Interface language. More languages are coming soon.",
     "settings.accent": "Accent color",
     "settings.accent.hint": "Pick a preset or any custom color.",
+    "settings.accent.custom": "Custom color",
+    "settings.accent.default": "Default",
     "settings.icon": "Logo & favicon",
     "settings.icon.hint": "PNG, JPEG, WebP or GIF, max 512 KB. Applied to the logo and used as the favicon.",
     "settings.icon.upload": "Upload image",
@@ -201,7 +221,6 @@ const I18N = {
     "settings.password.code": "2FA or backup code",
     "settings.password.code.hint": "Required because 2FA is enabled.",
     "settings.password.submit": "Update password",
-    "settings.password.done": "Password updated.",
     "settings.2fa.title": "Two-factor authentication",
     "settings.2fa.desc": "Require a TOTP code from an authenticator app at sign-in, with one-time backup codes for recovery.",
     "settings.2fa.status.on": "Enabled",
@@ -210,7 +229,6 @@ const I18N = {
     "settings.2fa.enable": "Enable 2FA",
     "settings.2fa.disable": "Disable 2FA",
     "settings.2fa.scan": "Scan this QR code with your authenticator app (Aegis, Bitwarden, Google Authenticator...), then enter the 6-digit code to confirm.",
-    "settings.2fa.manual": "Or enter the secret manually:",
     "settings.2fa.code": "6-digit code",
     "settings.2fa.confirm": "Confirm & activate",
     "settings.2fa.cancel": "Cancel",
@@ -223,29 +241,29 @@ const I18N = {
     "settings.2fa.disable.hint": "Enter a current 2FA code (or a backup code) to disable two-factor authentication.",
     "settings.token.title": "Cloudflare API token",
     "settings.token.desc": "The web UI talks to Cloudflare with an API token supplied via the CLOUDFLARE_API_TOKEN environment variable. Create it with the following preset:",
-    "settings.token.step1": "Open <strong>My Profile -> API Tokens</strong> in the Cloudflare dashboard.",
-    "settings.token.step2": "Click <strong>Create Token</strong> and choose the <strong>Edit zone DNS</strong> template.",
-    "settings.token.step3": "Keep permissions <code>Zone -> DNS -> Edit</code> and add <code>Zone -> Zone -> Read</code>.",
-    "settings.token.step4": "Under <strong>Zone Resources</strong> pick <em>Include -> Specific zone</em> for least privilege (or <em>All zones</em>).",
-    "settings.token.step5": "Create the token and set it as <code>CLOUDFLARE_API_TOKEN</code> (or mount it via <code>CLOUDFLARE_API_TOKEN_FILE</code>).",
+    "settings.token.step1.html": "Open <strong>My Profile -> API Tokens</strong> in the Cloudflare dashboard.",
+    "settings.token.step2.html": "Click <strong>Create Token</strong> and choose the <strong>Edit zone DNS</strong> template.",
+    "settings.token.step3.html": "Keep permissions <code>Zone -> DNS -> Edit</code> and add <code>Zone -> Zone -> Read</code>.",
+    "settings.token.step4.html": "Under <strong>Zone Resources</strong> pick <em>Include -> Specific zone</em> for least privilege (or <em>All zones</em>).",
+    "settings.token.step5.html": "Create the token and set it as <code>CLOUDFLARE_API_TOKEN</code> (or mount it via <code>CLOUDFLARE_API_TOKEN_FILE</code>).",
     "settings.about.title": "About",
     "settings.about.version": "Version",
     "settings.about.source": "Source code",
     "settings.about.upstream": "Based on the philosophy of",
-    "common.yes": "Yes",
-    "common.no": "No",
     "common.close": "Close",
+    "error.network": "network error - is the server reachable?",
+    "error.auth_changed": "Authentication changed. Sign in again.",
     "common.copy": "Click to copy",
     "common.copied": "Copied to clipboard",
-    "common.enabled": "Enabled",
-    "common.disabled": "Disabled",
     "toast.saved": "Record saved",
     "toast.created": "Record created",
-    "toast.deleted": "Record deleted",
-    "toast.bulk_delete": "Deleted {ok} records{fail_part}",
-    "toast.bulk_update": "Updated {ok} records{fail_part}",
-    "toast.fail_suffix": ", {n} failed",
-    "toast.error": "Error",
+    "toast.bulk_delete": "Deleted {ok} records",
+    "toast.bulk_delete.partial": "Deleted {ok} records, {n} failed",
+    "toast.bulk_delete.none": "No records were deleted ({n} failed)",
+    "toast.bulk_update": "Updated {ok} records",
+    "toast.bulk_update.partial": "Updated {ok} records, {n} failed",
+    "toast.bulk_update.none": "No records were updated ({n} failed)",
+    "toast.with_error": "{summary}. First error: {error}",
     "toast.exported": "Zone file exported",
     "toast.updated_ddns": "DDNS update finished",
     "toast.accent": "Accent color updated",
@@ -258,11 +276,20 @@ const I18N = {
 
 const LANGS = [{ code: "en", name: "English" }];
 
-let lang = localStorage.getItem("cfddns.lang") || "en";
+let lang = readStored("cfddns.lang", "en", (raw) => LANGS.some((l) => l.code === raw) ? raw : undefined);
 function t(key, vars) {
   let s = (I18N[lang] && I18N[lang][key]) || I18N.en[key] || key;
-  if (vars) for (const [k, v] of Object.entries(vars)) s = s.replace(`{${k}}`, v);
-  return s;
+  if (!vars) return s;
+  // One pass, so a value that contains "{size}" or "$&" stays literal.
+  return s.replace(/\{(\w+)\}/g, (match, k) => (Object.hasOwn(vars, k) ? String(vars[k]) : match));
+}
+
+// Only keys ending in ".html" hold trusted markup. Everything else, and every
+// interpolated value, is escaped so it can go into innerHTML safely.
+function tHtml(key, vars) {
+  if (!key.endsWith(".html")) return esc(t(key, vars));
+  const safeVars = vars && Object.fromEntries(Object.entries(vars).map(([k, v]) => [k, esc(v)]));
+  return t(key, safeVars);
 }
 
 /* ================= Icons ================= */
@@ -311,13 +338,21 @@ const TTL_OPTIONS = [
   [43200, "12 hours"], [86400, "1 day"],
 ];
 const ACCENT_PRESETS = ["#f6821f", "#3b82f6", "#22c55e", "#a855f7", "#ef4444", "#14b8a6", "#eab308", "#ec4899"];
-// NOTE: .sw-0..sw-7 classes in style.css must stay in the same order.
+const PER_PAGE_OPTIONS = [20, 50, 100];
 
 const DEFAULT_COLUMNS = {
   type: true, name: true, content: true, proxy: true, ttl: true,
   tags: true, comment: true, updated: false, created: false,
 };
 const COLUMN_ORDER = ["type", "name", "content", "proxy", "ttl", "tags", "comment", "updated", "created"];
+
+// Keeps only known columns with boolean values, so an edited entry cannot add or break columns.
+function parseColumns(raw) {
+  const saved = JSON.parse(raw);
+  const columns = { ...DEFAULT_COLUMNS };
+  for (const key of COLUMN_ORDER) if (typeof saved?.[key] === "boolean") columns[key] = saved[key];
+  return columns;
+}
 
 const state = {
   authed: false,
@@ -336,11 +371,11 @@ const state = {
   typeFilter: "",
   sort: { key: "name", dir: 1 },
   page: 1,
-  perPage: parseInt(localStorage.getItem("cfddns.perPage") || "20", 10),
-  view: localStorage.getItem("cfddns.view") === "card" ? "card" : "list",
+  perPage: readStored("cfddns.perPage", PER_PAGE_OPTIONS[0], (raw) => PER_PAGE_OPTIONS.find((n) => String(n) === raw)),
+  view: readStored("cfddns.view", "list") === "card" ? "card" : "list",
   selection: new Set(),
-  columns: { ...DEFAULT_COLUMNS, ...JSON.parse(localStorage.getItem("cfddns.columns") || "{}") },
-  sidebarCollapsed: localStorage.getItem("cfddns.sidebar") === "collapsed",
+  columns: readStored("cfddns.columns", { ...DEFAULT_COLUMNS }, parseColumns),
+  sidebarCollapsed: readStored("cfddns.sidebar", "") === "collapsed",
   mobileNavOpen: false,
   ddns: null,
   ddnsLoading: false,
@@ -374,7 +409,7 @@ function viewControls() {
 function wireViewControls(redraw) {
   document.querySelectorAll("[data-view]").forEach((button) => button.addEventListener("click", () => {
     state.view = button.dataset.view;
-    localStorage.setItem("cfddns.view", state.view);
+    writeStored("cfddns.view", state.view);
     redraw();
     document.querySelector(`[data-view="${state.view}"]`)?.focus();
   }));
@@ -399,7 +434,7 @@ themeMedia.addEventListener("change", () => applyTheme());
 let themeTransition = null;
 let iconRevision = Date.now();
 
-function currentTheme() { return localStorage.getItem("cfddns.theme") || "system"; }
+function currentTheme() { return readStored("cfddns.theme", "system", (raw) => THEMES.includes(raw) ? raw : undefined); }
 
 function applyTheme() {
   const mode = currentTheme();
@@ -409,8 +444,8 @@ function applyTheme() {
 }
 
 function setTheme(mode, origin) {
-  if (!["system", "light", "dark"].includes(mode)) return;
-  localStorage.setItem("cfddns.theme", mode);
+  if (!THEMES.includes(mode)) return;
+  writeStored("cfddns.theme", mode);
   themeTransition?.skipTransition();
   const root = document.documentElement;
   const dark = mode === "dark" || (mode === "system" && themeMedia.matches);
@@ -496,12 +531,11 @@ function themeIcon() {
 }
 
 function cycleTheme(event) {
-  const order = ["system", "light", "dark"];
-  const next = order[(order.indexOf(currentTheme()) + 1) % order.length];
+  const next = THEMES[(THEMES.indexOf(currentTheme()) + 1) % THEMES.length];
   setTheme(next, event?.currentTarget);
   document.querySelectorAll("[data-theme-btn]").forEach((b) => {
     b.innerHTML = themeIcon();
-    b.title = t("settings.theme." + (next === "system" ? "system" : next));
+    b.title = t("settings.theme." + next);
   });
 }
 
@@ -526,6 +560,13 @@ function fmtTtl(ttl) {
   return `${ttl}s`;
 }
 
+// Uses the largest unit that divides evenly, so a 5-minute session shows "5 min" instead of "0 h".
+function fmtDuration(secs) {
+  if (secs % 3600 === 0) return `${secs / 3600} h`;
+  if (secs % 60 === 0) return `${secs / 60} min`;
+  return `${secs} s`;
+}
+
 function fmtDate(iso) {
   if (!iso) return "-";
   try {
@@ -539,6 +580,50 @@ function fmtBytes(n) {
   if (n < 1024) return `${n} B`;
   if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
   return `${(n / 1024 / 1024).toFixed(1)} MB`;
+}
+
+// TTL choices for a select. A record may already use a TTL the list does not offer
+// (for example 30 or 14400); that value is added as its own option so the select can show it.
+function ttlOptions(current) {
+  const options = TTL_OPTIONS.map(([v, lbl]) => ({ value: String(v), label: v === 1 ? t("ttl.auto") : lbl }));
+  if (Number.isInteger(current) && !TTL_OPTIONS.some(([v]) => v === current)) {
+    options.push({ value: String(current), label: fmtTtl(current) });
+    options.sort((a, b) => Number(a.value) - Number(b.value));
+  }
+  return options;
+}
+
+// SRV records show their parsed fields; Cloudflare's content string omits the priority.
+function displayContent(r) {
+  if (r.type !== "SRV" || !r.data) return r.content;
+  return `${r.data.priority ?? ""} ${r.data.weight ?? ""} ${r.data.port ?? ""} ${r.data.target ?? r.content}`;
+}
+
+function showError(box, message) {
+  box.textContent = message;
+  box.classList.add("visible");
+}
+
+// Shows a spinner while a request runs. Call the returned function to restore the button.
+function showBusy(btn) {
+  const label = btn.innerHTML;
+  btn.disabled = true;
+  btn.innerHTML = '<div class="spinner small"></div>';
+  return () => {
+    btn.disabled = false;
+    btn.innerHTML = label;
+  };
+}
+
+function downloadText(filename, text) {
+  const url = URL.createObjectURL(new Blob([text], { type: "text/plain" }));
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
 }
 
 function toast(msg, kind = "ok") {
@@ -556,12 +641,30 @@ function toast(msg, kind = "ok") {
 /* ================= Validation ================= */
 
 const V = {
-  ipv4(v) { return /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.test(v.trim()) && v.trim().split(".").every((o) => +o <= 255); },
-  ipv6(v) { return /^[0-9a-fA-F:]+$/.test(v.trim()) && v.includes(":"); },
-  domain(v) { return /^(\*\.)?([a-zA-Z0-9_]([a-zA-Z0-9_-]*[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}\.?$/.test(v.trim()) || /^[a-zA-Z0-9_]([a-zA-Z0-9_-]*[a-zA-Z0-9])?\.?$/.test(v.trim()); },
+  // Leading zeros are rejected because the server's address parser rejects them.
+  ipv4(v) { return /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.test(v.trim()) && v.trim().split(".").every((o) => +o <= 255 && !/^0\d/.test(o)); },
+  ipv6(v) {
+    const s = v.trim();
+    // The character check stops input such as "::1]/x" from closing the bracket early;
+    // the URL parser then applies the full IPv6 grammar (one "::", at most 8 groups).
+    if (!s.includes(":") || !/^[0-9a-fA-F:.]+$/.test(s)) return false;
+    try {
+      new URL(`http://[${s}]/`);
+      return true;
+    } catch {
+      return false;
+    }
+  },
+  // The last label may hold digits and hyphens so IDN TLDs such as xn--p1ai pass.
+  domain(v) { return /^(\*\.)?([a-zA-Z0-9_]([a-zA-Z0-9_-]*[a-zA-Z0-9])?\.)+[a-zA-Z]([a-zA-Z0-9-]*[a-zA-Z0-9])?\.?$/.test(v.trim()) || /^[a-zA-Z0-9_]([a-zA-Z0-9_-]*[a-zA-Z0-9])?\.?$/.test(v.trim()); },
   recordName(v) { return v === "@" || /^[a-zA-Z0-9_*]([a-zA-Z0-9._-]*)$/.test(v.trim()); },
-  srvName(v) { return /^_[a-zA-Z0-9-]+\._(tcp|udp)\..+$/.test(v.trim()) || v === "@"; },
-  uint(v, min, max) { const n = Number(v); return Number.isInteger(n) && n >= min && n <= max; },
+  // "_sip._tcp" alone is valid: the form adds the zone name, as for any other record.
+  srvName(v) { return /^_[a-z0-9-]+\._(tcp|udp|tls)(\..+)?$/i.test(v.trim()); },
+  // Digits only: Number() would accept "", "1e3" and "0x10", which parseInt later reads differently.
+  uint(v, min, max) {
+    const s = String(v).trim();
+    return /^\d+$/.test(s) && Number(s) >= min && Number(s) <= max;
+  },
 };
 
 /* ================= API ================= */
@@ -582,6 +685,11 @@ function resetSessionData() {
   state.ddnsUpdateResult = null;
 }
 
+/**
+ * Calls the backend. Besides method/json/raw/text, callers that change the session say so:
+ * rotatesSession: a successful call issues a new session, so older responses are stale.
+ * clearsRecoveryCodes: the call ends the previous login, whose unsaved recovery codes are dropped.
+ */
 async function api(path, opts = {}) {
   const authentication = authGeneration;
   const page = pageGeneration;
@@ -602,7 +710,7 @@ async function api(path, opts = {}) {
   try {
     resp = await fetch(path, init);
   } catch {
-    throw new Error("network error - is the server reachable?");
+    throw new Error(t("error.network"));
   }
   if (resp.status === 401 && !path.startsWith("/api/auth/")) {
     if (authentication === authGeneration && page === pageGeneration && zoneId === state.zoneId) {
@@ -616,13 +724,10 @@ async function api(path, opts = {}) {
     throw new Error("unauthorized");
   }
   const sameAuthentication = authentication === authGeneration;
-  if (resp.ok && init.method === "POST" && sameAuthentication
-    && ["/api/auth/setup", "/api/auth/login", "/api/auth/login/2fa", "/api/auth/logout", "/api/auth/password", "/api/auth/2fa/confirm", "/api/auth/2fa/disable"].includes(path)) {
+  if (resp.ok && init.method === "POST" && sameAuthentication && opts.rotatesSession) {
     authGeneration++;
     resetSessionData();
-    if (["/api/auth/setup", "/api/auth/login", "/api/auth/login/2fa", "/api/auth/logout"].includes(path)) {
-      state.pendingBackupCodes = null;
-    }
+    if (opts.clearsRecoveryCodes) state.pendingBackupCodes = null;
   }
   if (resp.ok && sameAuthentication && opts.authContext) opts.authContext.generation = authGeneration;
   const ct = resp.headers.get("content-type") || "";
@@ -654,15 +759,12 @@ async function api(path, opts = {}) {
 
 /* ================= Modern select component ================= */
 
-let openMSelect = null;
-
 function closeMSelects() {
   document.querySelectorAll(".mselect.open, .dropdown.open").forEach((m) => {
     m.classList.remove("open");
     m.querySelector("button")?.setAttribute("aria-expanded", "false");
   });
   document.querySelectorAll(".menu.open").forEach((m) => m.classList.remove("open"));
-  openMSelect = null;
 }
 
 document.addEventListener("click", (e) => {
@@ -682,8 +784,22 @@ document.addEventListener("keydown", (e) => {
   }
 });
 
+function mselectOption(o, onPick) {
+  const item = document.createElement("button");
+  item.type = "button";
+  item.className = "mselect-option";
+  item.dataset.value = o.value;
+  const check = document.createElement("span");
+  check.className = "check";
+  const text = document.createElement("span");
+  text.textContent = o.label;
+  item.append(check, text);
+  item.addEventListener("click", onPick);
+  return item;
+}
+
 /**
- * Build a modern dropdown. opts: {id, options: [{value,label,group?}], value,
+ * Build a modern dropdown. opts: {id, label, options: [{value,label}], value,
  * placeholder, disabled, cls, onChange}
  */
 function mselect(opts) {
@@ -706,43 +822,28 @@ function mselect(opts) {
   menu.className = "mselect-menu";
   wrap.append(btn, menu);
 
-  const getValue = () => wrap.dataset.value ?? "";
-  const setLabel = (v) => {
+  wrap.mset = (v) => {
+    wrap.dataset.value = v ?? "";
     const opt = opts.options.find((o) => String(o.value) === String(v));
     label.textContent = opt ? opt.label : (opts.placeholder || "");
+    menu.querySelectorAll(".mselect-option").forEach((x) => {
+      const selected = x.dataset.value === String(v);
+      x.classList.toggle("selected", selected);
+      x.querySelector(".check").innerHTML = selected ? I.check : "";
+    });
   };
+  wrap.mget = () => wrap.dataset.value ?? "";
+  wrap.msetDisabled = (d) => { btn.disabled = d; };
 
-  let lastGroup = null;
   for (const o of opts.options) {
-    if (o.group && o.group !== lastGroup) {
-      lastGroup = o.group;
-      const g = document.createElement("div");
-      g.className = "mselect-group";
-      g.textContent = o.group;
-      menu.appendChild(g);
-    }
-    const item = document.createElement("button");
-    item.type = "button";
-    item.className = "mselect-option";
-    item.dataset.value = o.value;
-    item.innerHTML = `<span class="check">${String(o.value) === String(opts.value) ? I.check : ""}</span><span>${esc(o.label)}</span>`;
-    if (String(o.value) === String(opts.value)) item.classList.add("selected");
-    item.addEventListener("click", () => {
-      wrap.dataset.value = o.value;
-      setLabel(o.value);
-      menu.querySelectorAll(".mselect-option").forEach((x) => {
-        x.classList.toggle("selected", x.dataset.value === String(o.value));
-        x.querySelector(".check").innerHTML = x.dataset.value === String(o.value) ? I.check : "";
-      });
+    menu.appendChild(mselectOption(o, () => {
+      wrap.mset(o.value);
       closeMSelects();
       btn.focus();
       if (opts.onChange) opts.onChange(o.value);
-    });
-    menu.appendChild(item);
+    }));
   }
-
-  wrap.dataset.value = opts.value ?? "";
-  setLabel(opts.value);
+  wrap.mset(opts.value);
 
   btn.addEventListener("click", (e) => {
     e.stopPropagation();
@@ -755,7 +856,6 @@ function mselect(opts) {
     menu.classList.toggle("up", spaceBelow < 280 && rect.top > spaceBelow);
     wrap.classList.add("open");
     btn.setAttribute("aria-expanded", "true");
-    openMSelect = wrap;
   });
 
   wrap.addEventListener("keydown", (e) => {
@@ -769,49 +869,10 @@ function mselect(opts) {
       : e.key === "ArrowDown" ? (index + 1) % items.length : (index <= 0 ? items.length : index) - 1;
     items[next].focus();
   });
-
-  wrap.mset = (v) => {
-    wrap.dataset.value = v;
-    setLabel(v);
-    menu.querySelectorAll(".mselect-option").forEach((x) => {
-      x.classList.toggle("selected", x.dataset.value === String(v));
-      x.querySelector(".check").innerHTML = x.dataset.value === String(v) ? I.check : "";
-    });
-  };
-  wrap.mget = getValue;
-  wrap.msetDisabled = (d) => { btn.disabled = d; };
-  wrap.msetOptions = (newOptions, value) => {
-    opts.options = newOptions;
-    menu.innerHTML = "";
-    let lg = null;
-    for (const o of newOptions) {
-      if (o.group && o.group !== lg) {
-        lg = o.group;
-        const g = document.createElement("div");
-        g.className = "mselect-group";
-        g.textContent = o.group;
-        menu.appendChild(g);
-      }
-      const item = document.createElement("button");
-      item.type = "button";
-      item.className = "mselect-option";
-      item.dataset.value = o.value;
-      item.innerHTML = `<span class="check">${String(o.value) === String(value) ? I.check : ""}</span><span>${esc(o.label)}</span>`;
-      if (String(o.value) === String(value)) item.classList.add("selected");
-      item.addEventListener("click", () => {
-        wrap.dataset.value = o.value;
-        setLabel(o.value);
-        closeMSelects();
-        if (opts.onChange) opts.onChange(o.value);
-      });
-      menu.appendChild(item);
-    }
-    wrap.mset(value);
-  };
   return wrap;
 }
 
-/* Simple dropdown menu (topbar/columns) */
+/* Simple dropdown menu (login language, record columns) */
 function bindDropdown(btnId, menuId) {
   const btn = el(btnId), menu = el(menuId);
   if (!btn || !menu) return;
@@ -839,7 +900,7 @@ async function loadZones() {
   const zones = await api("/api/zones");
   if (authentication !== authGeneration || !state.authed) return;
   state.zones = zones;
-  const preferred = localStorage.getItem("cfddns.zone");
+  const preferred = readStored("cfddns.zone", null);
   if (preferred && state.zones.some((z) => z.id === preferred)) {
     state.zoneId = preferred;
   } else if (state.zones.length > 0) {
@@ -941,17 +1002,16 @@ function render() {
   );
   el("collapse-btn").addEventListener("click", () => {
     state.sidebarCollapsed = !state.sidebarCollapsed;
-    localStorage.setItem("cfddns.sidebar", state.sidebarCollapsed ? "collapsed" : "expanded");
+    writeStored("cfddns.sidebar", state.sidebarCollapsed ? "collapsed" : "expanded");
     el("layout").classList.toggle("collapsed", state.sidebarCollapsed);
   });
   el("logout-btn").addEventListener("click", async () => {
-    try { await api("/api/auth/logout", { method: "POST" }); } catch { /* ignore */ }
+    try { await api("/api/auth/logout", { method: "POST", rotatesSession: true, clearsRecoveryCodes: true }); } catch { /* ignore */ }
     state.authed = false;
     resetSessionData();
-    invalidatePageRequests();
     state.pendingBackupCodes = null;
+    // navigate() also invalidates pending page requests and renders.
     navigate("dashboard");
-    render();
   });
 
   renderTopbarActions();
@@ -1002,7 +1062,7 @@ function renderTopbarActions() {
       onChange: async (v) => {
         closeModal();
         state.zoneId = v;
-        localStorage.setItem("cfddns.zone", v);
+        writeStored("cfddns.zone", v);
         state.search = ""; state.typeFilter = "";
         await refreshRecords();
       },
@@ -1042,17 +1102,16 @@ function renderSetup(app) {
     errBox.classList.remove("visible");
     const password = el("setup-password").value;
     const confirm = el("setup-confirm").value;
-    if (password.length < 8) { errBox.textContent = t("setup.short"); errBox.classList.add("visible"); return; }
-    if (password !== confirm) { errBox.textContent = t("setup.mismatch"); errBox.classList.add("visible"); return; }
+    if (password.length < 8) { showError(errBox, t("setup.short")); return; }
+    if (password !== confirm) { showError(errBox, t("setup.mismatch")); return; }
     btn.disabled = true;
     try {
-      await api("/api/auth/setup", { method: "POST", json: { password, confirm } });
+      await api("/api/auth/setup", { method: "POST", json: { password, confirm }, rotatesSession: true, clearsRecoveryCodes: true });
       state.configured = true;
       state.authed = true;
       await bootAuthed();
     } catch (err) {
-      errBox.textContent = err.message;
-      errBox.classList.add("visible");
+      showError(errBox, err.message);
       btn.disabled = false;
     }
   });
@@ -1086,7 +1145,7 @@ function wireLoginShell() {
   document.querySelectorAll("#login-lang-menu [data-lang]").forEach((b) =>
     b.addEventListener("click", () => {
       lang = b.dataset.lang;
-      localStorage.setItem("cfddns.lang", lang);
+      writeStored("cfddns.lang", lang);
       render();
     })
   );
@@ -1118,7 +1177,9 @@ function renderLogin(app) {
     btn.disabled = true;
     btn.textContent = t("login.wait");
     try {
-      const res = await api("/api/auth/login", { method: "POST", json: { password: el("login-password").value } });
+      const res = await api("/api/auth/login", {
+        method: "POST", json: { password: el("login-password").value }, rotatesSession: true, clearsRecoveryCodes: true,
+      });
       if (res.requires_2fa) {
         state.pendingChallenge = res.challenge;
         render();
@@ -1127,8 +1188,7 @@ function renderLogin(app) {
       state.authed = true;
       await bootAuthed();
     } catch (err) {
-      errBox.textContent = err.status === 401 ? t("login.error") : err.message;
-      errBox.classList.add("visible");
+      showError(errBox, err.status === 401 ? t("login.error") : err.message);
       btn.disabled = false;
       btn.textContent = t("login.submit");
     }
@@ -1164,6 +1224,8 @@ function renderLogin2fa(app) {
       const res = await api("/api/auth/login/2fa", {
         method: "POST",
         json: { challenge: state.pendingChallenge, code: el("login2fa-code").value.trim() },
+        rotatesSession: true,
+        clearsRecoveryCodes: true,
       });
       state.pendingChallenge = null;
       state.authed = true;
@@ -1172,8 +1234,7 @@ function renderLogin2fa(app) {
       }
       await bootAuthed();
     } catch (err) {
-      errBox.textContent = err.message;
-      errBox.classList.add("visible");
+      showError(errBox, err.message);
       btn.disabled = false;
     }
   });
@@ -1205,29 +1266,17 @@ function ddnsUpdateLog() {
     <div class="log-output">${esc(lines.join("\n"))}</div></div>`;
 }
 
-function renderDashboardCards() {
-  const grid = el("stat-grid");
-  if (!grid) return;
-  const d = state.ddns;
-  const loading = state.ddnsLoading || d === null;
-  grid.innerHTML = `
-    <div class="stat-card">
-      <div class="stat-label">${I.globe} ${esc(t("dash.ipv4"))}</div>
-      <div class="stat-value ${!(d && d.ipv4) ? "na" : ""}">${loading ? '<div class="spinner small"></div>' : esc((d && d.ipv4) || (d && d.ipv4_error) || t("dash.na"))}</div>
-    </div>
-    <div class="stat-card">
-      <div class="stat-label">${I.globe} ${esc(t("dash.ipv6"))}</div>
-      <div class="stat-value ${!(d && d.ipv6) ? "na" : ""}">${loading ? '<div class="spinner small"></div>' : esc((d && d.ipv6) || (d && d.ipv6_error) || t("dash.na"))}</div>
-    </div>
-    <div class="stat-card">
-      <div class="stat-label">${I.dns} ${esc(t("dash.zones"))}</div>
-      <div class="stat-value">${state.zones.length}</div>
+function ipStatCard(family, d, loading) {
+  const ip = d && d[family];
+  const value = loading ? '<div class="spinner small"></div>' : esc(ip || (d && d[`${family}_error`]) || t("dash.na"));
+  return `<div class="stat-card">
+      <div class="stat-label">${I.globe} ${esc(t(`dash.${family}`))}</div>
+      <div class="stat-value ${ip ? "" : "na"}">${value}</div>
     </div>`;
+}
 
-  const section = el("ddns-section");
-  if (!section) return;
-  if (d && d.configured === false) {
-    section.innerHTML = `
+function ddnsUnconfiguredCard() {
+  return `
       <div class="card"><div class="card-pad">
         <div class="card-title">${esc(t("dash.ddns.title"))}</div>
         <div class="card-desc">${esc(t("dash.ddns.desc"))}</div>
@@ -1237,42 +1286,44 @@ function renderDashboardCards() {
           <p>${esc(t("dash.ddns.hint"))}</p>
         </div>
       </div>${ddnsUpdateLog()}</div>`;
-    return;
-  }
-  const rows = (d && d.domains ? d.domains : []).map((dom) => {
-    let statusBadge;
-    if (dom.error) statusBadge = `<span class="badge red">${esc(t("dash.ddns.error"))}</span>`;
-    else if (dom.in_sync) statusBadge = `<span class="badge green">${esc(t("dash.ddns.synced"))}</span>`;
-    else if (dom.dns_ips.length === 0) statusBadge = `<span class="badge yellow">${esc(t("dash.ddns.missing"))}</span>`;
-    else statusBadge = `<span class="badge yellow">${esc(t("dash.ddns.out_of_sync"))}</span>`;
-    if (currentView() === "card") return `<article class="ddns-card">
+}
+
+function ddnsStatusBadge(dom) {
+  if (dom.error) return `<span class="badge red">${esc(t("dash.ddns.error"))}</span>`;
+  if (dom.in_sync) return `<span class="badge green">${esc(t("dash.ddns.synced"))}</span>`;
+  if (dom.dns_ips.length === 0) return `<span class="badge yellow">${esc(t("dash.ddns.missing"))}</span>`;
+  return `<span class="badge yellow">${esc(t("dash.ddns.out_of_sync"))}</span>`;
+}
+
+function ddnsCard(dom) {
+  return `<article class="ddns-card">
       <div class="record-card-head"><strong>${esc(dom.domain)}</strong><span class="badge">${esc(dom.record_type)}</span></div>
       <dl class="record-details">
         <div><dt>${esc(t("dash.ddns.detected"))}</dt><dd class="mono">${esc(dom.detected_ip || "-")}</dd></div>
         <div><dt>${esc(t("dash.ddns.dns"))}</dt><dd class="mono">${esc(dom.dns_ips.join(", ") || "-")}</dd></div>
       </dl>
-      <div class="record-card-foot">${statusBadge}</div>
+      <div class="record-card-foot">${ddnsStatusBadge(dom)}</div>
       ${dom.error ? `<p class="cell-muted record-error">${esc(dom.error)}</p>` : ""}</article>`;
-    return `<tr>
+}
+
+function ddnsRow(dom) {
+  return `<tr>
       <td class="name-cell">${esc(dom.domain)}</td>
       <td><span class="badge">${esc(dom.record_type)}</span></td>
       <td class="mono">${esc(dom.detected_ip || "-")}</td>
       <td class="mono">${esc(dom.dns_ips.join(", ") || "-")}</td>
-      <td>${statusBadge}${dom.error ? `<div class="cell-muted u-err-detail">${esc(dom.error)}</div>` : ""}</td>
+      <td>${ddnsStatusBadge(dom)}${dom.error ? `<div class="cell-muted u-err-detail">${esc(dom.error)}</div>` : ""}</td>
     </tr>`;
-  }).join("");
-  section.innerHTML = `
-    <div class="card">
-      <div class="toolbar">
-        <div class="card-title u-mb0">${esc(t("dash.ddns.title"))}</div>
-        <div class="u-flex1"></div>
-        ${viewControls()}
-        <button class="btn ghost sm" id="ddns-refresh" ${state.ddnsLoading ? "disabled" : ""}>${I.refresh} ${esc(t("records.refresh"))}</button>
-        <button class="btn primary sm" id="ddns-update" ${state.ddnsUpdating || state.ddnsLoading || !d || d.error || d.manual_updates_enabled === false ? "disabled" : ""}>${I.bolt} ${esc(t(state.ddnsUpdating ? "dash.ddns.updating" : "dash.ddns.update_now"))}</button>
-      </div>
-      ${d?.error ? `<div class="card-pad login-error visible" role="alert">${esc(d.error)}</div>` : ""}
-      ${d?.contract_version ? `<div class="card-pad cell-muted">${esc(t("dash.ddns.contract", { contract: d.contract_version }))}</div>` : ""}
-      ${currentView() === "card" ? `<div class="ddns-cards">${state.ddnsLoading ? '<div class="skeleton"></div>' : rows || `<p class="cell-muted">${esc(t("dash.ddns.not_configured"))}</p>`}</div>` : `<div class="table-wrap">
+}
+
+function ddnsDomainList(domains) {
+  const empty = esc(t("dash.ddns.not_configured"));
+  if (currentView() === "card") {
+    const cards = domains.map(ddnsCard).join("");
+    return `<div class="ddns-cards">${state.ddnsLoading ? '<div class="skeleton"></div>' : cards || `<p class="cell-muted">${empty}</p>`}</div>`;
+  }
+  const rows = domains.map(ddnsRow).join("");
+  return `<div class="table-wrap">
         <table class="data">
           <thead><tr>
             <th>${esc(t("dash.ddns.domain"))}</th>
@@ -1281,9 +1332,43 @@ function renderDashboardCards() {
             <th>${esc(t("dash.ddns.dns"))}</th>
             <th>${esc(t("dash.ddns.status"))}</th>
           </tr></thead>
-          <tbody>${state.ddnsLoading ? `<tr><td colspan="5"><div class="skeleton"></div></td></tr>` : rows || `<tr><td colspan="5" class="cell-muted u-cell-empty">${esc(t("dash.ddns.not_configured"))}</td></tr>`}</tbody>
+          <tbody>${state.ddnsLoading ? `<tr><td colspan="5"><div class="skeleton"></div></td></tr>` : rows || `<tr><td colspan="5" class="cell-muted u-cell-empty">${empty}</td></tr>`}</tbody>
         </table>
-      </div>`}
+      </div>`;
+}
+
+function renderDashboardCards() {
+  const grid = el("stat-grid");
+  if (!grid) return;
+  const d = state.ddns;
+  const loading = state.ddnsLoading || d === null;
+  grid.innerHTML = `
+    ${ipStatCard("ipv4", d, loading)}
+    ${ipStatCard("ipv6", d, loading)}
+    <div class="stat-card">
+      <div class="stat-label">${I.dns} ${esc(t("dash.zones"))}</div>
+      <div class="stat-value">${state.zones.length}</div>
+    </div>`;
+
+  const section = el("ddns-section");
+  if (!section) return;
+  if (d && d.configured === false) {
+    section.innerHTML = ddnsUnconfiguredCard();
+    return;
+  }
+  const updateDisabled = state.ddnsUpdating || state.ddnsLoading || !d || d.error || d.manual_updates_enabled === false;
+  section.innerHTML = `
+    <div class="card">
+      <div class="toolbar">
+        <div class="card-title u-mb0">${esc(t("dash.ddns.title"))}</div>
+        <div class="u-flex1"></div>
+        ${viewControls()}
+        <button class="btn ghost sm" id="ddns-refresh" ${state.ddnsLoading ? "disabled" : ""}>${I.refresh} ${esc(t("records.refresh"))}</button>
+        <button class="btn primary sm" id="ddns-update" ${updateDisabled ? "disabled" : ""}>${I.bolt} ${esc(t(state.ddnsUpdating ? "dash.ddns.updating" : "dash.ddns.update_now"))}</button>
+      </div>
+      ${d?.error ? `<div class="card-pad login-error visible" role="alert">${esc(d.error)}</div>` : ""}
+      ${d?.contract_version ? `<div class="card-pad cell-muted">${esc(t("dash.ddns.contract", { contract: d.contract_version }))}</div>` : ""}
+      ${ddnsDomainList(d && d.domains ? d.domains : [])}
       ${ddnsUpdateLog()}
     </div>`;
 
@@ -1291,35 +1376,37 @@ function renderDashboardCards() {
   const refreshBtn = el("ddns-refresh");
   if (refreshBtn) refreshBtn.addEventListener("click", async () => { await loadDdns(); renderDashboard(); });
   const updateBtn = el("ddns-update");
-  if (updateBtn) updateBtn.addEventListener("click", async () => {
-    if (state.ddnsUpdating) return;
-    const authentication = authGeneration;
-    const current = () => authentication === authGeneration && state.authed;
-    state.ddnsUpdating = true;
-    renderDashboardCards();
-    try {
-      const res = await api("/api/ddns/update", { method: "POST", json: {} });
-      if (!current()) return;
-      state.ddnsUpdateResult = res;
-      toast(t(res.success ? "toast.updated_ddns" : "dash.ddns.update_failed"), res.success ? "ok" : "error");
-    } catch (e) {
-      if (!current()) return;
-      state.ddnsUpdateResult = { success: false, log: [e.message], outcomes: [] };
-      toast(e.message, "error");
-    } finally {
-      if (current()) {
-        state.ddnsUpdating = false;
-        if (state.route === "dashboard") renderDashboardCards();
-      }
-    }
+  if (updateBtn) updateBtn.addEventListener("click", runDdnsUpdate);
+}
+
+async function runDdnsUpdate() {
+  if (state.ddnsUpdating) return;
+  const authentication = authGeneration;
+  const current = () => authentication === authGeneration && state.authed;
+  state.ddnsUpdating = true;
+  renderDashboardCards();
+  try {
+    const res = await api("/api/ddns/update", { method: "POST", json: {} });
+    if (!current()) return;
+    state.ddnsUpdateResult = res;
+    toast(t(res.success ? "toast.updated_ddns" : "dash.ddns.update_failed"), res.success ? "ok" : "error");
+  } catch (e) {
+    if (!current()) return;
+    state.ddnsUpdateResult = { success: false, log: [e.message], outcomes: [] };
+    toast(e.message, "error");
+  } finally {
     if (current()) {
-      if (state.route === "dashboard") {
-        renderDashboardCards();
-        await loadDdns();
-        if (current()) renderDashboard();
-      } else state.ddns = null;
+      state.ddnsUpdating = false;
+      if (state.route === "dashboard") renderDashboardCards();
     }
-  });
+  }
+  if (current()) {
+    if (state.route === "dashboard") {
+      renderDashboardCards();
+      await loadDdns();
+      if (current()) renderDashboard();
+    } else state.ddns = null;
+  }
 }
 
 /* ================= Render: records page ================= */
@@ -1392,7 +1479,7 @@ function renderRecords() {
             ${COLUMN_ORDER.map((c) => `<button class="menu-item" data-col="${c}"><span class="check">${state.columns[c] ? I.check : ""}</span>${esc(t("col." + c))}</button>`).join("")}
           </div>
         </div>
-        <button class="btn icon" id="refresh-btn" title="Refresh">${I.refresh}</button>
+        <button class="btn icon" id="refresh-btn" title="${esc(t("records.refresh"))}" aria-label="${esc(t("records.refresh"))}">${I.refresh}</button>
       </div>
       <div class="bulkbar" id="bulkbar">
         <span id="bulk-count"></span>
@@ -1423,7 +1510,7 @@ function renderRecords() {
   if (currentView() === "card") {
     el("records-toolbar").insertBefore(mselect({
       label: t("records.sort"),
-      options: ["name", "type", "content", "ttl", "updated", "created"].flatMap((key) => [1, -1].map((dir) => ({ value: `${key}:${dir}`, label: `${t("col." + key)} ${dir === 1 ? "\u2191" : "\u2193"}` }))),
+      options: SORT_KEYS.flatMap((key) => [1, -1].map((dir) => ({ value: `${key}:${dir}`, label: `${t("col." + key)} ${dir === 1 ? "\u2191" : "\u2193"}` }))),
       value: `${state.sort.key}:${state.sort.dir}`,
       onChange: (value) => { const [key, dir] = value.split(":"); state.sort = { key, dir: Number(dir) }; renderRecordsTable(); },
     }), el("refresh-btn"));
@@ -1432,7 +1519,7 @@ function renderRecords() {
   document.querySelectorAll("#columns-menu [data-col]").forEach((b) =>
     b.addEventListener("click", () => {
       state.columns[b.dataset.col] = !state.columns[b.dataset.col];
-      localStorage.setItem("cfddns.columns", JSON.stringify(state.columns));
+      writeStored("cfddns.columns", JSON.stringify(state.columns));
       closeMSelects();
       renderRecords();
     })
@@ -1442,27 +1529,76 @@ function renderRecords() {
   el("export-btn").addEventListener("click", exportZone);
   el("import-btn").addEventListener("click", openImportModal);
   el("bulk-edit").addEventListener("click", openBulkEditModal);
-  el("bulk-delete").addEventListener("click", openBulkDeleteModal);
+  // Wrapped so the click event is not taken as the list of ids.
+  el("bulk-delete").addEventListener("click", () => openBulkDeleteModal());
   el("bulk-clear").addEventListener("click", () => { state.selection.clear(); renderRecordsTable(); });
 
   renderRecordsTable();
+}
+
+// List view cells, keyed like COLUMN_ORDER.
+const RECORD_CELLS = {
+  type: (r) => `<td><span class="badge">${esc(r.type)}</span></td>`,
+  name: (r) => `<td class="name-cell" title="${esc(r.name)}">${esc(r.name)}</td>`,
+  content: (r) => `<td class="mono truncate cell-copy" data-copy="${esc(r.content)}" title="${esc(t("common.copy"))}: ${esc(r.content)}">${esc(displayContent(r))}</td>`,
+  proxy: (r) => {
+    if (!r.proxiable) return `<td><span class="proxy-pill" title="${esc(t("proxy.na"))}">${I.cloud}<span class="cell-muted">-</span></span></td>`;
+    const on = !!r.proxied;
+    return `<td><span class="proxy-pill ${on ? "on" : "off"}">${on ? I.cloudFill : I.cloud}<span>${esc(on ? t("proxy.proxied") : t("proxy.dns_only"))}</span></span></td>`;
+  },
+  ttl: (r) => `<td>${esc(fmtTtl(r.ttl))}</td>`,
+  tags: (r) => `<td class="truncate">${(r.tags || []).map((tag) => `<span class="tag-chip">${esc(tag)}</span>`).join("") || '<span class="cell-muted">-</span>'}</td>`,
+  comment: (r) => `<td class="truncate cell-muted" title="${esc(r.comment || "")}">${esc(r.comment || "-")}</td>`,
+  updated: (r) => `<td class="cell-muted u-nowrap">${esc(fmtDate(r.modified_on))}</td>`,
+  created: (r) => `<td class="cell-muted u-nowrap">${esc(fmtDate(r.created_on))}</td>`,
+};
+const SORT_KEYS = ["name", "type", "content", "ttl", "updated", "created"];
+
+function visibleColumns() { return COLUMN_ORDER.filter((key) => state.columns[key]); }
+
+function sortHeader(key) {
+  const active = state.sort.key === key;
+  const arrow = active ? `<span class="sort-arrow" aria-hidden="true">${state.sort.dir === 1 ? "▲" : "▼"}</span>` : "";
+  const sort = active ? ` aria-sort="${state.sort.dir === 1 ? "ascending" : "descending"}"` : "";
+  return `<th class="sortable"${sort}><button type="button" class="sort-btn" data-sort="${key}">${esc(t("col." + key))}${arrow}</button></th>`;
+}
+
+function recordsTableHead() {
+  const cols = visibleColumns().map((key) => SORT_KEYS.includes(key) ? sortHeader(key) : `<th>${esc(t("col." + key))}</th>`);
+  return `<tr><th class="u-w-check"><input type="checkbox" class="checkbox" id="select-all" aria-label="${esc(t("records.select_all"))}"></th>${cols.join("")}<th class="u-w-actions">${esc(t("col.actions"))}</th></tr>`;
+}
+
+function recordRow(r) {
+  const selected = state.selection.has(r.id);
+  return `<tr class="${selected ? "selected" : ""}" data-row="${esc(r.id)}">`
+    + `<td><input type="checkbox" class="checkbox" data-select="${esc(r.id)}" aria-label="${esc(t("records.select", { name: r.name }))}"${selected ? " checked" : ""}></td>`
+    + visibleColumns().map((key) => RECORD_CELLS[key](r)).join("")
+    + `<td class="u-nowrap">
+      <button class="btn ghost icon sm" data-edit="${esc(r.id)}" title="${esc(t("records.edit"))}">${I.edit}</button>
+      <button class="btn ghost icon sm danger" data-delete="${esc(r.id)}" title="${esc(t("records.delete"))}">${I.trash}</button>
+    </td></tr>`;
+}
+
+function recordsSkeleton() {
+  if (currentView() === "card") return `<div class="record-cards">${Array.from({ length: 3 }, () => '<div class="record-card"><div class="skeleton"></div></div>').join("")}</div>`;
+  return `<table class="data"><tbody>
+      ${Array.from({ length: 5 }).map(() => `<tr class="skeleton-row"><td colspan="8"><div class="skeleton"></div></td></tr>`).join("")}
+    </tbody></table>`;
+}
+
+function recordsListHtml(rows) {
+  if (rows.length === 0) return `<div class="empty-state">${I.file}<h4>${esc(t("records.empty.title"))}</h4><p>${esc(t("records.empty.desc"))}</p></div>`;
+  if (currentView() === "card") return `<label class="card-select-all"><input type="checkbox" id="select-all">${esc(t("records.select_all"))}</label><div class="record-cards">${rows.map(recordCard).join("")}</div>`;
+  return `<table class="data"><thead>${recordsTableHead()}</thead><tbody>${rows.map(recordRow).join("")}</tbody></table>`;
 }
 
 function renderRecordsTable() {
   const wrap = el("table-wrap");
   if (!wrap) return;
 
-  if (state.recordsLoading) {
-    wrap.innerHTML = currentView() === "card" ? `<div class="record-cards">${Array.from({ length: 3 }, () => '<div class="record-card"><div class="skeleton"></div></div>').join("")}</div>` : `<table class="data"><tbody>
-      ${Array.from({ length: 5 }).map(() => `<tr class="skeleton-row"><td colspan="8"><div class="skeleton"></div></td></tr>`).join("")}
-    </tbody></table>`;
-    el("pagination").innerHTML = "";
-    updateBulkbar();
-    return;
-  }
-
-  if (state.recordsError || state.recordsZoneId !== state.zoneId) {
-    wrap.innerHTML = `<div class="card-pad login-error visible" role="alert">${esc(state.recordsError || t("records.empty.desc"))}</div>`;
+  if (state.recordsLoading || state.recordsError || state.recordsZoneId !== state.zoneId) {
+    wrap.innerHTML = state.recordsLoading ? recordsSkeleton()
+      : `<div class="card-pad login-error visible" role="alert">${esc(state.recordsError || t("records.empty.desc"))}</div>`;
     el("pagination").innerHTML = "";
     updateBulkbar();
     return;
@@ -1475,67 +1611,19 @@ function renderRecordsTable() {
   const from = (state.page - 1) * state.perPage;
   const rows = all.slice(from, from + state.perPage);
 
-  const c = state.columns;
-  const headCols = [];
-  headCols.push(`<th class="u-w-check"><span class="checkbox" id="select-all"></span></th>`);
-  const sortTh = (key, label) => {
-    const arrow = state.sort.key === key ? `<span class="sort-arrow">${state.sort.dir === 1 ? "▲" : "▼"}</span>` : "";
-    return `<th class="sortable" data-sort="${key}">${esc(label)}${arrow}</th>`;
-  };
-  if (c.type) headCols.push(sortTh("type", t("col.type")));
-  if (c.name) headCols.push(sortTh("name", t("col.name")));
-  if (c.content) headCols.push(sortTh("content", t("col.content")));
-  if (c.proxy) headCols.push(`<th>${esc(t("col.proxy"))}</th>`);
-  if (c.ttl) headCols.push(sortTh("ttl", t("col.ttl")));
-  if (c.tags) headCols.push(`<th>${esc(t("col.tags"))}</th>`);
-  if (c.comment) headCols.push(`<th>${esc(t("col.comment"))}</th>`);
-  if (c.updated) headCols.push(sortTh("updated", t("col.updated")));
-  if (c.created) headCols.push(sortTh("created", t("col.created")));
-  headCols.push(`<th class="u-w-actions">${esc(t("col.actions"))}</th>`);
+  wrap.innerHTML = recordsListHtml(rows);
+  wireRecordsTable(wrap, rows);
+  renderPagination(total, from, rows.length);
+  updateBulkbar();
+}
 
-  const bodyRows = rows.map((r) => {
-    const selected = state.selection.has(r.id);
-    const cells = [];
-    cells.push(`<td><span class="checkbox ${selected ? "checked" : ""}" data-select="${esc(r.id)}"></span></td>`);
-    if (c.type) cells.push(`<td><span class="badge">${esc(r.type)}</span></td>`);
-    if (c.name) cells.push(`<td class="name-cell" title="${esc(r.name)}">${esc(r.name)}</td>`);
-    if (c.content) {
-      const content = r.type === "SRV" && r.data
-        ? `${r.data.priority ?? ""} ${r.data.weight ?? ""} ${r.data.port ?? ""} ${r.data.target ?? r.content}`
-        : r.content;
-      cells.push(`<td class="mono truncate cell-copy" data-copy="${esc(r.content)}" title="${esc(t("common.copy"))}: ${esc(r.content)}">${esc(content)}</td>`);
-    }
-    if (c.proxy) {
-      if (r.proxiable) {
-        const on = !!r.proxied;
-        cells.push(`<td><span class="proxy-pill ${on ? "on" : "off"}">${on ? I.cloudFill : I.cloud}<span>${esc(on ? t("proxy.proxied") : t("proxy.dns_only"))}</span></span></td>`);
-      } else {
-        cells.push(`<td><span class="proxy-pill" title="${esc(t("proxy.na"))}">${I.cloud}<span class="cell-muted">-</span></span></td>`);
-      }
-    }
-    if (c.ttl) cells.push(`<td>${esc(fmtTtl(r.ttl))}</td>`);
-    if (c.tags) cells.push(`<td class="truncate">${(r.tags || []).map((tag) => `<span class="tag-chip">${esc(tag)}</span>`).join("") || '<span class="cell-muted">-</span>'}</td>`);
-    if (c.comment) cells.push(`<td class="truncate cell-muted" title="${esc(r.comment || "")}">${esc(r.comment || "-")}</td>`);
-    if (c.updated) cells.push(`<td class="cell-muted u-nowrap">${esc(fmtDate(r.modified_on))}</td>`);
-    if (c.created) cells.push(`<td class="cell-muted u-nowrap">${esc(fmtDate(r.created_on))}</td>`);
-    cells.push(`<td class="u-nowrap">
-      <button class="btn ghost icon sm" data-edit="${esc(r.id)}" title="${esc(t("records.edit"))}">${I.edit}</button>
-      <button class="btn ghost icon sm danger" data-delete="${esc(r.id)}" title="${esc(t("records.delete"))}">${I.trash}</button>
-    </td>`);
-    return `<tr class="${selected ? "selected" : ""}" data-row="${esc(r.id)}">${cells.join("")}</tr>`;
-  }).join("");
-
-  wrap.innerHTML = rows.length === 0
-    ? `<div class="empty-state">${I.file}<h4>${esc(t("records.empty.title"))}</h4><p>${esc(t("records.empty.desc"))}</p></div>`
-    : currentView() === "card" ? `<label class="card-select-all"><input type="checkbox" id="select-all">${esc(t("records.select_all"))}</label><div class="record-cards">${rows.map((r) => recordCard(r)).join("")}</div>`
-      : `<table class="data"><thead><tr>${headCols.join("")}</tr></thead><tbody>${bodyRows}</tbody></table>`;
-
+// Re-rendering replaces the controls, so handlers move focus to the replacement
+// when the clicked control had it (keyboard users keep their place).
+function wireRecordsTable(wrap, rows) {
   const selectAll = el("select-all");
   if (selectAll) {
     const pageIds = rows.map((r) => r.id);
     const selectedOnPage = pageIds.filter((id) => state.selection.has(id)).length;
-    selectAll.classList.toggle("checked", selectedOnPage > 0 && selectedOnPage === pageIds.length);
-    selectAll.classList.toggle("indeterminate", selectedOnPage > 0 && selectedOnPage < pageIds.length);
     selectAll.checked = selectedOnPage > 0 && selectedOnPage === pageIds.length;
     selectAll.indeterminate = selectedOnPage > 0 && selectedOnPage < pageIds.length;
     selectAll.addEventListener("click", () => {
@@ -1556,12 +1644,14 @@ function renderRecordsTable() {
       if (focused) [...wrap.querySelectorAll("[data-select]")].find((item) => item.dataset.select === id)?.focus();
     })
   );
-  wrap.querySelectorAll("[data-sort]").forEach((th) =>
-    th.addEventListener("click", () => {
-      const key = th.dataset.sort;
+  wrap.querySelectorAll("[data-sort]").forEach((btn) =>
+    btn.addEventListener("click", () => {
+      const key = btn.dataset.sort;
+      const focused = document.activeElement === btn;
       if (state.sort.key === key) state.sort.dir *= -1;
       else state.sort = { key, dir: 1 };
       renderRecordsTable();
+      if (focused) wrap.querySelector(`[data-sort="${key}"]`)?.focus();
     })
   );
   wrap.querySelectorAll("[data-copy]").forEach((td) =>
@@ -1575,26 +1665,20 @@ function renderRecordsTable() {
       if (rec) openRecordModal(rec);
     })
   );
+  // A row's own delete button leaves the checkbox selection alone.
   wrap.querySelectorAll("[data-delete]").forEach((btn) =>
-    btn.addEventListener("click", () => {
-      state.selection = new Set([btn.dataset.delete]);
-      openBulkDeleteModal();
-    })
+    btn.addEventListener("click", () => openBulkDeleteModal([btn.dataset.delete]))
   );
-
-  renderPagination(total, from, rows.length);
-  updateBulkbar();
 }
 
 function recordCard(r) {
   const selected = state.selection.has(r.id);
-  const content = r.type === "SRV" && r.data ? `${r.data.priority ?? ""} ${r.data.weight ?? ""} ${r.data.port ?? ""} ${r.data.target ?? r.content}` : r.content;
   return `<article class="record-card ${selected ? "selected" : ""}" data-row="${esc(r.id)}">
     <div class="record-card-head">
       <input type="checkbox" data-select="${esc(r.id)}" aria-label="${esc(t("records.select", { name: r.name }))}" ${selected ? "checked" : ""}>
       <strong>${esc(r.name)}</strong><span class="badge">${esc(r.type)}</span>
     </div>
-    <button class="record-content mono cell-copy" data-copy="${esc(r.content)}" title="${esc(t("common.copy"))}">${esc(content)}</button>
+    <button class="record-content mono cell-copy" data-copy="${esc(r.content)}" title="${esc(t("common.copy"))}">${esc(displayContent(r))}</button>
     <dl class="record-details">
       <div><dt>${esc(t("col.proxy"))}</dt><dd><span class="proxy-pill ${r.proxiable ? r.proxied ? "on" : "off" : ""}">${r.proxied ? I.cloudFill : I.cloud} ${esc(t(r.proxiable ? r.proxied ? "proxy.proxied" : "proxy.dns_only" : "proxy.na"))}</span></dd></div>
       <div><dt>${esc(t("col.ttl"))}</dt><dd>${esc(fmtTtl(r.ttl))}</dd></div>
@@ -1623,11 +1707,11 @@ function renderPagination(total, from, shown) {
       <button class="btn icon sm" id="page-next" ${state.page >= pages ? "disabled" : ""}>${I.chevronRight}</button>
     </div>`;
   el("per-page-slot").replaceWith(mselect({
-    options: [20, 50, 100].map((n) => ({ value: String(n), label: String(n) })),
+    options: PER_PAGE_OPTIONS.map((n) => ({ value: String(n), label: String(n) })),
     value: String(state.perPage),
     onChange: (v) => {
       state.perPage = parseInt(v, 10);
-      localStorage.setItem("cfddns.perPage", String(state.perPage));
+      writeStored("cfddns.perPage", String(state.perPage));
       state.page = 1;
       renderRecordsTable();
     },
@@ -1735,75 +1819,65 @@ function wireMetadata(modal, prefix) {
 
 /* ----- Add / edit record ----- */
 
+// One labelled input of the record form. Fields are required unless optional is set;
+// markValidity() writes the error text, so the error element starts empty.
+function inputField(id, labelKey, value, { type = "text", max = 65535, placeholder = "", v = "", full = false, optional = false, hint = "" } = {}) {
+  const attrs = [
+    `class="input" id="${id}"`,
+    type === "number" ? `type="number" min="0" max="${max}"` : "",
+    `value="${esc(value)}"`,
+    placeholder ? `placeholder="${esc(placeholder)}"` : "",
+    v ? `data-v="${v}"` : "",
+    optional ? "" : "required",
+  ].filter(Boolean).join(" ");
+  return `<label class="field${full ? " full" : ""}"><span>${esc(t(labelKey))}${optional ? "" : " *"}</span>
+          <input ${attrs}>
+          ${hint ? `<div class="field-hint">${esc(hint)}</div>` : `<div class="field-error" data-err="${id}"></div>`}</label>`;
+}
+
 function typeSpecificFields(type, rec) {
   const d = (rec && rec.data) || {};
   if (type === "MX") {
-    return `
-      <label class="field"><span>${esc(t("modal.content.MX"))} *</span>
-        <input class="input" id="f-content" value="${esc(rec ? rec.content : "")}" placeholder="mail.example.com" data-v="domain">
-        <div class="field-error" data-err="f-content">${esc(t("modal.invalid.domain"))}</div></label>
-      <label class="field"><span>${esc(t("modal.priority"))} *</span>
-        <input class="input" id="f-priority" type="number" min="0" max="65535" value="${esc(rec && rec.priority != null ? rec.priority : 10)}">
-        <div class="field-error" data-err="f-priority">${esc(t("modal.invalid.number", { min: 0, max: 65535 }))}</div></label>`;
+    return inputField("f-content", "modal.content.MX", rec ? rec.content : "", { placeholder: "mail.example.com", v: "domain" })
+      + inputField("f-priority", "modal.priority", rec && rec.priority != null ? rec.priority : 10, { type: "number" });
   }
   if (type === "SRV") {
     return `
       <div class="form-grid">
-        <label class="field"><span>${esc(t("modal.srv.priority"))} *</span>
-          <input class="input" id="f-srv-priority" type="number" min="0" max="65535" value="${esc(d.priority ?? 0)}">
-          <div class="field-error" data-err="f-srv-priority">${esc(t("modal.invalid.number", { min: 0, max: 65535 }))}</div></label>
-        <label class="field"><span>${esc(t("modal.srv.weight"))} *</span>
-          <input class="input" id="f-srv-weight" type="number" min="0" max="65535" value="${esc(d.weight ?? 5)}">
-          <div class="field-error" data-err="f-srv-weight">${esc(t("modal.invalid.number", { min: 0, max: 65535 }))}</div></label>
-        <label class="field"><span>${esc(t("modal.srv.port"))} *</span>
-          <input class="input" id="f-srv-port" type="number" min="0" max="65535" value="${esc(d.port ?? "")}" placeholder="25565">
-          <div class="field-error" data-err="f-srv-port">${esc(t("modal.invalid.number", { min: 0, max: 65535 }))}</div></label>
-        <label class="field"><span>${esc(t("modal.srv.target"))} *</span>
-          <input class="input" id="f-srv-target" value="${esc(d.target ?? "")}" placeholder="mc.example.com" data-v="domain">
-          <div class="field-error" data-err="f-srv-target">${esc(t("modal.invalid.domain"))}</div></label>
+        ${inputField("f-srv-priority", "modal.srv.priority", d.priority ?? 0, { type: "number" })}
+        ${inputField("f-srv-weight", "modal.srv.weight", d.weight ?? 5, { type: "number" })}
+        ${inputField("f-srv-port", "modal.srv.port", d.port ?? "", { type: "number", placeholder: "25565" })}
+        ${inputField("f-srv-target", "modal.srv.target", d.target ?? "", { placeholder: "mc.example.com", v: "domain" })}
       </div>`;
   }
   if (type === "CAA") {
     return `
       <div class="form-grid">
-        <label class="field"><span>${esc(t("modal.caa.flags"))} *</span>
-          <input class="input" id="f-caa-flags" type="number" min="0" max="255" value="${esc(d.flags ?? 0)}">
-          <div class="field-error" data-err="f-caa-flags">${esc(t("modal.invalid.number", { min: 0, max: 255 }))}</div></label>
+        ${inputField("f-caa-flags", "modal.caa.flags", d.flags ?? 0, { type: "number", max: 255 })}
         <div class="field"><span>${esc(t("modal.caa.tag"))} *</span><span id="f-caa-tag-slot"></span></div>
-        <label class="field full"><span>${esc(t("modal.caa.value"))} *</span>
-          <input class="input" id="f-caa-value" value="${esc(d.value ?? "")}" placeholder="letsencrypt.org">
-          <div class="field-error" data-err="f-caa-value">${esc(t("modal.required"))}</div></label>
+        ${inputField("f-caa-value", "modal.caa.value", d.value ?? "", { placeholder: "letsencrypt.org", full: true })}
       </div>`;
   }
   if (type === "HTTPS" || type === "SVCB") {
     return `
       <div class="form-grid">
-        <label class="field"><span>${esc(t("modal.svc.priority"))} *</span>
-          <input class="input" id="f-svc-priority" type="number" min="0" max="65535" value="${esc(d.priority ?? 1)}">
-          <div class="field-error" data-err="f-svc-priority">${esc(t("modal.invalid.number", { min: 0, max: 65535 }))}</div></label>
-        <label class="field"><span>${esc(t("modal.svc.target"))} *</span>
-          <input class="input" id="f-svc-target" value="${esc(d.target ?? "")}" placeholder=". or example.com">
-          <div class="field-error" data-err="f-svc-target">${esc(t("modal.required"))}</div></label>
-        <label class="field full"><span>${esc(t("modal.svc.value"))}</span>
-          <input class="input" id="f-svc-value" value="${esc(d.value ?? "")}" placeholder='alpn="h3,h2"'>
-          <div class="field-hint">${esc(t("modal.svc.value.hint"))}</div></label>
+        ${inputField("f-svc-priority", "modal.svc.priority", d.priority ?? 1, { type: "number" })}
+        ${inputField("f-svc-target", "modal.svc.target", d.target ?? "", { placeholder: ". or example.com" })}
+        ${inputField("f-svc-value", "modal.svc.value", d.value ?? "", { placeholder: 'alpn="h3,h2"', full: true, optional: true, hint: t("modal.svc.value.hint") })}
       </div>`;
   }
   const labelKey = `modal.content.${type}`;
-  const label = t(labelKey) === labelKey ? t("modal.content") : t(labelKey);
   const placeholders = {
     A: "192.0.2.1", AAAA: "2001:db8::1", CNAME: "example.com",
     TXT: "v=spf1 include:example.com ~all", NS: "ns1.example.com", PTR: "example.com",
   };
   const validators = { A: "ipv4", AAAA: "ipv6", CNAME: "domain", NS: "domain", PTR: "domain" };
-  const errKeys = { A: "modal.invalid.ipv4", AAAA: "modal.invalid.ipv6", CNAME: "modal.invalid.domain", NS: "modal.invalid.domain", PTR: "modal.invalid.domain" };
-  const v = validators[type];
-  return `<label class="field"><span>${esc(label)} *</span>
-    <input class="input" id="f-content" value="${esc(rec ? rec.content : "")}" placeholder="${esc(placeholders[type] || "")}" ${v ? `data-v="${v}"` : ""}>
-    ${v ? `<div class="field-error" data-err="f-content">${esc(t(errKeys[type]))}</div>` : `<div class="field-error" data-err="f-content">${esc(t("modal.required"))}</div>`}</label>`;
+  return inputField("f-content", t(labelKey) === labelKey ? "modal.content" : labelKey, rec ? rec.content : "", {
+    placeholder: placeholders[type] || "", v: validators[type] || "",
+  });
 }
 
-function wireTypeSelectValidation(modal, type) {
+function wireTypeSelectValidation(modal) {
   // CAA tag modern select.
   const tagSlot = modal.querySelector("#f-caa-tag-slot");
   if (tagSlot) {
@@ -1816,40 +1890,77 @@ function wireTypeSelectValidation(modal, type) {
     }));
   }
   // Live validation.
-  modal.querySelectorAll("[data-v]").forEach((input) => {
+  modal.querySelectorAll("#type-fields input").forEach((input) => {
     input.addEventListener("input", () => markValidity(modal, input));
   });
-  if (type === "SRV") {
-    modal.querySelectorAll("#f-srv-priority, #f-srv-weight, #f-srv-port").forEach((input) =>
-      input.addEventListener("input", () => markValidity(modal, input))
-    );
-  }
 }
 
-function markValidity(modal, input) {
-  const kind = input.dataset.v;
-  let ok = true;
+const INVALID_KEYS = { ipv4: "modal.invalid.ipv4", ipv6: "modal.invalid.ipv6", domain: "modal.invalid.domain" };
+
+// The error message for one form input, or "" when the value is acceptable.
+function fieldError(input) {
+  // A number input reports "" for text such as "-" or "e", so check badInput before the empty check.
+  if (input.type === "number" && input.validity?.badInput) {
+    return t("modal.invalid.number", { min: Number(input.min || 0), max: Number(input.max || 65535) });
+  }
   const val = input.value.trim();
-  if (kind === "ipv4") ok = V.ipv4(val);
-  else if (kind === "ipv6") ok = V.ipv6(val);
-  else if (kind === "domain") ok = val !== "" && V.domain(val);
-  else if (input.type === "number") ok = V.uint(val, Number(input.min || 0), Number(input.max || 65535));
-  else ok = val !== "";
-  input.classList.toggle("invalid", !ok && val !== "");
+  if (val === "") return input.required ? t("modal.required") : "";
+  const kind = input.dataset.v;
+  if (kind && !V[kind](val)) return t(INVALID_KEYS[kind]);
+  if (input.type === "number") {
+    const min = Number(input.min || 0), max = Number(input.max || 65535);
+    if (!V.uint(val, min, max)) return t("modal.invalid.number", { min, max });
+  }
+  return "";
+}
+
+// While typing, only fields with content are flagged; a save attempt (submitted) also flags empty required fields.
+function markValidity(modal, input, submitted = false) {
+  const message = fieldError(input);
+  const show = message !== "" && (submitted || input.value.trim() !== "");
+  input.classList.toggle("invalid", show);
   const err = modal.querySelector(`[data-err="${input.id}"]`);
-  if (err) err.classList.toggle("visible", !ok && val !== "");
+  if (err) {
+    err.textContent = message;
+    err.classList.toggle("visible", show);
+  }
+  return message === "";
+}
+
+// SRV names follow _service._proto.name, so they get their own message.
+function markName(modal, type, submitted = false) {
+  const input = modal.querySelector("#f-name");
+  const value = input.value.trim();
+  const ok = type === "SRV" ? V.srvName(value) : V.recordName(value);
+  const show = !ok && (submitted || value !== "");
+  input.classList.toggle("invalid", show);
+  const err = modal.querySelector('[data-err="f-name"]');
+  err.textContent = t(type === "SRV" ? "modal.invalid.srvname" : "modal.invalid.name");
+  err.classList.toggle("visible", show);
   return ok;
 }
 
-function openRecordModal(rec) {
-  const isEdit = !!rec;
-  const zone = currentZone();
-  const zoneId = state.zoneId;
-  const zoneName = zone ? zone.name : "";
-  const type = rec ? rec.type : "A";
-  const initialProxied = rec ? !!rec.proxied : false;
+// Proxied records always use TTL 1 (Auto) and the backend enforces that, so the TTL select
+// shows Auto and locks while proxied. Turning the proxy off brings back the earlier choice.
+function lockTtlWhenProxied(ttlSelect, hint) {
+  let before = null;
+  return (proxied) => {
+    if (proxied && before === null) {
+      before = ttlSelect.mget();
+      ttlSelect.mset("1");
+    }
+    if (!proxied && before !== null) {
+      ttlSelect.mset(before);
+      before = null;
+    }
+    ttlSelect.msetDisabled(proxied);
+    hint.classList.toggle("u-hidden", !proxied);
+  };
+}
 
-  const modal = openModal(`
+function recordModalHtml(rec, zoneName, type) {
+  const isEdit = !!rec;
+  return `
     ${modalHead(isEdit ? t("modal.edit.title") : t("modal.add.title"))}
     <div class="modal-body">
       <div class="zone-suffix-banner">${I.dns} <span>${esc(t("modal.zone"))}:</span> <strong>${esc(zoneName)}</strong></div>
@@ -1858,7 +1969,7 @@ function openRecordModal(rec) {
         <label class="field"><span>${esc(t("modal.name"))} *</span>
           <input class="input" id="f-name" value="${esc(rec ? shortName(rec.name, zoneName) : "")}" placeholder="subdomain" ${isEdit ? "disabled" : ""}>
           <div class="field-hint">${esc(t("modal.name.hint", { zone: zoneName }))}</div>
-          <div class="field-error" data-err="f-name">${esc(t("modal.invalid.name"))}</div></label>
+          <div class="field-error" data-err="f-name"></div></label>
       </div>
       <div id="type-fields">${typeSpecificFields(type, rec)}</div>
       <div class="form-grid">
@@ -1867,7 +1978,7 @@ function openRecordModal(rec) {
         <div class="field">
           <span>&nbsp;</span>
           <div class="switch-row">
-            <label class="switch"><input type="checkbox" id="f-proxied" ${initialProxied ? "checked" : ""} ${PROXIABLE.includes(type) ? "" : "disabled"}><span class="track"></span></label>
+            <label class="switch"><input type="checkbox" id="f-proxied" ${rec?.proxied ? "checked" : ""} ${PROXIABLE.includes(type) ? "" : "disabled"}><span class="track"></span></label>
             <span class="lbl">${esc(t("modal.proxy"))}</span>
           </div>
         </div>
@@ -1877,15 +1988,34 @@ function openRecordModal(rec) {
     <div class="modal-foot">
       <button class="btn" data-close>${esc(t("modal.cancel"))}</button>
       <button class="btn primary" id="f-save">${esc(isEdit ? t("modal.save") : t("modal.create"))}</button>
-    </div>`, true);
+    </div>`;
+}
 
+function openRecordModal(rec) {
+  const isEdit = !!rec;
+  const zone = currentZone();
+  const zoneId = state.zoneId;
+  const zoneName = zone ? zone.name : "";
+  const type = rec ? rec.type : "A";
+
+  const modal = openModal(recordModalHtml(rec, zoneName, type), true);
   modal.dataset.caaTag = (rec && rec.data && rec.data.tag) || "issue";
   let currentType = type;
   if (isEdit) wireMetadata(modal, "f");
 
+  // TTL modern select.
+  const ttlSelect = mselect({
+    id: "f-ttl-slot",
+    options: ttlOptions(rec?.ttl),
+    value: String(rec ? rec.ttl ?? 1 : 1),
+  });
+  modal.querySelector("#f-ttl-slot").replaceWith(ttlSelect);
+  const proxiedInput = modal.querySelector("#f-proxied");
+  const lockTtl = lockTtlWhenProxied(ttlSelect, modal.querySelector("#f-ttl-hint"));
+  const syncTtlAvailability = () => lockTtl(proxiedInput.checked && PROXIABLE.includes(currentType));
+
   // Type modern select.
-  const typeSlot = modal.querySelector("#f-type-slot");
-  typeSlot.replaceWith(mselect({
+  modal.querySelector("#f-type-slot").replaceWith(mselect({
     id: "f-type-slot",
     options: RECORD_TYPES.map((tp) => ({ value: tp, label: tp })),
     value: type,
@@ -1893,49 +2023,24 @@ function openRecordModal(rec) {
     onChange: (v) => {
       currentType = v;
       modal.querySelector("#type-fields").innerHTML = typeSpecificFields(v, null);
-      const ok = PROXIABLE.includes(v);
-      const proxiedInput = modal.querySelector("#f-proxied");
-      proxiedInput.disabled = !ok;
-      if (!ok) proxiedInput.checked = false;
+      proxiedInput.disabled = !PROXIABLE.includes(v);
+      if (proxiedInput.disabled) proxiedInput.checked = false;
       syncTtlAvailability();
-      wireTypeSelectValidation(modal, v);
+      wireTypeSelectValidation(modal);
+      // SRV names follow different rules, so recheck a name that was already typed.
+      if (!isEdit) markName(modal, v);
     },
   }));
 
-  // TTL modern select.
-  const ttlSlot = modal.querySelector("#f-ttl-slot");
-  const ttlSelect = mselect({
-    id: "f-ttl-slot",
-    options: TTL_OPTIONS.map(([v, lbl]) => ({ value: String(v), label: v === 1 ? t("ttl.auto") : lbl })),
-    value: String(rec ? rec.ttl ?? 1 : 1),
-  });
-  ttlSlot.replaceWith(ttlSelect);
-
-  const proxiedInput = modal.querySelector("#f-proxied");
-  function syncTtlAvailability() {
-    const proxied = proxiedInput.checked && PROXIABLE.includes(currentType);
-    ttlSelect.msetDisabled(proxied);
-    if (proxied) ttlSelect.mset("1");
-    modal.querySelector("#f-ttl-hint").classList.toggle("u-hidden", !proxied);
-  }
   proxiedInput.addEventListener("change", syncTtlAvailability);
   syncTtlAvailability();
-  wireTypeSelectValidation(modal, currentType);
-
-  // Name validation.
-  const nameInput = modal.querySelector("#f-name");
-  nameInput.addEventListener("input", () => {
-    const ok = currentType === "SRV" ? V.srvName(nameInput.value) : V.recordName(nameInput.value);
-    nameInput.classList.toggle("invalid", !ok && nameInput.value !== "");
-    modal.querySelector('[data-err="f-name"]').classList.toggle("visible", !ok && nameInput.value !== "");
-  });
+  wireTypeSelectValidation(modal);
+  modal.querySelector("#f-name").addEventListener("input", () => markName(modal, currentType));
 
   modal.querySelector("#f-save").addEventListener("click", async () => {
-    const saveBtn = modal.querySelector("#f-save");
     const payload = buildPayload(modal, currentType, zoneName, isEdit ? rec : null, ttlSelect);
     if (!payload) return;
-    saveBtn.disabled = true;
-    saveBtn.innerHTML = `<div class="spinner small"></div>`;
+    const restore = showBusy(modal.querySelector("#f-save"));
     try {
       if (isEdit) {
         await api(`/api/zones/${zoneId}/records/${rec.id}`, { method: "PUT", json: payload });
@@ -1948,8 +2053,7 @@ function openRecordModal(rec) {
       if (state.zoneId === zoneId) await refreshRecords();
     } catch (e) {
       toast(e.message, "error");
-      saveBtn.disabled = false;
-      saveBtn.textContent = isEdit ? t("modal.save") : t("modal.create");
+      restore();
     }
   });
 }
@@ -1973,21 +2077,13 @@ function buildPayload(modal, type, zoneName, rec, ttlSelect) {
 
   // Validate all visible inputs first.
   let allOk = true;
-  modal.querySelectorAll("#type-fields [data-v], #type-fields input[type=number]").forEach((input) => {
-    if (!markValidity(modal, input)) allOk = false;
+  modal.querySelectorAll("#type-fields input").forEach((input) => {
+    if (!markValidity(modal, input, true)) allOk = false;
   });
-  const nameRaw = isEdit ? "" : val("#f-name");
-  if (!isEdit) {
-    const nameOk = type === "SRV" ? V.srvName(nameRaw) : V.recordName(nameRaw);
-    if (!nameOk) {
-      modal.querySelector("#f-name").classList.add("invalid");
-      modal.querySelector('[data-err="f-name"]').classList.add("visible");
-      allOk = false;
-    }
-  }
+  if (!isEdit && !markName(modal, type, true)) allOk = false;
   if (!allOk) { toast(t("modal.invalid"), "error"); return null; }
 
-  const name = isEdit ? rec.name : fullName(nameRaw, zoneName);
+  const name = isEdit ? rec.name : fullName(val("#f-name"), zoneName);
   const proxied = PROXIABLE.includes(type) ? modal.querySelector("#f-proxied").checked : false;
   const ttl = proxied ? 1 : parseInt(ttlSelect.mget(), 10) || 1;
   const payload = { type, name, ttl, proxied };
@@ -2028,6 +2124,19 @@ function buildPayload(modal, type, zoneName, rec, ttlSelect) {
 
 /* ----- Bulk edit ----- */
 
+// The bulk endpoint answers 200 with per-record results, so failures must be read from the body.
+function bulkResultToast(action, res) {
+  const ok = res.succeeded || 0;
+  const failed = res.failed || 0;
+  if (!failed) {
+    toast(t(`toast.bulk_${action}`, { ok }));
+    return;
+  }
+  const summary = ok ? t(`toast.bulk_${action}.partial`, { ok, n: failed }) : t(`toast.bulk_${action}.none`, { n: failed });
+  const error = (res.results || []).find((item) => !item.ok)?.error;
+  toast(error ? t("toast.with_error", { summary, error }) : summary, "error");
+}
+
 function openBulkEditModal() {
   const zoneId = state.zoneId;
   const selected = state.records.filter((r) => state.selection.has(r.id));
@@ -2039,7 +2148,8 @@ function openBulkEditModal() {
     ${modalHead(t("modal.bulk.title", { n: selected.length }))}
     <div class="modal-body">
       <div class="form-grid">
-        <div class="field"><span>${esc(t("modal.bulk.ttl"))}</span><span id="b-ttl-slot"></span></div>
+        <div class="field"><span>${esc(t("modal.bulk.ttl"))}</span><span id="b-ttl-slot"></span>
+          <div class="field-hint u-hidden" id="b-ttl-hint">${esc(t("modal.ttl.proxied"))}</div></div>
         <div class="field"><span>${esc(t("modal.bulk.proxy"))}</span><span id="b-proxy-slot"></span></div>
       </div>
       ${allProxiable ? "" : `<div class="login-error visible u-mb16">${esc(t("modal.bulk.proxy.blocked"))} (${esc(nonProxiableTypes.join(", "))})</div>`}
@@ -2051,10 +2161,11 @@ function openBulkEditModal() {
     </div>`);
 
   const ttlSelect = mselect({
-    options: [{ value: "", label: t("modal.bulk.keep") }, ...TTL_OPTIONS.map(([v, lbl]) => ({ value: String(v), label: v === 1 ? t("ttl.auto") : lbl }))],
+    options: [{ value: "", label: t("modal.bulk.keep") }, ...ttlOptions()],
     value: "",
   });
   modal.querySelector("#b-ttl-slot").replaceWith(ttlSelect);
+  const lockTtl = lockTtlWhenProxied(ttlSelect, modal.querySelector("#b-ttl-hint"));
 
   const proxySelect = mselect({
     options: [
@@ -2064,13 +2175,13 @@ function openBulkEditModal() {
     ],
     value: "",
     disabled: !allProxiable,
+    onChange: (v) => lockTtl(v === "true"),
   });
   modal.querySelector("#b-proxy-slot").replaceWith(proxySelect);
 
   wireMetadata(modal, "b");
 
   modal.querySelector("#b-apply").addEventListener("click", async () => {
-    const applyBtn = modal.querySelector("#b-apply");
     const patch = {};
     const ttlV = ttlSelect.mget();
     if (ttlV) patch.ttl = parseInt(ttlV, 10);
@@ -2085,30 +2196,28 @@ function openBulkEditModal() {
       return;
     }
     if (Object.keys(patch).length === 0) { closeModal(); return; }
-    applyBtn.disabled = true;
-    applyBtn.innerHTML = `<div class="spinner small"></div>`;
+    const restore = showBusy(modal.querySelector("#b-apply"));
     try {
       const res = await api(`/api/zones/${zoneId}/records/bulk`, {
         method: "POST",
         json: { action: "update", ids: selected.map((record) => record.id), patch },
       });
-      toast(t("toast.bulk_update", { ok: res.succeeded, fail_part: res.failed ? t("toast.fail_suffix", { n: res.failed }) : "" }), res.failed ? "info" : "ok");
+      bulkResultToast("update", res);
       if (modal.isConnected) closeModal();
       if (state.zoneId === zoneId) await refreshRecords();
     } catch (e) {
       toast(e.message, "error");
-      applyBtn.disabled = false;
-      applyBtn.textContent = t("modal.bulk.apply", { n: selected.length });
+      restore();
     }
   });
 }
 
 /* ----- Delete (single or bulk) ----- */
 
-function openBulkDeleteModal() {
+// ids defaults to the checkbox selection; a row's delete button passes just its own id.
+function openBulkDeleteModal(ids = [...state.selection]) {
   const zoneId = state.zoneId;
-  const ids = [...state.selection];
-  const n = state.selection.size;
+  const n = ids.length;
   if (n === 0) return;
   const modal = openModal(`
     ${modalHead(t("modal.delete.title"))}
@@ -2120,21 +2229,18 @@ function openBulkDeleteModal() {
       <button class="btn danger" id="d-confirm">${I.trash} ${esc(t("modal.delete.confirm"))}</button>
     </div>`);
   modal.querySelector("#d-confirm").addEventListener("click", async () => {
-    const btn = modal.querySelector("#d-confirm");
-    btn.disabled = true;
-    btn.innerHTML = `<div class="spinner small"></div>`;
+    const restore = showBusy(modal.querySelector("#d-confirm"));
     try {
       const res = await api(`/api/zones/${zoneId}/records/bulk`, {
         method: "POST",
         json: { action: "delete", ids },
       });
-      toast(t("toast.bulk_delete", { ok: res.succeeded, fail_part: res.failed ? t("toast.fail_suffix", { n: res.failed }) : "" }), res.failed ? "info" : "ok");
+      bulkResultToast("delete", res);
       if (modal.isConnected) closeModal();
       if (state.zoneId === zoneId) await refreshRecords();
     } catch (e) {
       toast(e.message, "error");
-      btn.disabled = false;
-      btn.innerHTML = `${I.trash} ${esc(t("modal.delete.confirm"))}`;
+      restore();
     }
   });
 }
@@ -2149,7 +2255,7 @@ function openImportModal() {
       <p class="u-note-sm">${esc(t("modal.import.desc"))}</p>
       <div class="dropzone" id="dropzone">
         ${I.file}
-        <div class="u-mt8" id="drop-label">${t("modal.import.drop")}</div>
+        <div class="u-mt8" id="drop-label">${tHtml("modal.import.drop.html")}</div>
       </div>
       <input type="file" id="file-input" accept=".txt,.zone,text/plain" class="u-hidden">
       <div class="field-error" id="import-error"></div>
@@ -2172,8 +2278,7 @@ function openImportModal() {
     file = null;
     submit.disabled = true;
     if (f.size > 2 * 1024 * 1024) {
-      errBox.textContent = "File too large (max 2 MiB).";
-      errBox.classList.add("visible");
+      showError(errBox, t("modal.import.too_big"));
       return;
     }
     file = f;
@@ -2195,8 +2300,7 @@ function openImportModal() {
   submit.addEventListener("click", async () => {
     if (!file) return;
     const selectedFile = file;
-    submit.disabled = true;
-    submit.innerHTML = `<div class="spinner small"></div>`;
+    const restore = showBusy(submit);
     try {
       const bytes = await selectedFile.arrayBuffer();
       if (!modal.isConnected) return;
@@ -2212,10 +2316,8 @@ function openImportModal() {
       if (modal.isConnected) closeModal();
       if (state.zoneId === zoneId) await refreshRecords();
     } catch (e) {
-      errBox.textContent = e.message;
-      errBox.classList.add("visible");
-      submit.disabled = false;
-      submit.innerHTML = `${I.upload} ${esc(t("modal.import.submit"))}`;
+      showError(errBox, e.message);
+      restore();
     }
   });
 }
@@ -2224,15 +2326,7 @@ async function exportZone() {
   const zone = currentZone();
   try {
     const text = await api(`/api/zones/${state.zoneId}/export`, { text: true });
-    const blob = new Blob([text], { type: "text/plain" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = `${zone ? zone.name : "zone"}.txt`;
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    URL.revokeObjectURL(url);
+    downloadText(`${zone ? zone.name : "zone"}.txt`, text);
     toast(t("toast.exported"));
   } catch (e) {
     toast(e.message, "error");
@@ -2241,11 +2335,8 @@ async function exportZone() {
 
 /* ================= Render: settings ================= */
 
-function renderSettings() {
-  const page = el("page");
-  page.innerHTML = `
-    <div class="settings-grid">
-      <div class="card"><div class="card-pad">
+function appearanceCard() {
+  return `<div class="card"><div class="card-pad">
         <div class="card-title">${I.palette} ${esc(t("settings.appearance.title"))}</div>
         <div class="card-desc">${esc(t("settings.appearance.desc"))}</div>
         <div class="settings-row">
@@ -2281,7 +2372,38 @@ function renderSettings() {
           <button class="btn sm ghost" id="icon-reset">${esc(t("settings.icon.reset"))}</button>
           <input type="file" id="icon-input" accept="image/png,image/jpeg,image/webp,image/gif" class="u-hidden">
         </div>
-      </div></div>
+      </div></div>`;
+}
+
+function tokenCard() {
+  return `<div class="card"><div class="card-pad">
+        <div class="card-title">${I.key} ${esc(t("settings.token.title"))}</div>
+        <div class="card-desc">${esc(t("settings.token.desc"))}</div>
+        <ol class="token-steps">
+          ${[1, 2, 3, 4, 5].map((step) => `<li>${tHtml(`settings.token.step${step}.html`)}</li>`).join("\n          ")}
+        </ol>
+        <div class="u-mt14">
+          <a href="https://dash.cloudflare.com/profile/api-tokens" target="_blank" rel="noopener noreferrer">dash.cloudflare.com/profile/api-tokens ↗</a>
+        </div>
+      </div></div>`;
+}
+
+function aboutCard() {
+  return `<div class="card"><div class="card-pad">
+        <div class="card-title">${esc(t("settings.about.title"))}</div>
+        <table class="kv-table">
+          <tr><td>${esc(t("settings.about.version"))}</td><td class="mono">v${esc(state.config ? state.config.version : "?")}</td></tr>
+          <tr><td>${esc(t("settings.about.source"))}</td><td><a href="${esc(state.config?.github || "")}" target="_blank" rel="noopener noreferrer">GitHub</a></td></tr>
+          <tr><td>${esc(t("settings.about.upstream"))}</td><td><a href="https://github.com/timothymiller/cloudflare-ddns" target="_blank" rel="noopener noreferrer">cloudflare-ddns</a></td></tr>
+        </table>
+      </div></div>`;
+}
+
+function renderSettings() {
+  const page = el("page");
+  page.innerHTML = `
+    <div class="settings-grid">
+      ${appearanceCard()}
 
       <div class="card"><div class="card-pad">
         <div class="card-title">${I.shield} ${esc(t("settings.security.title"))}</div>
@@ -2289,40 +2411,16 @@ function renderSettings() {
         <div id="security-body"></div>
       </div></div>
 
-      <div class="card"><div class="card-pad">
-        <div class="card-title">${I.key} ${esc(t("settings.token.title"))}</div>
-        <div class="card-desc">${esc(t("settings.token.desc"))}</div>
-        <ol class="token-steps">
-          <li>${t("settings.token.step1")}</li>
-          <li>${t("settings.token.step2")}</li>
-          <li>${t("settings.token.step3")}</li>
-          <li>${t("settings.token.step4")}</li>
-          <li>${t("settings.token.step5")}</li>
-        </ol>
-        <div class="u-mt14">
-          <a href="https://dash.cloudflare.com/profile/api-tokens" target="_blank" rel="noopener noreferrer">dash.cloudflare.com/profile/api-tokens ↗</a>
-        </div>
-      </div></div>
+      ${tokenCard()}
 
-      <div class="card"><div class="card-pad">
-        <div class="card-title">${esc(t("settings.about.title"))}</div>
-        <table class="kv-table">
-          <tr><td>${esc(t("settings.about.version"))}</td><td class="mono">v${esc(state.config ? state.config.version : "?")}</td></tr>
-          <tr><td>${esc(t("settings.about.source"))}</td><td><a href="${esc(state.config?.github || "")}" target="_blank" rel="noopener noreferrer">GitHub</a></td></tr>
-          <tr><td>${esc(t("settings.about.upstream"))}</td><td><a href="https://github.com/timothymiller/cloudflare-ddns" target="_blank" rel="noopener noreferrer">cloudflare-ddns</a></td></tr>
-        </table>
-      </div></div>
+      ${aboutCard()}
     </div>`;
 
   // Theme select
   const themeSelect = mselect({
     id: "settings-theme-select",
     label: t("settings.theme"),
-    options: [
-      { value: "system", label: t("settings.theme.system") },
-      { value: "light", label: t("settings.theme.light") },
-      { value: "dark", label: t("settings.theme.dark") },
-    ],
+    options: THEMES.map((mode) => ({ value: mode, label: t("settings.theme." + mode) })),
     value: currentTheme(),
     onChange: (v) => setTheme(v, themeSelect.querySelector(".mselect-btn")),
   });
@@ -2333,7 +2431,7 @@ function renderSettings() {
     cls: "u-lang-select",
     options: LANGS.map((l) => ({ value: l.code, label: l.name })),
     value: lang,
-    onChange: (v) => { lang = v; localStorage.setItem("cfddns.lang", v); render(); },
+    onChange: (v) => { lang = v; writeStored("cfddns.lang", v); render(); },
   }));
 
   renderAccentRow();
@@ -2346,11 +2444,12 @@ function renderAccentRow() {
   if (!row) return;
   const current = (state.config && state.config.accent) || "#f6821f";
   row.innerHTML = "";
-  ACCENT_PRESETS.forEach((color, i) => {
+  ACCENT_PRESETS.forEach((color) => {
     const b = document.createElement("button");
-    b.className = `swatch sw-${i} ${current.toLowerCase() === color ? "selected" : ""}`;
+    b.className = `swatch ${current.toLowerCase() === color ? "selected" : ""}`;
     b.type = "button";
     b.title = color;
+    b.style.setProperty("--swatch-color", color);
     b.setAttribute("aria-label", color);
     b.setAttribute("aria-pressed", String(current.toLowerCase() === color));
     b.addEventListener("click", () => saveAccent(color));
@@ -2364,14 +2463,14 @@ function renderAccentRow() {
   picker.type = "color";
   picker.className = "color-input";
   picker.value = /^#[0-9a-fA-F]{6}$/.test(current) ? current : "#f6821f";
-  picker.title = "Custom color";
-  picker.setAttribute("aria-label", "Custom color");
+  picker.title = t("settings.accent.custom");
+  picker.setAttribute("aria-label", t("settings.accent.custom"));
   picker.addEventListener("change", () => saveAccent(picker.value));
   custom.appendChild(picker);
   row.appendChild(custom);
   const reset = document.createElement("button");
   reset.className = "btn sm ghost";
-  reset.textContent = "Default";
+  reset.textContent = t("settings.accent.default");
   reset.addEventListener("click", () => saveAccent(null));
   row.appendChild(reset);
 }
@@ -2380,8 +2479,8 @@ async function saveAccent(color) {
   try {
     await api("/api/ui/accent", { method: "POST", json: { accent: color } });
     state.config.accent = color;
-    applyAccent(color);
     // Refresh the derived palette without waiting for a reload.
+    applyAccent(color);
     toast(t("toast.accent"));
     renderAccentRow();
   } catch (e) {
@@ -2432,7 +2531,7 @@ function renderSecurityBody() {
   const totpOn = state.totpEnabled;
   body.innerHTML = `
     <table class="kv-table">
-      <tr><td>${esc(t("settings.security.session"))}</td><td class="mono">${state.sessionTtl ? `${Math.round(state.sessionTtl / 3600)} h` : "-"}</td></tr>
+      <tr><td>${esc(t("settings.security.session"))}</td><td class="mono">${state.sessionTtl ? esc(fmtDuration(state.sessionTtl)) : "-"}</td></tr>
       <tr><td>${esc(t("settings.security.cookies"))}</td><td><span class="cell-muted">${esc(t("settings.security.cookies.hint"))}</span></td></tr>
       <tr><td>${esc(t("settings.2fa.title"))}</td><td>
         <div class="security-factor-status">
@@ -2493,7 +2592,7 @@ function open2faSetupModal() {
     const btn = modal.querySelector("#begin-2fa-submit");
     const error = modal.querySelector("#begin-2fa-error");
     const password = modal.querySelector("#begin-2fa-password").value;
-    if (!password) { error.textContent = t("modal.required"); error.classList.add("visible"); return; }
+    if (!password) { showError(error, t("modal.required")); return; }
     btn.disabled = true;
     error.classList.remove("visible");
     try {
@@ -2505,8 +2604,7 @@ function open2faSetupModal() {
         else await api("/api/auth/2fa/cancel", { method: "POST", json: {} });
       });
     } catch (e) {
-      error.textContent = e.message;
-      error.classList.add("visible");
+      showError(error, e.message);
       btn.disabled = false;
     }
   });
@@ -2559,8 +2657,8 @@ function show2faEnrollment(begin) {
     try {
       const code = modal.querySelector("#t2fa-code").value.trim();
       const res = await withEnrollmentOperation(() => {
-        if (authentication !== authGeneration || !state.authed) throw new Error("Authentication changed. Sign in again.");
-        return api("/api/auth/2fa/confirm", { method: "POST", json: { code }, authContext: session });
+        if (authentication !== authGeneration || !state.authed) throw new Error(t("error.auth_changed"));
+        return api("/api/auth/2fa/confirm", { method: "POST", json: { code }, authContext: session, rotatesSession: true });
       });
       completed = true;
       if (session.generation !== authGeneration || !state.authed) return;
@@ -2571,8 +2669,7 @@ function show2faEnrollment(begin) {
       renderRecoveryNotice();
       if (modal.isConnected && state.authed) showBackupCodesModal(state.pendingBackupCodes);
     } catch (e) {
-      errBox.textContent = e.message;
-      errBox.classList.add("visible");
+      showError(errBox, e.message);
       btn.disabled = false;
     } finally {
       confirming = false;
@@ -2606,15 +2703,7 @@ authenticator app. Store them somewhere safe.
 
 ${codes.join("\n")}
 `;
-    const blob = new Blob([text], { type: "text/plain" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = "cloudflare-ddns-backup-codes.txt";
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    URL.revokeObjectURL(url);
+    downloadText("cloudflare-ddns-backup-codes.txt", text);
   });
   modal.querySelector("#bc-done").addEventListener("click", () => {
     state.pendingBackupCodes = null;
@@ -2651,6 +2740,7 @@ function open2faDisableModal() {
         method: "POST",
         json: { code: modal.querySelector("#d2fa-code").value.trim() },
         authContext: session,
+        rotatesSession: true,
       });
       if (session.generation !== authGeneration || !state.authed) return;
       state.totpEnabled = false;
@@ -2659,8 +2749,7 @@ function open2faDisableModal() {
       toast(t("toast.2fa.disabled"));
       renderSecurityBody();
     } catch (e) {
-      errBox.textContent = e.message;
-      errBox.classList.add("visible");
+      showError(errBox, e.message);
       btn.disabled = false;
     }
   });
@@ -2695,8 +2784,8 @@ function openPasswordModal() {
     const errBox = modal.querySelector("#pw-error");
     errBox.classList.remove("visible");
     const val = (id) => modal.querySelector(id).value;
-    if (val("#pw-new").length < 8) { errBox.textContent = t("setup.short"); errBox.classList.add("visible"); return; }
-    if (val("#pw-new") !== val("#pw-confirm")) { errBox.textContent = t("setup.mismatch"); errBox.classList.add("visible"); return; }
+    if (val("#pw-new").length < 8) { showError(errBox, t("setup.short")); return; }
+    if (val("#pw-new") !== val("#pw-confirm")) { showError(errBox, t("setup.mismatch")); return; }
     btn.disabled = true;
     try {
       await api("/api/auth/password", {
@@ -2708,13 +2797,13 @@ function openPasswordModal() {
           confirm: val("#pw-confirm"),
         },
         authContext: session,
+        rotatesSession: true,
       });
       if (session.generation !== authGeneration || !state.authed) return;
       if (modal.isConnected) closeModal();
       toast(t("toast.password"));
     } catch (e) {
-      errBox.textContent = e.message;
-      errBox.classList.add("visible");
+      showError(errBox, e.message);
       btn.disabled = false;
     }
   });
