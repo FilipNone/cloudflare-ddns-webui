@@ -632,7 +632,7 @@ table.data td.name-cell { font-weight: 550; max-width: 240px; overflow: hidden; 
 .settings-sep { height: 1px; background: var(--border); margin: 18px 0; }
 
 .swatch-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
-/* app.js sets --swatch-color on each swatch through CSSOM (inline style attributes break the CSP). */
+/* js/settings.js sets --swatch-color on each swatch through CSSOM (inline style attributes break the CSP). */
 .swatch { width: 30px; height: 30px; border-radius: 8px; border: 2px solid transparent; cursor: pointer; padding: 0; background: var(--swatch-color, var(--accent)); transition: transform 0.1s, border-color 0.1s; }
 .swatch:hover { transform: scale(1.08); }
 .swatch.selected { border-color: var(--text); }

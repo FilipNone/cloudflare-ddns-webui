@@ -42,12 +42,24 @@ src/
   persist.rs     crash-safe file replacement for state.json and UI settings
   pp.rs          log output with optional emoji and quiet mode
 web/
-  index.html app.js style.css favicon.svg   the embedded frontend
-  app.test.cjs appearance.test.cjs          Node test suites for the frontend
+  index.html style.css favicon.svg   page, stylesheet and default icon
+  js/core.js             saved preferences, constants, app state, formatters, validators
+  js/i18n.js             interface strings, t() and tHtml()
+  js/ui.js               icons, theme and branding, toasts, selects, dropdowns, modal frame
+  js/api.js              api() client, session reset, zone/record/DDNS loaders
+  js/login.js            first-run setup, sign-in and the 2FA step
+  js/dashboard.js        IP cards, DDNS status and the manual update
+  js/records.js          DNS records page: filters, list and card views, selection, pagination
+  js/record-modals.js    add/edit, bulk edit, delete and import/export dialogs
+  js/settings.js         appearance, security, 2FA enrollment, recovery codes, password change
+  app.js                 entry script, loaded last: page shell, navigation and boot
+  app.test.cjs appearance.test.cjs   Node test suites for the frontend
 scripts/
   mock-cloudflare-api.py   local Cloudflare API mock with the synthetic example.com zone
   smoke-test.py            end-to-end smoke harness (temporary state, loopback, mock token)
 ```
+
+The frontend scripts are classic scripts that share one global scope. `index.html` lists them in load order, and the Node tests read the same list. Code that runs while a file loads can use only what that file or an earlier one defines. A new script needs a `defer` script tag in `index.html` and an entry in `SCRIPTS` in `src/routes.rs`.
 
 ## 3. Golden rules
 
@@ -102,6 +114,7 @@ cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
 cargo build --locked --release
 node --check web/app.js
+(for f in web/js/*.js; do node --check "$f" || exit 1; done)
 node --test web/app.test.cjs web/appearance.test.cjs
 python3 scripts/smoke-test.py
 ```
@@ -125,7 +138,7 @@ Toolchain: Rust 1.99.1 with rustfmt and Clippy (pinned in `rust-toolchain.toml` 
 
 - Use your own target directory (`CARGO_TARGET_DIR=target/agent-<name>`) to avoid the Cargo build lock. Delete it when you finish.
 - Give each `--serve` instance its own `--port`.
-- Edit only the files your task owns. `src/routes.rs` and `web/app.js` are large shared files; make small edits and re-read them before each edit.
+- Edit only the files your task owns. `src/routes.rs` is a large shared file, and the scripts in `web/js/` share one global scope with `web/app.js`; make small edits and re-read a file before each edit.
 - If someone else's unfinished edit breaks the build, wait and retry. Do not fix their files.
 
 ## 7. Upstream reference

@@ -1233,6 +1233,13 @@ def icon_files(files):
     return [name for name in files if re.fullmatch(r"icon-[0-9a-f]{32}", name)]
 
 
+def script_paths(page):
+    """Script URLs in the served index page, in load order, without the version query."""
+    paths = [p.decode() for p in re.findall(rb'<script src="(/static/[^"?]+)[^"]*"', page)]
+    require(paths and paths[-1] == "/static/app.js", "index page must load app.js last")
+    return paths
+
+
 def customization_smoke(app, mock):
     cookie = setup_session(app)
     png = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=")
@@ -1274,8 +1281,12 @@ def customization_smoke(app, mock):
     csp = headers.get("Content-Security-Policy", "")
     require("sandbox" in csp and "default-src 'none'" in csp,
             "persisted raster lacks the required sandbox and deny-all favicon CSP")
-    for path in ("/", "/static/style.css", "/static/app.js"):
-        wire_request(app.port, "GET", path)
+    page, _ = wire_request(app.port, "GET", "/")
+    wire_request(app.port, "GET", "/static/style.css")
+    for path in script_paths(page):
+        _, headers = wire_request(app.port, "GET", path)
+        require(headers["Content-Type"] == "application/javascript; charset=utf-8",
+                f"{path}: not served as JavaScript")
     request(app.port, "DELETE", "/api/ui/icon", cookie=cookie)
     config, _ = request(app.port, "GET", "/api/config")
     require(not config["has_icon"], "icon reset was not reported")

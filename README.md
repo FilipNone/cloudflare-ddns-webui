@@ -339,6 +339,7 @@ cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
 cargo build --locked --release
 node --check web/app.js
+(for f in web/js/*.js; do node --check "$f" || exit 1; done)
 node --test web/app.test.cjs web/appearance.test.cjs
 python3 scripts/smoke-test.py
 ```

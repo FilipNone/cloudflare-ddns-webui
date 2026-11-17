@@ -6,7 +6,11 @@ const path = require("node:path");
 const test = require("node:test");
 const vm = require("node:vm");
 
-const source = fs.readFileSync(path.join(__dirname, "app.js"), "utf8");
+const html = fs.readFileSync(path.join(__dirname, "index.html"), "utf8");
+// index.html is the one list of scripts and their load order; /static/<file> is web/<file>.
+const scriptFiles = [...html.matchAll(/<script\b[^>]*\bsrc="\/static\/([^"?]+)/g)].map((match) => match[1]);
+const scriptSources = scriptFiles.map((file) => fs.readFileSync(path.join(__dirname, file), "utf8"));
+const source = scriptSources.join("\n");
 const css = fs.readFileSync(path.join(__dirname, "style.css"), "utf8");
 const BOOT_MARKER = "(async function boot()";
 
@@ -18,11 +22,12 @@ function bootlessSource(text) {
   return text.slice(0, end);
 }
 
+// Runs every script as one, in index.html order, stopping before app.js boots.
 function loadApp(context) {
   vm.runInContext(bootlessSource(source), context);
 }
 
-module.exports = { bootlessSource, loadApp };
+module.exports = { bootlessSource, loadApp, source };
 
 function rgb(color) {
   if (color.startsWith("#")) return [1, 3, 5].map((offset) => parseInt(color.slice(offset, offset + 2), 16));
@@ -153,14 +158,48 @@ test("the test loader refuses an app.js without the boot marker", () => {
   assert.throws(() => bootlessSource("const a = 1;\n(async function start() {})();"), /boot/);
 });
 
+test("index.html loads every frontend script with defer, app.js last, and each one parses", () => {
+  const tags = [...html.matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script>/g)];
+  assert.equal(tags.length, scriptFiles.length, "every script tag needs a /static/ src");
+  for (const [tag, attributes, body] of tags) {
+    assert.match(attributes, /^ src="\/static\/[^"?]+\?v=__VERSION__" defer$/, tag);
+    assert.equal(body, "", `inline script: ${tag}`);
+  }
+  assert.equal(scriptFiles.at(-1), "app.js");
+  assert.equal(new Set(scriptFiles).size, scriptFiles.length, "a script is listed twice");
+  const onDisk = fs.readdirSync(path.join(__dirname, "js")).filter((name) => name.endsWith(".js")).map((name) => `js/${name}`);
+  assert.deepEqual(scriptFiles.slice(0, -1).sort(), onDisk.sort(), "web/js/ and index.html list different files");
+  scriptFiles.forEach((file, index) => {
+    assert.ok(fs.existsSync(path.join(__dirname, file)), file);
+    assert.doesNotThrow(() => new vm.Script(scriptSources[index], { filename: file }), file);
+    assert.equal(scriptSources[index].includes(BOOT_MARKER), file === "app.js", file);
+  });
+});
+
+// Concatenation hoists functions across files, which a browser does not do,
+// so this test also runs the files as separate scripts in the same context.
+test("each script loads on its own in index.html order", () => {
+  const context = vm.createContext({
+    document: { documentElement: node("html"), addEventListener() {} },
+    localStorage: { getItem: () => null, setItem() {} },
+    location: { hash: "" },
+    window: { matchMedia: () => ({ matches: false, addEventListener() {} }), addEventListener() {} },
+    setTimeout, clearTimeout, console, URL,
+  });
+  scriptFiles.forEach((file, index) => {
+    const text = file === "app.js" ? bootlessSource(scriptSources[index]) : scriptSources[index];
+    assert.doesNotThrow(() => new vm.Script(text, { filename: file }).runInContext(context), file);
+  });
+  assert.equal(vm.runInContext("typeof render === 'function' && state.route", context), "dashboard");
+});
+
 test("every class selector in style.css is used by the frontend", () => {
-  const html = fs.readFileSync(path.join(__dirname, "index.html"), "utf8");
   let selectors = css.replace(/\/\*[\s\S]*?\*\//g, "");
   while (/\{[^{}]*\}/.test(selectors)) selectors = selectors.replace(/\{[^{}]*\}/g, " ");
   const classes = new Set([...selectors.matchAll(/\.([a-zA-Z_][\w-]*)/g)].map((match) => match[1]));
   const unused = [...classes].filter((name) => !new RegExp(`(?<![\\w-])${name}(?![\\w-])`).test(source + html));
   assert.deepEqual(unused, []);
-  // Word matches cannot catch these, because the words also appear elsewhere in app.js.
+  // Word matches cannot catch these, because the words also appear elsewhere in the scripts.
   for (const selector of ["textarea.input", ".qr-box img", ".badge.orange", ".mselect-group", ".checkbox.checked", ".checkbox.indeterminate"]) {
     assert.equal(css.includes(selector), false, selector);
   }

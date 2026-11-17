@@ -6,9 +6,8 @@ const path = require("node:path");
 const test = require("node:test");
 const vm = require("node:vm");
 // CI runs only this file, so it pulls in the appearance suite and shares its loader.
-const { loadApp } = require("./appearance.test.cjs");
-
-const appSource = fs.readFileSync(path.join(__dirname, "app.js"), "utf8");
+// appSource is every script that index.html loads, joined in load order.
+const { loadApp, source: appSource } = require("./appearance.test.cjs");
 
 function classes(initial = []) {
   const names = new Set(initial);
@@ -20,7 +19,7 @@ function classes(initial = []) {
   };
 }
 
-// The session flags each auth call site in app.js must pass to api().
+// The session flags each auth call site in the frontend must pass to api().
 const SESSION_FLAGS = {
   setup: { rotatesSession: true, clearsRecoveryCodes: true },
   login: { rotatesSession: true, clearsRecoveryCodes: true },
@@ -1093,7 +1092,11 @@ test("auth call sites declare how they change the session", () => {
     assert.deepEqual(flags, { rotatesSession: false, clearsRecoveryCodes: false, ...SESSION_FLAGS[endpoint] }, endpoint);
   }
   for (const endpoint of Object.keys(SESSION_FLAGS)) assert.ok(seen.has(endpoint), endpoint);
-  assert.doesNotMatch(appSource.slice(appSource.indexOf("async function api("), appSource.indexOf("/* ================= Modern select")), /"\/api\/auth\/(?:setup|login|logout|password|2fa)/);
+  // The body of api() itself, up to its closing brace at the start of a line.
+  const apiStart = appSource.indexOf("async function api(");
+  const apiBody = appSource.slice(apiStart, appSource.indexOf("\n}\n", apiStart));
+  assert.match(apiBody, /await fetch\(path, init\)/);
+  assert.doesNotMatch(apiBody, /"\/api\/auth\/(?:setup|login|logout|password|2fa)/);
 });
 
 test("logout invalidates and renders once", async () => {
@@ -1112,8 +1115,13 @@ test("logout invalidates and renders once", async () => {
 });
 
 test("user-visible strings come from the translation table", () => {
+  // All script code except the I18N table itself.
+  const tableStart = appSource.indexOf("const I18N = {");
+  const tableEnd = appSource.indexOf("\n};\n", tableStart);
+  assert.ok(tableStart > 0 && tableEnd > tableStart);
+  const code = appSource.slice(0, tableStart) + appSource.slice(tableEnd);
   for (const literal of [/title="Refresh"/, /"Custom color"/, /textContent = "Default"/, /"File too large/, /"Authentication changed/, /"network error/]) {
-    assert.doesNotMatch(appSource.slice(appSource.indexOf("/* ================= Icons")), literal);
+    assert.doesNotMatch(code, literal);
   }
 });
 

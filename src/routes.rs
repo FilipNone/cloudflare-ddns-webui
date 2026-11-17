@@ -26,8 +26,33 @@ const SECURE_SESSION_COOKIE: &str = "__Host-cfddns_session";
 static INDEX_HTML: LazyLock<String> =
     LazyLock::new(|| include_str!("../web/index.html").replace("__VERSION__", VERSION));
 const STYLE_CSS: &str = include_str!("../web/style.css");
-const APP_JS: &str = include_str!("../web/app.js");
 const FAVICON_SVG: &str = include_str!("../web/favicon.svg");
+
+const JAVASCRIPT: &str = "application/javascript; charset=utf-8";
+
+/// Embeds `web/<file>` as a script served at `/static/<file>`.
+macro_rules! script {
+    ($file:literal) => {
+        (
+            concat!("/static/", $file),
+            include_str!(concat!("../web/", $file)),
+        )
+    };
+}
+
+/// Path and body of every script that index.html loads.
+const SCRIPTS: &[(&str, &str)] = &[
+    script!("js/core.js"),
+    script!("js/i18n.js"),
+    script!("js/ui.js"),
+    script!("js/api.js"),
+    script!("js/login.js"),
+    script!("js/dashboard.js"),
+    script!("js/records.js"),
+    script!("js/record-modals.js"),
+    script!("js/settings.js"),
+    script!("app.js"),
+];
 
 const PROXIABLE_TYPES: [&str; 3] = ["A", "AAAA", "CNAME"];
 pub const GITHUB_URL: &str = "https://github.com/FilipNone/cloudflare-ddns-webui";
@@ -355,13 +380,15 @@ fn static_file(state: &AppState, path: &str) -> Option<Response> {
         }
         // Always the built-in cloud, even after a custom favicon upload.
         "/static/default-logo.svg" => Response::new(200, "image/svg+xml", FAVICON_SVG),
-        "/static/app.js" => Response::new(200, "application/javascript; charset=utf-8", APP_JS),
         "/static/favicon.svg" => match state.ui.icon() {
             Some((mime, data)) => Response::new(200, &mime, data)
                 .header("Content-Security-Policy", "sandbox; default-src 'none'"),
             None => Response::new(200, "image/svg+xml", FAVICON_SVG),
         },
-        _ => return None,
+        _ => {
+            let (_, body) = SCRIPTS.iter().find(|(file, _)| *file == path)?;
+            Response::new(200, JAVASCRIPT, *body)
+        }
     };
     Some(resp.header("Cache-Control", "no-cache"))
 }
@@ -1465,6 +1492,51 @@ mod tests {
             policies,
             [CONTENT_SECURITY_POLICY, "sandbox; default-src 'none'"]
         );
+    }
+
+    #[tokio::test]
+    async fn every_script_in_index_html_is_served_as_javascript() {
+        let fixture = Fixture::new().await;
+        let html = String::from_utf8(fixture.get("/").await.body).unwrap();
+        let mut listed = Vec::new();
+        for tag in html.split("<script").skip(1) {
+            let (attributes, rest) = tag.split_once('>').unwrap();
+            // Any text before </script> would be an inline script.
+            assert!(rest.starts_with("</script>"), "inline script: {tag}");
+            let src = attributes
+                .split_once(" src=\"")
+                .and_then(|(_, rest)| rest.split_once('"'))
+                .map(|(src, _)| src)
+                .unwrap_or_else(|| panic!("script without src: {attributes}"));
+            let path = src
+                .strip_suffix(&format!("?v={VERSION}"))
+                .unwrap_or_else(|| panic!("{src} lacks the version query"));
+            let resp = fixture.get(path).await;
+            assert_eq!(
+                (resp.status, resp.content_type.as_str()),
+                (200, JAVASCRIPT),
+                "{path}"
+            );
+            assert!(!resp.body.is_empty(), "{path}");
+            assert_eq!(header(&resp, "Cache-Control"), Some("no-cache"), "{path}");
+            listed.push(path);
+        }
+        assert_eq!(listed.last(), Some(&"/static/app.js"));
+        let mut served: Vec<&str> = SCRIPTS.iter().map(|(path, _)| *path).collect();
+        listed.sort_unstable();
+        served.sort_unstable();
+        assert_eq!(
+            listed, served,
+            "index.html and SCRIPTS list different files"
+        );
+        for path in [
+            "/static/js/missing.js",
+            "/static/js/",
+            "/static/core.js",
+            "/js/core.js",
+        ] {
+            assert_eq!(fixture.get(path).await.status, 404, "{path}");
+        }
     }
 
     #[tokio::test]

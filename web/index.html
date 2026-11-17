@@ -12,6 +12,16 @@
 <div id="app"><div class="boot-splash"><div class="spinner"></div></div></div>
 <div id="modal-root"></div>
 <div id="toast-root" aria-live="polite"></div>
+<!-- Scripts run in this order and share one global scope. app.js starts the app, so it stays last. -->
+<script src="/static/js/core.js?v=__VERSION__" defer></script>
+<script src="/static/js/i18n.js?v=__VERSION__" defer></script>
+<script src="/static/js/ui.js?v=__VERSION__" defer></script>
+<script src="/static/js/api.js?v=__VERSION__" defer></script>
+<script src="/static/js/login.js?v=__VERSION__" defer></script>
+<script src="/static/js/dashboard.js?v=__VERSION__" defer></script>
+<script src="/static/js/records.js?v=__VERSION__" defer></script>
+<script src="/static/js/record-modals.js?v=__VERSION__" defer></script>
+<script src="/static/js/settings.js?v=__VERSION__" defer></script>
 <script src="/static/app.js?v=__VERSION__" defer></script>
 </body>
 </html>
