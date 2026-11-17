@@ -13,6 +13,7 @@ import importlib.util
 import io
 import ipaddress
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -73,6 +74,7 @@ MAX_CONNECTIONS = 16              # MAX_CONNECTIONS in src/http.rs
 MAX_BODY_BYTES = 2 * 1024 * 1024  # MAX_BODY_SIZE in src/http.rs
 MAX_ICON_BYTES = 512 * 1024       # MAX_ICON_BYTES in src/customize.rs
 MAX_BULK_IDS = 500                # bulk limit in src/routes.rs
+BATCH_LIMIT = 200                 # BATCH_LIMIT in src/cloudflare.rs
 MAX_2FA_ATTEMPTS = 5              # MAX_2FA_ATTEMPTS in src/auth.rs
 CONTAINER_ID = 65534              # UID and GID of the image's non-root user
 
@@ -175,6 +177,33 @@ def check_reference_parsers(module):
     require([r["ttl"] for r in inherited] == [600, 600], "mock fails standard last explicit TTL inheritance")
 
 
+def check_mock_batch(module):
+    """The mock's batch endpoint must be all or nothing, like Cloudflare's."""
+    rows = copy.deepcopy(next(iter(module.RECORDS.values())))
+    before = copy.deepcopy(rows)
+    first, second = rows[0]["id"], rows[1]["id"]
+    for payload in ({"deletes": [{"id": first}], "patches": [{"id": "0" * 32, "ttl": 600}]},
+                    {"deletes": [{"id": first}, {"id": first}]},
+                    {"deletes": [{"id": first}], "patches": [{"id": first, "ttl": 600}]}):
+        status, reply = module.apply_batch(rows, payload)
+        require(status == 404 and reply["errors"][0]["code"] == 81044 and rows == before,
+                "mock batch applied part of a failing batch")
+    # The limit counts every item in the batch, whatever its operation.
+    missing = {"id": "0" * 32}
+    status, reply = module.apply_batch(rows, {"deletes": [missing] * (BATCH_LIMIT // 2),
+                                              "patches": [missing] * (BATCH_LIMIT // 2 + 1)})
+    require(status == 400 and reply["success"] is False and reply["errors"][0]["code"]
+            and rows == before, "mock batch accepted more than the 200 record limit")
+    status, _ = module.apply_batch(rows, {"deletes": [missing] * BATCH_LIMIT})
+    require(status == 404, "mock batch refused a batch at the 200 record limit")
+    status, reply = module.apply_batch(rows, {"deletes": [{"id": first}],
+                                              "patches": [{"id": second, "ttl": 600}]})
+    require(status == 200 and [r["id"] for r in reply["result"]["deletes"]] == [first]
+            and [r["id"] for r in rows] == [r["id"] for r in before[1:]]
+            and rows[0] == {**before[1], "ttl": 600, "modified_on": rows[0]["modified_on"]},
+            "mock batch did not apply its deletes and then its patches")
+
+
 def load_mock():
     sys.dont_write_bytecode = True
     spec = importlib.util.spec_from_file_location(
@@ -184,6 +213,7 @@ def load_mock():
     spec.loader.exec_module(module)
     check_fixture_privacy(module)
     check_reference_parsers(module)
+    check_mock_batch(module)
     return module
 
 
@@ -258,8 +288,11 @@ class FaultInjection:
     def _mutation(self, owner, method, api_path, body):
         with owner.lock:
             owner.writes += 1
+            owner.mutations.append((method, api_path))
         if method == "POST" and api_path.endswith("/dns_records/import") and owner.malformed_import:
             return self._json(malformed_reply(owner.malformed_import))
+        if method == "POST" and api_path.endswith("/dns_records/batch"):
+            return self._batch(owner, body)
         record_id = api_path.rsplit("/", 1)[-1]
         if method != "POST":
             owner.hold_mutation(record_id)
@@ -270,6 +303,17 @@ class FaultInjection:
             if payload.get("name") in owner.fail_names:
                 return self._json(owner.module.error_envelope("synthetic upstream create failure"), 503)
         return super().route(method, body)
+
+    def _batch(self, owner, body):
+        """Apply the per-record hold and failure faults to every batch item.
+        One failing item fails the whole batch before anything changes, as
+        Cloudflare does."""
+        ids = owner.module.batch_item_ids(owner.module.json_object(body))
+        for record_id in ids:
+            owner.hold_mutation(record_id)
+        if any(record_id in owner.fail_ids for record_id in ids):
+            return self._json(owner.module.error_envelope("synthetic upstream write failure"), 503)
+        return super().route("POST", body)
 
 
 class IPv6Server(ThreadingHTTPServer):
@@ -282,6 +326,7 @@ class Mock:
         # Guards the counters and hold flags below. Records use module.LOCK.
         self.lock = threading.Lock()
         self.writes = 0
+        self.mutations = []  # (method, API path) of each write request
         self.calls = 0
         self.provider_calls = {}
         self.fail_ids = set()
@@ -347,6 +392,11 @@ class Mock:
         """The live mock records, locked against handler threads for the block."""
         with self.module.LOCK:
             yield self.module.RECORDS
+
+    def mutation_count(self, method, suffix=""):
+        """How many write requests used `method` on a path ending with `suffix`."""
+        with self.lock:
+            return sum(1 for m, path in self.mutations if m == method and path.endswith(suffix))
 
     def count_provider_call(self, path):
         with self.lock:
@@ -749,6 +799,16 @@ def setup_session(app, overrides=None):
     return create_admin(app)
 
 
+def add_synthetic_records(mock, zone, count, prefix):
+    """Add `count` A records under example.com with documentation addresses
+    to the mock zone and return their IDs."""
+    rows = [mock.module.rec("A", f"{prefix}-{i}.example.com", f"198.51.100.{i % 254 + 1}", ttl=300)
+            for i in range(count)]
+    with mock.records() as records:
+        records[zone].extend(rows)
+    return [row["id"] for row in rows]
+
+
 def totp(secret, timestamp=None):
     key = base64.b32decode(secret.upper() + "=" * (-len(secret) % 8))
     counter = int(time.time() if timestamp is None else timestamp) // TOTP_STEP
@@ -1086,27 +1146,66 @@ def metadata_smoke(app, mock):
     other, _ = request(app.port, "POST", path, {**basic, "name": "partial.example.com"},
                         cookie=cookie, expected=201)
     mock.fail_ids.add(other["id"])
-    for action, patch in (("update", {"comment": "partial-success"}), ("delete", None)):
-        failed_before = stored(other["id"])
-        result, _ = request(app.port, "POST", path + "/bulk",
-                             {"action": action, "ids": [rid, other["id"]], "patch": patch}, cookie=cookie)
-        require(result["succeeded"] == 1 and result["failed"] == 1
-                and len(result["results"]) == 2, "partial bulk failure totals are inaccurate")
-        results = {r["id"]: r for r in result["results"]}
-        require(results[rid]["ok"] and not results[other["id"]]["ok"]
-                and results[other["id"]]["error"], "bulk hid per-record upstream failure")
+    # With the failing record, these fill the first batch and push rid into a second one.
+    filler = add_synthetic_records(mock, zone, BATCH_LIMIT - 1, "filler")
+    # Update fails through fault injection, because the app lists the zone first
+    # and refuses an unknown ID. Delete sends an ID that names no record, so the
+    # mock's own batch check rejects it. That ID goes last, so a mock that
+    # applied items one at a time would already have changed the ones before it.
+    missing = "0" * 32
+    for action, patch, bad, error in (
+            ("update", {"comment": "partial-success"}, other["id"], "synthetic upstream write failure"),
+            ("delete", None, missing, "[81044] Record not found")):
+        bulk_failure_checks(app, mock, cookie, zone, action, patch, error, [rid, bad], [])
+        bulk_failure_checks(app, mock, cookie, zone, action, patch, error, [*filler, bad], [rid])
         records = mock.snapshot()[1][zone]
-        require(find_record(records, "partial upstream failure removed the failed record",
-                            id=other["id"]) == failed_before,
-                "partial upstream failure changed the failed record")
         if action == "update":
             require(find_record(records, "partial update lost the successful record",
                                 id=rid)["comment"] == "partial-success",
-                    "partial result claimed success without applying the successful patch")
+                    "partial result claimed success without applying the successful batch")
         else:
             require(all(r["id"] != rid for r in records),
-                    "partial delete claimed success without deleting the successful record")
-    print("PASS PUT/bulk metadata keep/set/clear, proxy TTL and per-record partial failures")
+                    "partial delete claimed success without deleting the successful batch")
+    mock.fail_ids.clear()
+    count = 2 * BATCH_LIMIT + 50
+    ids = add_synthetic_records(mock, zone, count, "batch")
+    batches = mock.mutation_count("POST", "/dns_records/batch")
+    deletes = mock.mutation_count("DELETE")
+    result, _ = request(app.port, "POST", path + "/bulk", {"action": "delete", "ids": ids}, cookie=cookie)
+    require(result["succeeded"] == count and result["failed"] == 0, "bulk delete of full batches failed")
+    require(mock.mutation_count("POST", "/dns_records/batch") - batches == math.ceil(count / BATCH_LIMIT)
+            and mock.mutation_count("DELETE") == deletes,
+            f"bulk delete of {count} records did not send ceil({count}/{BATCH_LIMIT}) batches "
+            "and no per-record DELETE")
+    require(not {r["id"] for r in mock.snapshot()[1][zone]} & set(ids), "bulk delete left records behind")
+    print("PASS PUT/bulk metadata keep/set/clear, proxy TTL, all-or-nothing batches and batch counts")
+
+
+def bulk_failure_checks(app, mock, cookie, zone, action, patch, error, failing, passing):
+    """Bulk `failing` + `passing` while a record in `failing` makes its batch fail.
+
+    `passing` must start a new batch, so it shares no batch with `failing`.
+    Every record in `failing` must be reported failed with `error`, no record
+    outside `passing` may change, and the batch with `passing` must still be sent.
+    """
+    ids = [*failing, *passing]
+    before = mock.snapshot()
+    batches = mock.mutation_count("POST", "/dns_records/batch")
+    result, _ = request(app.port, "POST", f"/api/zones/{zone}/records/bulk",
+                         {"action": action, "ids": ids, "patch": patch}, cookie=cookie)
+    require(result["succeeded"] == len(passing) and result["failed"] == len(failing)
+            and len(result["results"]) == len(ids), "bulk batch failure totals are inaccurate")
+    results = {r["id"]: r for r in result["results"]}
+    require(all(not results[i]["ok"] and error in results[i]["error"] for i in failing)
+            and all(results[i]["ok"] for i in passing),
+            "bulk did not fail every record of the failed batch")
+    sent = math.ceil(len(ids) / BATCH_LIMIT)
+    require(mock.mutation_count("POST", "/dns_records/batch") == batches + sent
+            and mock.snapshot()[0] == before[0] + sent,
+            "bulk stopped after a failed batch or wrote outside the batch endpoint")
+    prior = {r["id"]: r for r in before[1][zone] if r["id"] not in passing}
+    now = {r["id"]: r for r in mock.snapshot()[1][zone] if r["id"] not in passing}
+    require(now == prior, "a failed batch changed some of its records")
 
 
 def identifier_smoke(app, mock):
@@ -1607,14 +1706,16 @@ def concurrent_ddns_smoke(app, mock):
 def bulk_revocation_smoke(app, mock):
     cookie = setup_session(app)
     zone = mock.module.ZONES[0]["id"]
+    # More than one batch, so the session can end before the second is sent.
+    ids = add_synthetic_records(mock, zone, BATCH_LIMIT + 50, "revoke")
+    sent, unsent = ids[:BATCH_LIMIT], ids[BATCH_LIMIT:]
     before = mock.snapshot()
-    ids = [r["id"] for r in before[1][zone]][:2]
     mock.hold_mutation_id = ids[0]
     bulk = Background(lambda: request(app.port, "POST", f"/api/zones/{zone}/records/bulk",
                                       {"action": "delete", "ids": ids}, cookie=cookie)[0]).start()
     try:
         require(mock.mutation_entered.wait(timeout=HOLD_TIMEOUT),
-                "first bulk delete did not reach the upstream hold")
+                "first bulk batch did not reach the upstream hold")
         new_cookie = revoke_by_password_change(app, cookie)
         request(app.port, "GET", "/api/auth/me", cookie=new_cookie)
     finally:
@@ -1622,16 +1723,17 @@ def bulk_revocation_smoke(app, mock):
         bulk.join()
     require(bulk.ok(), "bulk after revocation did not settle: " + background_errors(bulk))
     result = bulk.result
-    require(result["succeeded"] == 1 and result["failed"] == 1,
+    require(result["succeeded"] == len(sent) and result["failed"] == len(unsent),
             "bulk continued reporting full success after session revocation")
     per_record = {r["id"]: r for r in result["results"]}
-    require(per_record[ids[0]]["ok"] and not per_record[ids[1]]["ok"]
-            and per_record[ids[1]]["error"], "bulk failed to report unsent revoked item")
+    require(all(per_record[i]["ok"] for i in sent), "bulk hid the batch sent before revocation")
+    require(all(not per_record[i]["ok"] and per_record[i]["error"] for i in unsent),
+            "bulk failed to report unsent revoked items")
     after = mock.snapshot()
-    require(after[0] == before[0] + 1 and all(r["id"] != ids[0] for r in after[1][zone])
-            and any(r["id"] == ids[1] for r in after[1][zone]),
+    remaining = {r["id"] for r in after[1][zone]}
+    require(after[0] == before[0] + 1 and not remaining & set(sent) and set(unsent) <= remaining,
             "bulk sent a new upstream mutation after originating session was revoked")
-    print("PASS session revocation stops unsent bulk writes and reports partial outcome")
+    print("PASS session revocation stops unsent bulk batches and reports partial outcome")
 
 
 def ddns_revocation_smoke(app, mock):

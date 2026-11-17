@@ -105,6 +105,71 @@ def reset_records(records):
         RECORDS.update(copy.deepcopy(records))
 
 
+# Batch operation lists in the order Cloudflare applies them.
+BATCH_KEYS = ("deletes", "patches", "puts", "posts")
+# Free plan limit on the items in one batch, the smallest of any plan.
+BATCH_LIMIT = 200
+PATCH_FIELDS = ("content", "ttl", "proxied", "comment", "tags", "priority", "data", "name")
+
+
+def batch_item_ids(payload):
+    """Record IDs named by a batch body, in Cloudflare's order. Skips malformed items."""
+    ids = []
+    for key in BATCH_KEYS:
+        items = payload.get(key) if isinstance(payload, dict) else None
+        for item in items if isinstance(items, list) else []:
+            if isinstance(item, dict) and isinstance(item.get("id"), str):
+                ids.append(item["id"])
+    return ids
+
+
+def apply_batch(records, payload):
+    """Apply a batch body to `records` like Cloudflare: check every item first,
+    and change nothing when one fails. Returns (status, reply).
+
+    Only deletes and patches are supported. Records are changed in place, so
+    callers that hold a record dict see the update.
+    """
+    if payload is None:
+        return 400, error_envelope("request body must be a JSON object")
+    unknown = sorted(set(payload) - set(BATCH_KEYS))
+    if unknown:
+        return 400, error_envelope(f"unknown batch field {unknown[0]}")
+    if payload.get("puts") or payload.get("posts"):
+        return 400, error_envelope("mock: batch puts and posts are not supported")
+    lists = {key: payload.get(key, []) for key in ("deletes", "patches")}
+    for key, items in lists.items():
+        if not isinstance(items, list):
+            return 400, error_envelope(f"{key} must be a list")
+    if sum(len(items) for items in lists.values()) > BATCH_LIMIT:
+        return 400, error_envelope(f"a batch may contain at most {BATCH_LIMIT} records")
+    by_id = {r["id"]: r for r in records}
+    deleted = set()
+    for key, items in lists.items():
+        for item in items:
+            rid = item.get("id") if isinstance(item, dict) else None
+            if not isinstance(rid, str):
+                return 400, error_envelope(f"every item in {key} needs an id")
+            # A record deleted earlier in the batch no longer exists for later items.
+            if rid not in by_id or rid in deleted:
+                return 404, error_envelope("Record not found", 81044)
+            if key == "deletes":
+                deleted.add(rid)
+    result = {key: [] for key in BATCH_KEYS}
+    for item in payload.get("deletes", []):
+        found = by_id[item["id"]]
+        records.remove(found)
+        result["deletes"].append(found)
+    for item in payload.get("patches", []):
+        found = by_id[item["id"]]
+        for k in PATCH_FIELDS:
+            if k in item:
+                found[k] = item[k]
+        found["modified_on"] = "2026-07-29T18:30:00.000000Z"
+        result["patches"].append(found)
+    return 200, envelope(result)
+
+
 def parse_bind(text, zone_name):
     """Parse the synthetic import subset; reject unhandled syntax, never invent rows."""
     origin = zone_name + "."
@@ -337,6 +402,10 @@ class Handler(BaseHTTPRequestHandler):
                 added += 1
             return 200, envelope({"recs_added": added, "total_records_parsed": len(imported)})
 
+        # Checked before the record ID routes below, which would read "batch" as an ID.
+        if rest == ["batch"] and method == "POST":
+            return apply_batch(records, json_object(body))
+
         if len(rest) == 1:
             rid = rest[0]
             found = next((r for r in records if r["id"] == rid), None)
@@ -349,7 +418,7 @@ class Handler(BaseHTTPRequestHandler):
                 payload = json_object(body)
                 if payload is None:
                     return 400, error_envelope("request body must be a JSON object")
-                for k in ("content", "ttl", "proxied", "comment", "tags", "priority", "data", "name"):
+                for k in PATCH_FIELDS:
                     if k in payload:
                         found[k] = payload[k]
                 found["modified_on"] = "2026-07-29T18:30:00.000000Z"

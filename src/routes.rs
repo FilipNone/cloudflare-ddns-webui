@@ -3,8 +3,8 @@
 
 use crate::auth::{Auth, AuthError, Login2faOutcome, LoginStep1Outcome};
 use crate::cloudflare::{
-    ApiFailure, CaaData, CloudflareClient, RecordData, RecordPatch, RecordPayload, SrvData,
-    SvcbData,
+    ApiFailure, BatchDelete, BatchPatch, BatchRequest, CaaData, CloudflareClient, DnsRecord,
+    RecordData, RecordPatch, RecordPayload, SrvData, SvcbData, BATCH_LIMIT,
 };
 use crate::config::{bare_url, host_ip, is_loopback_host, valid_ttl, Config, MAX_RECORD_COMMENT};
 use crate::customize::{UiError, UiStore};
@@ -952,7 +952,8 @@ fn require_content(content: Option<&str>) -> Result<(), String> {
 
 // --- Bulk operations ---
 // Bulk requests answer 200 with one result per record; the counts tell the
-// caller whether some writes failed.
+// caller whether some writes failed. Writes go to Cloudflare's batch endpoint
+// in chunks of at most BATCH_LIMIT records.
 
 async fn bulk(state: &AppState, req: &Request, zone_id: &str) -> Result<Response, Response> {
     let body: BulkBody = json_body(req)?;
@@ -983,13 +984,6 @@ fn unsent(id: &str) -> Value {
     json!({ "id": id, "ok": false, "error": "session expired or revoked; write not sent" })
 }
 
-fn bulk_result<T>(id: &str, result: Result<T, ApiFailure>) -> Value {
-    match result {
-        Ok(_) => json!({ "id": id, "ok": true }),
-        Err(e) => json!({ "id": id, "ok": false, "error": e.to_string() }),
-    }
-}
-
 fn bulk_response(results: Vec<Value>) -> Response {
     let succeeded = results.iter().filter(|r| r["ok"] == true).count();
     let failed = results.len().saturating_sub(succeeded);
@@ -999,16 +993,52 @@ fn bulk_response(results: Vec<Value>) -> Response {
     )
 }
 
-async fn bulk_delete(state: &AppState, req: &Request, zone_id: &str, ids: &[String]) -> Response {
+/// Sends the batches in order and returns one result per record. Every
+/// record in a failed batch is reported as failed: a Cloudflare error reply
+/// means none of them changed, and a lost reply carries an error saying the
+/// outcome is unknown. Later batches are still sent. The session is checked
+/// before each batch; once it has ended, no further batch is sent.
+async fn send_batches(
+    state: &AppState,
+    req: &Request,
+    zone_id: &str,
+    batches: Vec<BatchRequest>,
+) -> Response {
     let mut results = Vec::new();
-    for id in ids {
-        if !authenticated(state, req) {
-            results.push(unsent(id));
+    let mut signed_in = true;
+    for batch in &batches {
+        signed_in = signed_in && authenticated(state, req);
+        if !signed_in {
+            results.extend(batch.ids().map(unsent));
             continue;
         }
-        results.push(bulk_result(id, state.cf.delete_record(zone_id, id).await));
+        match state.cf.batch(zone_id, batch).await {
+            Ok(()) => results.extend(batch.ids().map(|id| json!({ "id": id, "ok": true }))),
+            Err(e) => {
+                let error = e.to_string();
+                results.extend(
+                    batch
+                        .ids()
+                        .map(|id| json!({ "id": id, "ok": false, "error": error })),
+                );
+            }
+        }
     }
     bulk_response(results)
+}
+
+async fn bulk_delete(state: &AppState, req: &Request, zone_id: &str, ids: &[String]) -> Response {
+    let batches = ids
+        .chunks(BATCH_LIMIT)
+        .map(|chunk| BatchRequest {
+            deletes: chunk
+                .iter()
+                .map(|id| BatchDelete { id: id.clone() })
+                .collect(),
+            ..BatchRequest::default()
+        })
+        .collect();
+    send_batches(state, req, zone_id, batches).await
 }
 
 async fn bulk_update(
@@ -1070,13 +1100,7 @@ async fn bulk_update(
         content: None,
     };
 
-    let mut results = Vec::new();
-    for record in records {
-        let id = &record.id;
-        if !authenticated(state, req) {
-            results.push(unsent(id));
-            continue;
-        }
+    let record_patch = |record: &DnsRecord| {
         let mut record_patch = cf_patch.clone();
         if patch.proxied != Some(false)
             && record.proxied == Some(true)
@@ -1084,12 +1108,19 @@ async fn bulk_update(
         {
             record_patch.ttl = Some(1);
         }
-        results.push(bulk_result(
-            id,
-            state.cf.patch_record(zone_id, id, &record_patch).await,
-        ));
-    }
-    Ok(bulk_response(results))
+        BatchPatch {
+            id: record.id.clone(),
+            patch: record_patch,
+        }
+    };
+    let batches = records
+        .chunks(BATCH_LIMIT)
+        .map(|chunk| BatchRequest {
+            patches: chunk.iter().copied().map(&record_patch).collect(),
+            ..BatchRequest::default()
+        })
+        .collect();
+    Ok(send_batches(state, req, zone_id, batches).await)
 }
 
 #[cfg(test)]
@@ -1140,12 +1171,65 @@ mod tests {
     const PASSWORD: &str = "synthetic-password";
     const ZONE: &str = "0123456789abcdef0123456789abcdef";
 
+    /// One request that reached the fake Cloudflare upstream.
+    struct Upstream {
+        method: String,
+        path: String,
+        body: Value,
+    }
+
+    /// Picks the fake upstream's reply. `None` closes the connection unanswered.
+    type Responder = Box<dyn FnMut(&Upstream) -> Option<(u16, Value)> + Send>;
+
+    /// Reads one request with a Content-Length body, or `None` if the
+    /// connection ends first.
+    async fn read_upstream(socket: &mut tokio::net::TcpStream) -> Option<Upstream> {
+        use tokio::io::AsyncReadExt;
+        let mut data = Vec::new();
+        let mut buffer = [0; 8192];
+        let end = loop {
+            if let Some(end) = data.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                break end + 4;
+            }
+            let count = socket.read(&mut buffer).await.ok()?;
+            if count == 0 {
+                return None;
+            }
+            data.extend_from_slice(&buffer[..count]);
+        };
+        let head = String::from_utf8(data[..end].to_vec()).ok()?;
+        let mut line = head.lines().next()?.split(' ');
+        let (method, path) = (line.next()?.to_owned(), line.next()?.to_owned());
+        let length = head
+            .lines()
+            .find_map(|line| {
+                let (key, value) = line.split_once(':')?;
+                key.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())
+                    .flatten()
+            })
+            .unwrap_or(0);
+        while data.len() < end + length {
+            let count = socket.read(&mut buffer).await.ok()?;
+            if count == 0 {
+                return None;
+            }
+            data.extend_from_slice(&buffer[..count]);
+        }
+        let body = serde_json::from_slice(&data[end..]).unwrap_or(Value::Null);
+        Some(Upstream { method, path, body })
+    }
+
     /// App state over a temporary data directory. Cloudflare calls go to a
-    /// loopback listener that counts connections and closes them unanswered.
+    /// loopback listener that counts connections, logs each request and
+    /// answers with the current responder. The default responder closes each
+    /// connection unanswered.
     struct Fixture {
         dir: std::path::PathBuf,
         state: Arc<AppState>,
         upstream_hits: Arc<std::sync::atomic::AtomicUsize>,
+        upstream_log: Arc<std::sync::Mutex<Vec<Upstream>>>,
+        responder: Arc<std::sync::Mutex<Responder>>,
         upstream: tokio::task::JoinHandle<()>,
     }
 
@@ -1166,11 +1250,32 @@ mod tests {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let api_base = format!("http://{}/client/v4", listener.local_addr().unwrap());
             let upstream_hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            let hits = upstream_hits.clone();
+            let upstream_log = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let responder: Arc<std::sync::Mutex<Responder>> =
+                Arc::new(std::sync::Mutex::new(Box::new(|_| None)));
+            let (hits, log, reply) = (
+                upstream_hits.clone(),
+                upstream_log.clone(),
+                responder.clone(),
+            );
             let upstream = tokio::spawn(async move {
-                while let Ok((socket, _)) = listener.accept().await {
+                use tokio::io::AsyncWriteExt;
+                while let Ok((mut socket, _)) = listener.accept().await {
                     hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    drop(socket);
+                    let Some(request) = read_upstream(&mut socket).await else {
+                        continue;
+                    };
+                    let answer = (reply.lock().unwrap())(&request);
+                    log.lock().unwrap().push(request);
+                    if let Some((status, body)) = answer {
+                        let body = body.to_string();
+                        let response = format!(
+                            "HTTP/1.1 {status} Synthetic\r\nContent-Type: application/json\r\n\
+                             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                        let _ = socket.write_all(response.as_bytes()).await;
+                    }
                 }
             });
             let mut cfg = fixture_config();
@@ -1195,8 +1300,23 @@ mod tests {
                 dir,
                 state,
                 upstream_hits,
+                upstream_log,
+                responder,
                 upstream,
             }
+        }
+
+        /// Sets how the fake upstream answers from now on.
+        fn respond(
+            &self,
+            responder: impl FnMut(&Upstream) -> Option<(u16, Value)> + Send + 'static,
+        ) {
+            *self.responder.lock().unwrap() = Box::new(responder);
+        }
+
+        /// The requests the upstream received since the last call.
+        fn take_upstream_requests(&self) -> Vec<Upstream> {
+            std::mem::take(&mut *self.upstream_log.lock().unwrap())
         }
 
         /// Creates the admin account and returns a Cookie header for it.
@@ -1343,6 +1463,242 @@ mod tests {
             .send("POST", &path, Some(&cookie), body.as_bytes())
             .await;
         assert_eq!(resp.status, 400);
+        assert_eq!(fixture.upstream_hits(), 0);
+    }
+
+    /// A success envelope that echoes the batch body as its result.
+    fn batch_applied(request: &Upstream) -> Option<(u16, Value)> {
+        Some((
+            200,
+            json!({"success": true, "errors": [], "messages": [], "result": request.body}),
+        ))
+    }
+
+    fn record_ids(count: usize) -> Vec<String> {
+        (0..count).map(|i| format!("{i:032x}")).collect()
+    }
+
+    /// Checks that every request is a batch whose body has only `key`, and
+    /// returns the record IDs of each batch.
+    fn batched_ids(requests: &[Upstream], key: &str) -> Vec<Vec<String>> {
+        let batch_path = format!("/client/v4/zones/{ZONE}/dns_records/batch");
+        requests
+            .iter()
+            .map(|request| {
+                assert_eq!(
+                    (request.method.as_str(), request.path.as_str()),
+                    ("POST", batch_path.as_str())
+                );
+                let body = request.body.as_object().unwrap();
+                assert_eq!(body.keys().collect::<Vec<_>>(), [key]);
+                body[key]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|item| item["id"].as_str().unwrap().to_owned())
+                    .collect()
+            })
+            .collect()
+    }
+
+    async fn bulk_request(fixture: &Fixture, cookie: &str, body: Value) -> Value {
+        let path = format!("/api/zones/{ZONE}/records/bulk");
+        let resp = fixture
+            .send("POST", &path, Some(cookie), body.to_string().as_bytes())
+            .await;
+        assert_eq!(resp.status, 200);
+        body_json(&resp)
+    }
+
+    #[tokio::test]
+    async fn bulk_delete_sends_batches_of_at_most_200_records() {
+        let fixture = Fixture::new().await;
+        let cookie = fixture.login();
+        fixture.respond(batch_applied);
+        for (count, sizes) in [
+            (1, vec![1]),
+            (200, vec![200]),
+            (201, vec![200, 1]),
+            (500, vec![200, 200, 100]),
+        ] {
+            let ids = record_ids(count);
+            let result =
+                bulk_request(&fixture, &cookie, json!({"action": "delete", "ids": ids})).await;
+            let requests = fixture.take_upstream_requests();
+            for item in requests
+                .iter()
+                .flat_map(|r| r.body["deletes"].as_array().unwrap())
+            {
+                assert_eq!(item.as_object().unwrap().len(), 1, "{item}");
+            }
+            let batches = batched_ids(&requests, "deletes");
+            assert_eq!(batches.iter().map(Vec::len).collect::<Vec<_>>(), sizes);
+            assert_eq!(batches.concat(), ids);
+            let results: Vec<Value> = ids.iter().map(|id| json!({"id": id, "ok": true})).collect();
+            assert_eq!(
+                result,
+                json!({"results": results, "succeeded": count, "failed": 0})
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_batch_fails_every_record_in_it_and_later_batches_still_run() {
+        let fixture = Fixture::new().await;
+        let cookie = fixture.login();
+        let mut sent = 0;
+        fixture.respond(move |request| {
+            sent += 1;
+            if sent > 1 {
+                return batch_applied(request);
+            }
+            let errors = json!([{"code": 81044, "message": "Record not found"}]);
+            Some((
+                404,
+                json!({"success": false, "errors": errors, "result": null}),
+            ))
+        });
+        let ids = record_ids(201);
+        let result = bulk_request(&fixture, &cookie, json!({"action": "delete", "ids": ids})).await;
+        assert_eq!(
+            batched_ids(&fixture.take_upstream_requests(), "deletes").len(),
+            2
+        );
+        let mut results: Vec<Value> = ids[..200]
+            .iter()
+            .map(|id| json!({"id": id, "ok": false, "error": "[81044] Record not found"}))
+            .collect();
+        results.push(json!({"id": ids[200], "ok": true}));
+        assert_eq!(
+            result,
+            json!({"results": results, "succeeded": 1, "failed": 200})
+        );
+    }
+
+    #[tokio::test]
+    async fn unconfirmed_batch_is_reported_failed_with_an_unknown_outcome() {
+        let fixture = Fixture::new().await;
+        let cookie = fixture.login();
+        fixture.respond(|_| Some((200, json!({"success": true, "errors": [], "result": null}))));
+        let ids = record_ids(2);
+        let result = bulk_request(&fixture, &cookie, json!({"action": "delete", "ids": ids})).await;
+        assert_eq!(
+            (&result["succeeded"], &result["failed"]),
+            (&json!(0), &json!(2))
+        );
+        for item in result["results"].as_array().unwrap() {
+            assert_eq!(item["ok"], false, "{item}");
+            let error = item["error"].as_str().unwrap();
+            assert!(error.contains("outcome is unknown"), "{error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn revoking_the_session_during_a_batch_stops_the_later_ones() {
+        let fixture = Fixture::new().await;
+        let token = fixture.state.auth.setup_password_session(PASSWORD).unwrap();
+        let cookie = format!("{SESSION_COOKIE}={token}");
+        let state = fixture.state.clone();
+        fixture.respond(move |request| {
+            state.auth.destroy_session(&token);
+            batch_applied(request)
+        });
+        let ids = record_ids(401);
+        let result = bulk_request(&fixture, &cookie, json!({"action": "delete", "ids": ids})).await;
+        assert_eq!(
+            batched_ids(&fixture.take_upstream_requests(), "deletes"),
+            [ids[..200].to_vec()]
+        );
+        let mut results: Vec<Value> = ids[..200]
+            .iter()
+            .map(|id| json!({"id": id, "ok": true}))
+            .collect();
+        results.extend(ids[200..].iter().map(|id| unsent(id)));
+        assert_eq!(
+            result,
+            json!({"results": results, "succeeded": 200, "failed": 201})
+        );
+        assert_eq!(
+            results[200]["error"],
+            "session expired or revoked; write not sent"
+        );
+    }
+
+    #[tokio::test]
+    async fn bulk_update_batches_one_patch_per_record_with_only_the_changed_fields() {
+        let fixture = Fixture::new().await;
+        let cookie = fixture.login();
+        let ids = record_ids(201);
+        // The first record is proxied, so a TTL change must leave it at Auto.
+        let records: Vec<Value> = ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| {
+                json!({"id": id, "type": "A", "name": format!("r{i}.example.com"),
+                       "content": "192.0.2.1", "proxied": i == 0, "ttl": if i == 0 { 1 } else { 300 }})
+            })
+            .collect();
+        let listing = json!({"success": true, "errors": [], "result": records,
+            "result_info": {"page": 1, "per_page": 100, "total_pages": 1, "total_count": 201}});
+        fixture.respond(move |request| {
+            if request.method == "GET" {
+                return Some((200, listing.clone()));
+            }
+            batch_applied(request)
+        });
+        let synthetic = json!({"ttl": 600, "comment": "synthetic"});
+        let tags = json!({"tags": ["test:bulk"]});
+        let proxied = json!({"ttl": 1, "proxied": true});
+        let dns_only = json!({"ttl": 600, "proxied": false});
+        for (patch, first, rest) in [
+            (
+                &synthetic,
+                &json!({"ttl": 1, "comment": "synthetic"}),
+                &synthetic,
+            ),
+            (&tags, &tags, &tags),
+            (&json!({"proxied": true, "ttl": 3600}), &proxied, &proxied),
+            (&dns_only, &dns_only, &dns_only),
+        ] {
+            let body = json!({"action": "update", "ids": ids, "patch": patch});
+            let result = bulk_request(&fixture, &cookie, body).await;
+            assert_eq!(
+                (&result["succeeded"], &result["failed"]),
+                (&json!(201), &json!(0)),
+                "{patch}"
+            );
+            let requests = fixture.take_upstream_requests();
+            assert_eq!(requests[0].method, "GET");
+            let batches = batched_ids(&requests[1..], "patches");
+            assert_eq!(batches.iter().map(Vec::len).collect::<Vec<_>>(), [200, 1]);
+            let items = requests[1..]
+                .iter()
+                .flat_map(|r| r.body["patches"].as_array().unwrap());
+            for (i, item) in items.enumerate() {
+                let mut expected = if i == 0 { first.clone() } else { rest.clone() };
+                expected["id"] = json!(ids[i]);
+                assert_eq!(item, &expected, "{patch}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn bulk_checks_every_id_before_the_first_batch() {
+        let fixture = Fixture::new().await;
+        let cookie = fixture.login();
+        fixture.respond(batch_applied);
+        let path = format!("/api/zones/{ZONE}/records/bulk");
+        let mut late_bad_id = record_ids(300);
+        late_bad_id[250] = "bad.identifier".into();
+        for ids in [late_bad_id, record_ids(501)] {
+            for action in ["delete", "update"] {
+                let body = json!({"action": action, "ids": ids, "patch": {"ttl": 600}});
+                let resp = fixture
+                    .send("POST", &path, Some(&cookie), body.to_string().as_bytes())
+                    .await;
+                assert_eq!(resp.status, 400, "{action}");
+            }
+        }
         assert_eq!(fixture.upstream_hits(), 0);
     }
 

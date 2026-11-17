@@ -18,6 +18,10 @@ const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_IDENTIFIER_LEN: usize = 32;
 const MAX_IMPORT_FILENAME_LEN: usize = 128;
 const MISSING_RESULT: &str = "Cloudflare response missing result";
+/// Most records in one batch request. Cloudflare allows 200 on the Free plan
+/// and 3,500 on paid plans. The GUI cannot see the plan, so it uses the Free
+/// limit.
+pub const BATCH_LIMIT: usize = 200;
 
 // --- Envelope ---
 
@@ -145,6 +149,56 @@ pub struct RecordPatch {
     pub tags: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
+}
+
+/// A record to delete in a batch request. Cloudflare needs only its ID.
+#[derive(Debug, Serialize, Clone)]
+pub struct BatchDelete {
+    pub id: String,
+}
+
+/// A record to change in a batch request. The patch fields sit next to the
+/// ID, and Cloudflare keeps every field the patch leaves out.
+#[derive(Debug, Serialize, Clone)]
+pub struct BatchPatch {
+    pub id: String,
+    #[serde(flatten)]
+    pub patch: RecordPatch,
+}
+
+/// Body of `POST /zones/{zone_id}/dns_records/batch`. Cloudflare runs the
+/// whole batch in one transaction: if any operation fails, it applies none
+/// and replies with the first error.
+#[derive(Debug, Serialize, Clone, Default)]
+pub struct BatchRequest {
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub deletes: Vec<BatchDelete>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub patches: Vec<BatchPatch>,
+}
+
+impl BatchRequest {
+    /// The record IDs in the order Cloudflare applies them: deletes first,
+    /// then patches.
+    pub fn ids(&self) -> impl Iterator<Item = &str> {
+        self.deletes
+            .iter()
+            .map(|item| item.id.as_str())
+            .chain(self.patches.iter().map(|item| item.id.as_str()))
+    }
+}
+
+/// The record IDs in a batch reply. Cloudflare sends full records; only the
+/// IDs are needed to confirm what it applied.
+#[derive(Deserialize)]
+struct BatchResult {
+    deletes: Option<Vec<IdOnly>>,
+    patches: Option<Vec<IdOnly>>,
+}
+
+#[derive(Deserialize)]
+struct IdOnly {
+    id: String,
 }
 
 #[derive(Debug)]
@@ -361,6 +415,56 @@ impl CloudflareClient {
         Ok(())
     }
 
+    /// Send one batch of deletes and patches. `Ok` means Cloudflare confirmed
+    /// every record in it. A Cloudflare error reply means it applied none of
+    /// them. When the reply is lost, unreadable or does not list the records
+    /// sent, the outcome is unknown and the error says so.
+    pub async fn batch(&self, zone_id: &str, batch: &BatchRequest) -> Result<(), ApiFailure> {
+        validate_identifier(zone_id)?;
+        for id in batch.ids() {
+            validate_identifier(id)?;
+        }
+        let count = batch.deletes.len().saturating_add(batch.patches.len());
+        if count == 0 || count > BATCH_LIMIT {
+            return Err(input_error(&format!(
+                "a batch must contain between 1 and {BATCH_LIMIT} records"
+            )));
+        }
+        let response = self
+            .request(
+                reqwest::Method::POST,
+                &format!("zones/{zone_id}/dns_records/batch"),
+            )
+            .json(batch)
+            .send()
+            .await
+            .map_err(|error| unknown_outcome(transport_error(error)))?;
+        let status = response.status().as_u16();
+        let text = read_body(response).await.map_err(unknown_outcome)?;
+        let envelope: Envelope<serde_json::Value> = serde_json::from_str(&text).map_err(|_| {
+            unknown_outcome(bad_upstream(&format!(
+                "unexpected Cloudflare response (HTTP {status})"
+            )))
+        })?;
+        match envelope.success {
+            Some(true) if (200..300).contains(&status) => {}
+            // Cloudflare rolls back the whole batch when it reports an error.
+            Some(false) => return Err(api_errors(status, envelope.errors)),
+            _ => {
+                return Err(unknown_outcome(bad_upstream(&format!(
+                    "unexpected Cloudflare response (HTTP {status})"
+                ))))
+            }
+        }
+        if batch_confirmed(batch, envelope.result) {
+            Ok(())
+        } else {
+            Err(unknown_outcome(bad_upstream(
+                "Cloudflare reported success without listing the records in the batch",
+            )))
+        }
+    }
+
     // --- Import / export (BIND zone files, Cloudflare native endpoints) ---
 
     pub async fn export_records(&self, zone_id: &str) -> Result<String, ApiFailure> {
@@ -534,6 +638,43 @@ fn transport_error(error: reqwest::Error) -> ApiFailure {
     }
 }
 
+/// Marks a batch failure where Cloudflare may have applied the batch anyway,
+/// for example when the reply was lost after the request was sent.
+fn unknown_outcome(failure: ApiFailure) -> ApiFailure {
+    ApiFailure {
+        // Status 0 stays a transport failure; any reply counts as a bad upstream.
+        status: if failure.status == 0 { 0 } else { 502 },
+        messages: vec![format!(
+            "{failure}; the outcome is unknown, so reload the records before retrying"
+        )],
+    }
+}
+
+/// Whether a success reply lists exactly the records sent, each once. The
+/// docs do not promise an order, so the IDs are compared sorted. A missing
+/// list counts as empty.
+fn batch_confirmed(batch: &BatchRequest, result: Option<serde_json::Value>) -> bool {
+    fn same_ids<'a>(reported: Option<Vec<IdOnly>>, sent: impl Iterator<Item = &'a str>) -> bool {
+        let reported = reported.unwrap_or_default();
+        let mut reported: Vec<&str> = reported.iter().map(|item| item.id.as_str()).collect();
+        let mut sent: Vec<&str> = sent.collect();
+        reported.sort_unstable();
+        sent.sort_unstable();
+        reported == sent
+    }
+    let Some(result) = result.and_then(|value| serde_json::from_value::<BatchResult>(value).ok())
+    else {
+        return false;
+    };
+    same_ids(
+        result.deletes,
+        batch.deletes.iter().map(|item| item.id.as_str()),
+    ) && same_ids(
+        result.patches,
+        batch.patches.iter().map(|item| item.id.as_str()),
+    )
+}
+
 /// Cloudflare's error list as messages, with the numeric code when present.
 fn api_errors(status: u16, errors: Option<Vec<CfError>>) -> ApiFailure {
     let messages = errors
@@ -634,29 +775,73 @@ mod tests {
 
     /// Answer one connection per body with HTTP 200 and return the request lines.
     async fn serve(bodies: Vec<String>) -> (String, tokio::task::JoinHandle<Vec<String>>) {
+        let (base, task) = serve_requests(bodies).await;
+        let lines = tokio::spawn(async move {
+            let requests = task.await.unwrap();
+            requests.into_iter().map(|(line, _)| line).collect()
+        });
+        (base, lines)
+    }
+
+    /// Like `serve`, returning each request line with its body.
+    async fn serve_requests(
+        bodies: Vec<String>,
+    ) -> (String, tokio::task::JoinHandle<Vec<(String, String)>>) {
+        let responses = bodies
+            .into_iter()
+            .map(|body| {
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+            })
+            .collect();
+        serve_raw(responses).await
+    }
+
+    /// Answer one connection per raw HTTP response, written as given.
+    async fn serve_raw(
+        responses: Vec<String>,
+    ) -> (String, tokio::task::JoinHandle<Vec<(String, String)>>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let task = tokio::spawn(async move {
-            let mut lines = Vec::new();
-            for body in bodies {
+            let mut requests = Vec::new();
+            for response in responses {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let mut request = Vec::new();
                 let mut buffer = [0; 4096];
-                while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                let end = loop {
+                    if let Some(end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                        break end + 4;
+                    }
                     let count = stream.read(&mut buffer).await.unwrap();
                     assert!(count > 0, "request headers were truncated");
                     request.extend_from_slice(&buffer[..count]);
                     assert!(request.len() <= 8192);
+                };
+                let head = String::from_utf8(request[..end].to_vec()).unwrap();
+                let length: usize = head
+                    .lines()
+                    .find_map(|line| {
+                        let (key, value) = line.split_once(':')?;
+                        key.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse().unwrap())
+                    })
+                    .unwrap_or(0);
+                // Read the whole body, so closing the socket cannot reset the reply.
+                while request.len() < end + length {
+                    let count = stream.read(&mut buffer).await.unwrap();
+                    assert!(count > 0, "request body was truncated");
+                    request.extend_from_slice(&buffer[..count]);
                 }
-                let request = String::from_utf8(request).unwrap();
-                lines.push(request.lines().next().unwrap().to_string());
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-                stream.write_all(response.as_bytes()).await.unwrap();
+                let line = head.lines().next().unwrap().to_string();
+                let sent = String::from_utf8(request[end..].to_vec()).unwrap();
+                requests.push((line, sent));
+                // A client that rejects the reply early may close first.
+                let _ = stream.write_all(response.as_bytes()).await;
             }
-            lines
+            requests
         });
         (base, task)
     }
@@ -826,6 +1011,7 @@ mod tests {
                 .unwrap_err(),
             cf.zone_for_domain("example.com").await.unwrap_err(),
             cf.delete_record(zone, zone).await.unwrap_err(),
+            cf.batch(zone, &deletes(&[zone])).await.unwrap_err(),
         ];
         for error in errors {
             let text = error.to_string();
@@ -946,5 +1132,203 @@ mod tests {
                 "unsafe filename reached network: {filename:?}"
             );
         }
+    }
+
+    fn deletes(ids: &[&str]) -> BatchRequest {
+        BatchRequest {
+            deletes: ids
+                .iter()
+                .map(|id| BatchDelete { id: id.to_string() })
+                .collect(),
+            ..BatchRequest::default()
+        }
+    }
+
+    fn patch(id: &str, patch: RecordPatch) -> BatchPatch {
+        BatchPatch {
+            id: id.to_string(),
+            patch,
+        }
+    }
+
+    #[test]
+    fn batch_bodies_carry_ids_and_only_the_changed_fields() {
+        assert_eq!(
+            serde_json::to_value(deletes(&["one", "two"])).unwrap(),
+            json!({"deletes": [{"id": "one"}, {"id": "two"}]})
+        );
+        let patches = BatchRequest {
+            patches: vec![
+                patch(
+                    "one",
+                    RecordPatch {
+                        ttl: Some(600),
+                        ..RecordPatch::default()
+                    },
+                ),
+                patch(
+                    "two",
+                    RecordPatch {
+                        proxied: Some(true),
+                        ttl: Some(1),
+                        comment: Some(String::new()),
+                        tags: Some(vec!["test:batch".into()]),
+                        content: None,
+                    },
+                ),
+            ],
+            ..BatchRequest::default()
+        };
+        assert_eq!(
+            serde_json::to_value(&patches).unwrap(),
+            json!({"patches": [
+                {"id": "one", "ttl": 600},
+                {"id": "two", "ttl": 1, "proxied": true, "comment": "", "tags": ["test:batch"]},
+            ]})
+        );
+        assert_eq!(patches.ids().collect::<Vec<_>>(), ["one", "two"]);
+    }
+
+    #[tokio::test]
+    async fn batch_posts_to_the_zone_batch_endpoint_and_keeps_error_codes() {
+        let ok = json!({"success": true, "errors": [], "result": {"deletes": [{"id": "one"}]}});
+        let failed = r#"{"success":false,"errors":[{"code":81044,"message":"Record not found"}]}"#;
+        let (base, task) = serve_requests(vec![ok.to_string(), failed.into()]).await;
+        let cf = client(&base);
+        cf.batch("synthetic-zone", &deletes(&["one"]))
+            .await
+            .unwrap();
+        let error = cf
+            .batch("synthetic-zone", &deletes(&["two"]))
+            .await
+            .unwrap_err();
+        assert_eq!(error.to_string(), "[81044] Record not found");
+        let requests = task.await.unwrap();
+        for ((line, body), id) in requests.iter().zip(["one", "two"]) {
+            assert!(
+                line.starts_with("POST /zones/synthetic-zone/dns_records/batch "),
+                "{line}"
+            );
+            let body: serde_json::Value = serde_json::from_str(body).unwrap();
+            assert_eq!(body, json!({"deletes": [{"id": id}]}));
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_checks_every_identifier_and_its_size_before_network() {
+        let cf = client("http://127.0.0.1:1");
+        let full: Vec<String> = (0..=BATCH_LIMIT).map(|i| format!("r{i}")).collect();
+        let full: Vec<&str> = full.iter().map(String::as_str).collect();
+        let mut late_bad_patch = deletes(&["one", "two"]);
+        late_bad_patch
+            .patches
+            .push(patch("record/other", RecordPatch::default()));
+        for (zone, batch) in [
+            ("../zones", deletes(&["one"])),
+            ("synthetic-zone", deletes(&["one", "two", "a b"])),
+            ("synthetic-zone", late_bad_patch),
+            ("synthetic-zone", BatchRequest::default()),
+            ("synthetic-zone", deletes(&full)),
+        ] {
+            let error = cf.batch(zone, &batch).await.unwrap_err();
+            assert_eq!(error.status, 400, "{error}");
+        }
+        // A full batch passes the checks and fails only at the network.
+        let error = cf
+            .batch("synthetic-zone", &deletes(&full[..BATCH_LIMIT]))
+            .await
+            .unwrap_err();
+        assert_eq!(error.status, 0, "{error}");
+    }
+
+    #[tokio::test]
+    async fn batch_success_without_a_matching_result_is_an_unknown_outcome() {
+        let mut sent = deletes(&["one", "two"]);
+        sent.patches.push(patch(
+            "three",
+            RecordPatch {
+                ttl: Some(600),
+                ..RecordPatch::default()
+            },
+        ));
+        let one = json!({"id": "one"});
+        let two = json!({"id": "two"});
+        let three = json!({"id": "three"});
+        let replies = [
+            json!({"success": true}),
+            json!({"success": true, "result": null}),
+            json!({"success": true, "result": {}}),
+            json!({"success": true, "result": {"deletes": [one], "patches": [three]}}),
+            json!({"success": true, "result": {"deletes": [one, two]}}),
+            json!({"success": true, "result": {"deletes": [one, one], "patches": [three]}}),
+            json!({"success": true, "result": {"deletes": [one, {"id": "other"}], "patches": [three]}}),
+            json!({"success": true, "result": {"deletes": "one", "patches": [three]}}),
+        ];
+        // Full records, plus empty lists for other operations. The docs do not
+        // promise an order, so a reply in a different order still confirms.
+        let applied = json!({"success": true, "result": {
+            "deletes": [{"id": "one", "type": "A"}, {"id": "two", "type": "A"}],
+            "patches": [{"id": "three", "type": "A", "ttl": 600}],
+            "puts": [], "posts": [],
+        }});
+        let reordered = json!({"success": true, "result": {
+            "deletes": [{"id": "two", "type": "A"}, {"id": "one", "type": "A"}],
+            "patches": [{"id": "three", "type": "A", "ttl": 600}],
+        }});
+        let bodies = replies
+            .iter()
+            .chain([&applied, &reordered])
+            .map(|r| r.to_string());
+        let (base, task) = serve_requests(bodies.collect()).await;
+        let cf = client(&base);
+        for reply in &replies {
+            let error = cf.batch("synthetic-zone", &sent).await.unwrap_err();
+            assert_eq!(error.status, 502, "{reply}: {error}");
+            assert!(
+                error.to_string().contains("outcome is unknown"),
+                "{reply}: {error}"
+            );
+        }
+        cf.batch("synthetic-zone", &sent).await.unwrap();
+        cf.batch("synthetic-zone", &sent).await.unwrap();
+        assert_eq!(task.await.unwrap().len(), replies.len() + 2);
+    }
+
+    #[tokio::test]
+    async fn lost_or_unreadable_batch_replies_are_an_unknown_outcome() {
+        let reply = |status: &str, body: &str| {
+            format!(
+                "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+        };
+        let responses = vec![
+            // The connection closes after the request was sent.
+            String::new(),
+            // Too large to read.
+            "HTTP/1.1 200 OK\r\nContent-Length: 9999999999\r\nConnection: close\r\n\r\n{}".into(),
+            // Cut off before the declared length.
+            "HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{\"success\":"
+                .into(),
+            reply("200 OK", "not json"),
+            reply("200 OK", "{}"),
+            reply("504 Gateway Timeout", "<html>timeout</html>"),
+            reply("502 Bad Gateway", "{}"),
+        ];
+        let count = responses.len();
+        let (base, task) = serve_raw(responses).await;
+        let cf = client(&base);
+        for _ in 0..count {
+            let error = cf
+                .batch("synthetic-zone", &deletes(&["one"]))
+                .await
+                .unwrap_err();
+            let text = error.to_string();
+            assert!(text.contains("outcome is unknown"), "{text}");
+            for leaked in ["synthetic-zone", "127.0.0.1", "dns_records"] {
+                assert!(!text.contains(leaked), "{text}");
+            }
+        }
+        assert_eq!(task.await.unwrap().len(), count);
     }
 }

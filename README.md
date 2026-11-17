@@ -8,7 +8,7 @@ It is a single static Rust binary in a `FROM scratch` Docker image (2,341,533 by
 
 - Zone selector for every zone your API token can see, with search across name, content, comment and tags, a type filter, sortable columns and columns you can hide
 - Add and edit A, AAAA, CAA, CNAME, HTTPS, MX, NS, PTR, SRV, SVCB and TXT records, with per-type fields and input validation as you type
-- Bulk delete and bulk edit of TTL, proxy status, comments and tags, where comments and tags each have an explicit keep, set or clear choice
+- Bulk delete and bulk edit of TTL, proxy status, comments and tags, where comments and tags each have an explicit keep, set or clear choice. Changes are sent in batches of up to 200 records ([failure handling](#failure-safety))
 - The same proxy and TTL rules as the dashboard: only A, AAAA and CNAME records can be proxied, and proxied records use TTL Auto. The server enforces both
 - BIND zone file import and export in Cloudflare's format, including `cf_tags=cf-proxied:true`. Imports are append-only and are checked before anything is sent
 - A DDNS dashboard that shows your current IPv4 and IPv6 addresses and whether each domain's record already has that address and the configured TTL, proxy status and comment, with an Update now button
@@ -110,7 +110,9 @@ If detection fails, returns a private or wrong-family address, or returns a Clou
 
 Duplicate records for a domain make the update fail for that domain. The GUI reports the duplicates and leaves them alone.
 
-If your session expires or is revoked during a bulk edit or an update, writes that have not been sent yet are stopped and the result lists what finished. Requests already sent to Cloudflare can still complete.
+Bulk edits and bulk deletes go to Cloudflare's batch endpoint in groups of up to 200 records, the Free plan limit, so they work on every plan. Cloudflare saves each group in one transaction, but the change does not reach every Cloudflare location at the same moment. If one record in a group fails, for example because it was deleted in the meantime, Cloudflare replies with an error and applies none of the up to 200 records sent with it. The result marks all of them as failed with Cloudflare's first error. If the reply is lost, cannot be read, or reports success without listing the records sent, the GUI cannot tell whether the group was applied. It marks the group's records as failed with an error saying the outcome is unknown; reload the records to see their real state before you retry. Later groups are still sent in both cases.
+
+If your session expires or is revoked during a bulk edit or an update, writes that have not been sent yet are stopped and the result lists what finished. A bulk edit checks the session before each group, so groups after the revocation are reported as not sent. Requests already sent to Cloudflare can still complete.
 
 ## 🧰 Configuration
 

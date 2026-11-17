@@ -84,7 +84,8 @@ The release profile sets `panic = "abort"`, so one panic stops the server for ev
 - Parse detected addresses and check the address family before any DNS write. A failed or wrong-family detection leaves existing records untouched.
 - Report provider and API errors as failures. Never show a failed or partial update as a success.
 - Keep proxy and TTL rules the same in the backend and frontend: proxied records use TTL 1 (Auto), and only A, AAAA and CNAME records can be proxied.
-- After a session is revoked, multi-record operations stop unsent writes and report partial results.
+- After a session is revoked, multi-record operations stop unsent writes and report partial results. Bulk edits and deletes check the session before each batch request.
+- A Cloudflare error reply to a batch request means nothing in that batch was applied, so every record in it is reported as failed. A lost or unreadable reply, or a success reply that does not list the records sent, leaves the outcome unknown: report those records as failed with an error that says so, and never as success.
 - Duplicate DDNS records fail closed. The GUI does not delete or reconcile records it does not own.
 - DDNS changes need address-family tests and proof that detection failures preserve DNS records.
 
