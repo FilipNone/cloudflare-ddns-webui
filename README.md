@@ -11,7 +11,7 @@ It is a single static Rust binary in a `FROM scratch` Docker image (2,341,533 by
 - Bulk delete and bulk edit of TTL, proxy status, comments and tags, where comments and tags each have an explicit keep, set or clear choice
 - The same proxy and TTL rules as the dashboard: only A, AAAA and CNAME records can be proxied, and proxied records use TTL Auto. The server enforces both
 - BIND zone file import and export in Cloudflare's format, including `cf_tags=cf-proxied:true`. Imports are append-only and are checked before anything is sent
-- A DDNS dashboard that shows your current IPv4 and IPv6 addresses and whether each domain's records match them, with an Update now button
+- A DDNS dashboard that shows your current IPv4 and IPv6 addresses and whether each domain's record already has that address and the configured TTL, proxy status and comment, with an Update now button
 - One admin account whose password is set in the browser on first run and stored only as a PBKDF2 hash. No password environment variable exists
 - TOTP two-factor authentication with QR enrollment and single-use backup codes that you can download as a `.txt` file
 - Light, dark and system themes, an accent colour, and your own logo and favicon
@@ -100,7 +100,7 @@ When you press **Update now**:
 
 1. The GUI detects your public IPv4 and IPv6 addresses with the configured providers. Redirects are not followed, responses are size-limited, and an address must be public and belong to the requested family.
 2. Addresses inside Cloudflare's ranges are rejected. The GUI checks them against a list of ranges recorded in the source; it does not download Cloudflare's current list.
-3. For each domain, the GUI finds its zone, then creates the missing A or AAAA record or updates the content of the existing one.
+3. For each domain with a detected address, the GUI finds its zone, then creates the missing A or AAAA record or updates the address, TTL, proxy status and comment of the existing one. If the token can see more than one zone with that name, the update fails for that domain.
 
 Only one update runs at a time. A second request while one is in progress returns `409`. That lock covers the GUI process only; it does not coordinate with cloudflare-ddns, other processes, or ordinary record edits.
 
@@ -114,14 +114,14 @@ If your session expires or is revoked during a bulk edit or an update, writes th
 
 ## 🧰 Configuration
 
-All settings are environment variables. Invalid values stop the program at startup with an error message instead of being ignored. See [`env-example`](env-example) for a commented template.
+All settings are environment variables. Invalid values stop the program at startup with an error message instead of being ignored. As in cloudflare-ddns, a variable set to an empty string counts as unset, so it gets its default. See [`env-example`](env-example) for a commented template.
 
 ### Authentication
 
 | Variable | Description |
 |----------|-------------|
 | `CLOUDFLARE_API_TOKEN` | API token ([permissions](#1-create-an-api-token)) |
-| `CLOUDFLARE_API_TOKEN_FILE` | Path to a file that contains the token, for example a Docker secret |
+| `CLOUDFLARE_API_TOKEN_FILE` | Path to a file that contains the token, for example a Docker secret. Read only when `CLOUDFLARE_API_TOKEN` is unset; at most 4 KiB |
 
 The admin password is not configured here. You create it in the browser on first run.
 
@@ -132,8 +132,8 @@ The admin password is not configured here. You create it in the browser on first
 | `LISTEN` | `0.0.0.0:8080` | Address and port to listen on |
 | `DATA_DIR` | `/data` | Directory for the password hash, TOTP secret and UI settings |
 | `SESSION_TTL` | `24h` | Session lifetime |
-| `SECURE_COOKIES` | `false` | Adds the `Secure` attribute to the session cookie. Turn it on behind HTTPS |
-| `PUBLIC_ORIGIN` | unset | The exact origin a reverse proxy serves, such as `https://dns-admin.example.com`. It must be HTTPS (plain HTTP is allowed only for loopback) and requires `SECURE_COOKIES=true`. When unset, only numeric IP or `localhost` Host values on the listening port are accepted |
+| `SECURE_COOKIES` | `false` | Adds the `Secure` attribute to the session cookie and names it `__Host-cfddns_session` instead of `cfddns_session`, so other subdomains cannot set or override it. Turn it on behind HTTPS |
+| `PUBLIC_ORIGIN` | unset | The exact origin a reverse proxy serves, such as `https://dns-admin.example.com`. It must be HTTPS (plain HTTP is allowed only for loopback) and requires `SECURE_COOKIES=true`. An HTTPS origin also turns on `Strict-Transport-Security`. When unset, only numeric IP or `localhost` Host values on the listening port are accepted |
 
 ### Domains
 
@@ -169,7 +169,7 @@ Provider URLs must be `http` or `https` and must not contain credentials or a fr
 |----------|---------|-------------|
 | `TTL` | `1` (Auto) | TTL for records created or updated by Update now. `1` or `30` to `86400`; Cloudflare may require at least 60 outside Enterprise zones |
 | `PROXIED` | `false` | Proxy status for records created by Update now. Proxying forces TTL to `1` |
-| `RECORD_COMMENT` | unset | Comment for records created or updated by Update now |
+| `RECORD_COMMENT` | unset | Comment for records created or updated by Update now. At most 500 bytes, the longest comment any Cloudflare plan accepts (Free zones allow 100 characters) |
 
 ### Sharing a zone with cloudflare-ddns
 
@@ -195,7 +195,7 @@ Booleans are `true` or `false`. Durations are positive whole seconds with an opt
 
 ### Updater settings the GUI rejects
 
-The GUI refuses to start when it sees settings it does not implement, so you never get a silent mismatch. Rejected names are `UPDATE_CRON`, `UPDATE_ON_START`, `DELETE_ON_STOP`, `DELETE_ON_FAILURE`, `WAF_LISTS`, `WAF_LIST_DESCRIPTION`, `WAF_LIST_ITEM_COMMENT`, `MANAGED_WAF_LIST_ITEMS_COMMENT_REGEX`, `SHOUTRRR`, `HEALTHCHECKS`, `UPTIMEKUMA`, `CONFIG_PATH`, `CF_API_TOKEN`, `CF_API_TOKEN_FILE`, `CF_ACCOUNT_ID`, `IP4_POLICY`, `IP6_POLICY`, `PUID`, `PGID`, anything starting with `CF_DDNS_`, and numbered group settings such as `DOMAINS_2` or `IP4_PROVIDER_2`. `REJECT_CLOUDFLARE_IPS=false` is rejected as well.
+The GUI refuses to start when it sees settings it does not implement, so you never get a silent mismatch. Rejected names are `UPDATE_CRON`, `UPDATE_ON_START`, `DELETE_ON_STOP`, `DELETE_ON_FAILURE`, `WAF_LISTS`, `WAF_LIST_DESCRIPTION`, `WAF_LIST_ITEM_COMMENT`, `MANAGED_WAF_LIST_ITEMS_COMMENT_REGEX`, `SHOUTRRR`, `HEALTHCHECKS`, `UPTIMEKUMA`, `CONFIG_PATH`, `CF_API_TOKEN`, `CF_API_TOKEN_FILE`, `CF_ACCOUNT_ID`, `IP4_POLICY`, `IP6_POLICY`, `PUID`, `PGID`, anything starting with `CF_DDNS_`, and numbered group settings such as `DOMAINS_2` or `IP4_PROVIDER_2`. `REJECT_CLOUDFLARE_IPS=false` is rejected as well. The empty-string rule above does not apply here: a rejected name stops startup even when its value is empty, because an empty value may still be a leftover from the updater's env file.
 
 Give the GUI its own environment rather than reusing the updater's env file.
 
@@ -237,9 +237,9 @@ The supported setup is a private admin network, or loopback behind an HTTPS reve
 
 1. Publish the container on loopback or on a network only the proxy can reach.
 2. Set `PUBLIC_ORIGIN` to the exact HTTPS origin and `SECURE_COOKIES=true`.
-3. Have the proxy talk HTTP/1.1 to the GUI.
+3. Have the proxy talk HTTP/1.1 to the GUI. HTTP/1.0 requests are rejected, so nginx older than 1.29.7 needs `proxy_http_version 1.1`. The GUI closes a kept-alive connection after 5 idle seconds, so if the proxy reuses upstream connections, set its upstream idle timeout below that (nginx `keepalive_timeout` in the `upstream` block, Traefik `idleConnTimeout`).
 4. Create the admin account before opening the proxy to anyone else.
-5. Check that HTTPS works, that the session cookie is `Secure`, that the account survives a restart, and that requests with any other Host or Origin get `403`.
+5. Check that HTTPS works, that the session cookie is `__Host-cfddns_session` and `Secure`, that the account survives a restart, and that requests with any other Host or Origin get `403`.
 
 ### Dokploy
 
@@ -260,27 +260,32 @@ docker build -t cloudflare-ddns-webui .
 
 The Dockerfile builds a static musl binary, compresses it with UPX and copies it into a `FROM scratch` image that runs as UID/GID 65534 with a writable `/data`.
 
+On SIGTERM (`docker stop`) or SIGINT (Ctrl+C) the GUI stops accepting connections, gives requests in progress up to 5 seconds to finish, and exits with status 0. That fits inside Docker's default 10-second stop timeout.
+
 ## 🛡️ Two-factor authentication and recovery
 
 1. Go to **Settings › Security › Enable 2FA** and enter your current password.
 2. Scan the QR code with an authenticator app (Aegis, Bitwarden, 2FAS, Google Authenticator and others) and confirm with a 6-digit code.
 3. Save the backup codes right away. They are shown once, can be downloaded as a `.txt` file, and each one works once. The page keeps showing them until you press Done; reloading the page or logging out clears them.
-4. Later logins accept either the current TOTP code or one backup code.
+4. Later logins accept either the current TOTP code or one backup code. Each TOTP code is accepted once, so right after logging in, wait for the next code before disabling 2FA or changing the password. A reused code is refused without counting as a failed attempt. The GUI remembers the last used code in memory only, so a restart forgets it.
 5. Disabling 2FA needs a valid TOTP or backup code. Changing the password needs the current password, plus a 2FA code when 2FA is on.
 
 If you lose both the authenticator and the backup codes, stop the service and remove remote access. Then delete `state.json` from the data volume, start the GUI on loopback, and create the new account before reopening the proxy. If `state.json` is present but unreadable or invalid, the GUI refuses to start instead of resetting the account.
 
 ## 🔒 Security notes
 
-- The admin password is stored only as a PBKDF2-HMAC-SHA256 hash (100,000 iterations, per-account salt) in `state.json` with mode `600`. Backup codes are stored as salted one-way hashes and are consumed when used.
+- The admin password is stored only as a PBKDF2-HMAC-SHA256 hash (100,000 iterations, per-account salt) in `state.json` with mode `600`. Backup codes are stored as salted one-way hashes and are consumed when used. Codes issued by older versions have no random salt. While any are left, the GUI logs a warning at startup; disabling and re-enabling 2FA replaces them.
 - Sessions are random 256-bit tokens kept in memory, so a restart logs everyone out. Changing the password or 2FA revokes existing sessions and pending login challenges.
-- Failed passwords are rate-limited per source IP. Failed 2FA codes share one account-wide limit of five attempts per five minutes across logins and sensitive actions. These counters reset when the process restarts.
+- Failed passwords are rate-limited per source IP address, and per /64 prefix for IPv6. Behind a reverse proxy every client shares the proxy's address, so one client's failures also lock out the others. The limiter tracks at most 10,000 addresses. When it is full, the oldest address that is not locked out makes room; only when all 10,000 are locked out are new addresses refused until old entries expire. Failed 2FA codes share one account-wide limit of five attempts per five minutes across logins and sensitive actions. These counters reset when the process restarts.
 - Every write needs both the session cookie and a custom header that browsers will not send cross-site.
-- Responses carry a strict Content-Security-Policy (`default-src 'self'`, no inline scripts or styles), `X-Frame-Options: DENY`, `nosniff` and `no-referrer`.
+- Responses carry a strict Content-Security-Policy (`default-src 'self'`, no inline scripts or styles), `X-Frame-Options: DENY`, `nosniff`, `no-referrer`, `Cross-Origin-Opener-Policy` and `Cross-Origin-Resource-Policy` set to `same-origin`, and a `Permissions-Policy` that turns off camera, microphone, geolocation, payment and USB access. With an HTTPS `PUBLIC_ORIGIN` they also carry `Strict-Transport-Security: max-age=31536000`.
+- API request bodies must not contain unknown fields, and structured record data (SRV, CAA, HTTPS, SVCB) must match the record type.
 - Logo and favicon uploads accept PNG, JPEG, WebP and GIF only, with checks on type, container format, size and dimensions. SVG is rejected. The image data itself is not decoded.
-- The HTTP server accepts at most 16 connections, limits request bodies to 2 MiB, and gives each request 30 seconds to arrive and 30 seconds to be answered.
+- The accent colour and the icon's type and file name are kept in `ui-settings.json`; the icon itself is a separate `icon-<random hex>` file in the data directory. If `ui-settings.json` cannot be read, the GUI refuses to start. If it can be read but its content is invalid, the GUI renames it to `ui-settings.json.invalid`, logs a warning and starts with the default appearance. Icon files are kept while `ui-settings.json.invalid` exists, and if a second invalid file turns up before you have moved the first one away, the GUI refuses to start rather than overwrite it.
+- The HTTP server keeps at most 16 connections open and answers any more with `503` and `Retry-After: 1`. It limits request bodies to 2 MiB. A request has 30 seconds to arrive, counted from its first byte, and each response has 30 seconds to be written. A kept-alive connection is closed after 5 seconds without a new request.
+- The server speaks HTTP/1.1 only. It rejects HTTP/1.0 requests and absolute-form targets such as `GET http://example.com/ HTTP/1.1`. RFC 9112 §3.2.2 says a server must accept absolute-form targets; this server deliberately does not.
 - The BIND import check supports the documented record types, `$ORIGIN` and `$TTL`, default and inherited TTLs, omitted owners, escaped names and multi-line records. It is not a complete RFC parser. If Cloudflare's reply to an import is missing its counts, the result is reported as unknown; check the zone before you retry, because the import may already have gone through.
-- State changes are written to a private temporary file, synced and renamed before the in-memory state changes. A failed save does not consume a backup code or log you in. Durability after a power loss is not guaranteed, because the parent directory is not synced.
+- Each state change is written to a private temporary file, synced and renamed over `state.json`, and then the data directory is synced. Only after that does the in-memory state change. Appearance changes are saved the same way, and temporary files left by an interrupted save are deleted at startup. A failed save does not consume a backup code or log you in. If only the directory sync fails, the new file is already in place, so the GUI keeps the change and logs a warning, because a power loss right afterwards could still bring back the previous state.
 - The Cloudflare token stays on the server. The browser only talks to the GUI.
 
 ## 🩺 Troubleshooting
@@ -300,6 +305,10 @@ The container was recreated without a volume at `/data`. Mount one, then create 
 ### "Permission denied" writing to `/data`
 
 The image runs as UID 65534. A bind-mounted directory must be writable by that user, or start the container with `--user` set to the directory owner's UID and GID.
+
+### "cannot load UI settings"
+
+The GUI could not read `ui-settings.json` or the icon file it names, for example because of file permissions or a file larger than expected. Fix the permissions, or move the file out of the data directory to start with the default appearance.
 
 ### Update now skips IPv6
 

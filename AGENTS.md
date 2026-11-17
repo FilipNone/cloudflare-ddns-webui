@@ -39,6 +39,7 @@ src/
   ddns.rs        IP detection, DNS status, manual DDNS updates
   config.rs      environment parsing and rejection of unsupported updater settings
   customize.rs   UI settings and uploaded logo/favicon checks
+  persist.rs     crash-safe file replacement for state.json and UI settings
   pp.rs          log output with optional emoji and quiet mode
 web/
   index.html app.js style.css favicon.svg   the embedded frontend
@@ -105,7 +106,7 @@ node --test web/app.test.cjs web/appearance.test.cjs
 python3 scripts/smoke-test.py
 ```
 
-Build the release binary before the smoke test. `python3 scripts/smoke-test.py --only <group>` runs one group while you iterate, and `--serve` starts a disposable instance on loopback for manual checks (add `--port 8888` for a fixed port). CI currently runs `web/app.test.cjs` only, so run the appearance suite yourself.
+Build the release binary before the smoke test. `python3 scripts/smoke-test.py --only <group>` runs one group while you iterate, and `--serve` starts a disposable instance on loopback for manual checks (add `--port 8888` for a fixed port). CI runs `node --test web/app.test.cjs`, which loads `web/appearance.test.cjs` too, so both suites run there; locally the command above runs the appearance suite twice.
 
 For container changes, also run:
 
