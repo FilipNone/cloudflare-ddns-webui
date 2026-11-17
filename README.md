@@ -1,30 +1,31 @@
+<p align="center"><img width="200" src="web/favicon.svg" alt="Cloudflare DDNS Web UI logo"/></p>
+
 # 🌍 Cloudflare DDNS Web UI
 
-A web interface for managing Cloudflare DNS, built to sit next to [cloudflare-ddns](https://github.com/timothymiller/cloudflare-ddns).
+Edit your Cloudflare DNS records and check on your dynamic DNS from a page you host yourself.
 
-It is a single static Rust binary in a `FROM scratch` Docker image (2,341,533 bytes when last measured in October 2026). There is no web framework: the HTTP/1.1 server is written by hand on top of Tokio, and the frontend is plain JavaScript and CSS compiled into the binary. The record editor is modelled on the Cloudflare dashboard, and the dashboard page adds DDNS status and an update button for the domains your updater manages.
+A web interface for Cloudflare DNS, written in Rust: one static binary in a `FROM scratch` Docker image of about 2.4 MB, with the frontend compiled in. The record editor follows the Cloudflare dashboard, and the DDNS page shows whether the domains [cloudflare-ddns](https://github.com/timothymiller/cloudflare-ddns) manages point at your current IP address, with a button to update them now.
 
 ## ✨ Features
 
-- Zone selector for every zone your API token can see, with search across name, content, comment and tags, a type filter, sortable columns and columns you can hide
-- Add and edit A, AAAA, CAA, CNAME, HTTPS, MX, NS, PTR, SRV, SVCB and TXT records, with per-type fields and input validation as you type
-- Bulk delete and bulk edit of TTL, proxy status, comments and tags, where comments and tags each have an explicit keep, set or clear choice
-- The same proxy and TTL rules as the dashboard: only A, AAAA and CNAME records can be proxied, and proxied records use TTL Auto. The server enforces both
-- BIND zone file import and export in Cloudflare's format, including `cf_tags=cf-proxied:true`. Imports are append-only and are checked before anything is sent
-- A DDNS dashboard that shows your current IPv4 and IPv6 addresses and whether each domain's records match them, with an Update now button
-- One admin account whose password is set in the browser on first run and stored only as a PBKDF2 hash. No password environment variable exists
-- TOTP two-factor authentication with QR enrollment and single-use backup codes that you can download as a `.txt` file
-- Light, dark and system themes, an accent colour, and your own logo and favicon
-- Uses the same `CLOUDFLARE_API_TOKEN` and `DOMAINS` settings as cloudflare-ddns
+- Every zone your API token can see, with search, a type filter, sortable columns and columns you can hide
+- Add and edit A, AAAA, CAA, CNAME, HTTPS, MX, NS, PTR, SRV, SVCB and TXT records, with fields and checks for each type
+- Bulk delete, and bulk edit of TTL, proxy status, comments and tags through Cloudflare's batch endpoint
+- The dashboard's proxy rules, enforced by the server: only A, AAAA and CNAME records can be proxied, and proxied records use TTL Auto
+- BIND zone file export, and append-only import that is checked before anything is sent
+- A DDNS page with your current IPv4 and IPv6 addresses, whether each domain's record matches, and an Update now button
+- One admin account with TOTP two-factor login and single-use backup codes
+- Light, dark and system themes, an accent colour, and your own logo
+- The same `CLOUDFLARE_API_TOKEN` and `DOMAINS` settings as cloudflare-ddns
 
 ## Contents
 
 - [Quick start](#-quick-start)
-- [How DDNS updates work](#-how-ddns-updates-work)
+- [How it works](#-how-it-works)
 - [Configuration](#-configuration)
 - [Environment variable reference](#-environment-variable-reference)
 - [Deployment](#-deployment)
-- [Two-factor authentication and recovery](#-two-factor-authentication-and-recovery)
+- [Two-factor authentication](#-two-factor-authentication)
 - [Security notes](#-security-notes)
 - [Troubleshooting](#-troubleshooting)
 - [Development](#-development)
@@ -33,18 +34,18 @@ It is a single static Rust binary in a `FROM scratch` Docker image (2,341,533 by
 
 ### 1. Create an API token
 
-In the Cloudflare dashboard go to [My Profile › API Tokens › Create Token](https://dash.cloudflare.com/profile/api-tokens) and start from the **Edit zone DNS** template, or create a custom token with:
+In the Cloudflare dashboard go to [**My Profile › API Tokens › Create Token**](https://dash.cloudflare.com/profile/api-tokens) and start from the **Edit zone DNS** template, or grant:
 
 | Permission | Needed for |
 |------------|------------|
-| Zone › DNS › Edit | Creating, editing, deleting, importing and exporting records |
-| Zone › Zone › Read | Listing zones and finding the zone for each domain |
+| **Zone › DNS › Edit** | Reading, changing, importing and exporting records |
+| **Zone › Zone › Read** | Listing zones and finding each domain's zone |
 
-Under **Zone Resources**, include only the zones you want to manage. The GUI never needs zone deletion or account-level permissions.
+Under **Zone Resources**, include only the zones you want to manage.
 
-### 2. Build and run it
+### 2. Run it
 
-No prebuilt image is published, so build it from this repository:
+No image is published, so build it from this repository:
 
 ```bash
 git clone https://github.com/FilipNone/cloudflare-ddns-webui.git
@@ -60,13 +61,11 @@ docker run -d \
   cloudflare-ddns-webui
 ```
 
-Open http://localhost:8080. The first visit asks you to create the admin password.
-
-Set up the account over loopback before you allow remote access: anyone who reaches an uninitialized instance can create the admin account. The `/data` volume holds the password hash, the TOTP secret and the UI settings. Without it, recreating the container resets the account.
+Open http://localhost:8080 and create the admin password. Do this over loopback before you allow remote access, because anyone who reaches a new instance can create the account. The `/data` volume keeps the account; without it, recreating the container resets it.
 
 ### 3. Or use Docker Compose
 
-The included [`docker-compose.yml`](docker-compose.yml) builds the image and publishes it on loopback only:
+The included [`docker-compose.yml`](docker-compose.yml) builds the image and publishes it on loopback only. Uncomment the settings you need, such as `DOMAINS`:
 
 ```yaml
 services:
@@ -88,210 +87,200 @@ volumes:
   webui-data:
 ```
 
-```bash
-docker compose up -d
-```
+## 🔄 How it works
 
-## 🔄 How DDNS updates work
-
-The GUI is not an updater. It has no schedule and does not start, configure or watch cloudflare-ddns. Keep cloudflare-ddns running for automatic updates and use the GUI to check on the result or to push one update by hand.
+The GUI has no schedule, and it does not start, configure or watch cloudflare-ddns. Keep cloudflare-ddns running for automatic updates and use the GUI to check the result or push one update by hand.
 
 When you press **Update now**:
 
-1. The GUI detects your public IPv4 and IPv6 addresses with the configured providers. Redirects are not followed, responses are size-limited, and an address must be public and belong to the requested family.
-2. Addresses inside Cloudflare's ranges are rejected. The GUI checks them against a list of ranges recorded in the source; it does not download Cloudflare's current list.
-3. For each domain, the GUI finds its zone, then creates the missing A or AAAA record or updates the content of the existing one.
+1. Detect the public IPv4 and IPv6 addresses with the configured providers. Redirects are not followed, replies are size-limited, and an address must be public and of the right family.
+2. Reject Cloudflare IPs. Addresses inside Cloudflare's ranges are discarded, using a list built into the binary.
+3. Update each domain that has an address: find its zone, then create the A or AAAA record, or update the address, TTL, proxy status and comment of the existing one.
 
-Only one update runs at a time. A second request while one is in progress returns `409`. That lock covers the GUI process only; it does not coordinate with cloudflare-ddns, other processes, or ordinary record edits.
+Only one update runs at a time, and a second request gets `409`. That lock does not coordinate with cloudflare-ddns or with record edits.
 
 ### Failure safety
 
-If detection fails, returns a private or wrong-family address, or returns a Cloudflare address, that family is skipped and its records stay as they are. The GUI never deletes records because detection failed.
+A failed IP lookup never changes your DNS.
 
-Duplicate records for a domain make the update fail for that domain. The GUI reports the duplicates and leaves them alone.
-
-If your session expires or is revoked during a bulk edit or an update, writes that have not been sent yet are stopped and the result lists what finished. Requests already sent to Cloudflare can still complete.
+- A detection that fails or returns a private, wrong-family or Cloudflare address skips that family, and its records stay as they are.
+- Duplicate records, or two zones with the same name, fail that domain without changing anything. The GUI leaves the duplicates alone.
+- Bulk edits go to Cloudflare in groups of up to 200 records, the Free plan limit. Cloudflare applies a group completely or not at all, so one failing record fails its whole group. If the reply is lost or does not list the records sent, the result says the outcome is unknown; reload the records before you retry.
+- If your session ends during an update or a bulk edit, writes that have not been sent are stopped, and the result lists what finished.
 
 ## 🧰 Configuration
 
-All settings are environment variables. Invalid values stop the program at startup with an error message instead of being ignored. See [`env-example`](env-example) for a commented template.
+All settings are environment variables, and [`.env.example`](.env.example) is a commented template. Invalid values stop the program at startup with an error message.
 
 ### Authentication
 
 | Variable | Description |
 |----------|-------------|
 | `CLOUDFLARE_API_TOKEN` | API token ([permissions](#1-create-an-api-token)) |
-| `CLOUDFLARE_API_TOKEN_FILE` | Path to a file that contains the token, for example a Docker secret |
+| `CLOUDFLARE_API_TOKEN_FILE` | File holding the token, such as a Docker secret. Read only when `CLOUDFLARE_API_TOKEN` is unset; at most 4 KiB |
 
-The admin password is not configured here. You create it in the browser on first run.
+There is no password setting. You create the password in the browser on first run.
 
 ### Server
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `LISTEN` | `0.0.0.0:8080` | Address and port to listen on |
-| `DATA_DIR` | `/data` | Directory for the password hash, TOTP secret and UI settings |
+| `DATA_DIR` | `/data` | Where the account and UI settings are saved |
 | `SESSION_TTL` | `24h` | Session lifetime |
-| `SECURE_COOKIES` | `false` | Adds the `Secure` attribute to the session cookie. Turn it on behind HTTPS |
-| `PUBLIC_ORIGIN` | unset | The exact origin a reverse proxy serves, such as `https://dns-admin.example.com`. It must be HTTPS (plain HTTP is allowed only for loopback) and requires `SECURE_COOKIES=true`. When unset, only numeric IP or `localhost` Host values on the listening port are accepted |
+| `SECURE_COOKIES` | `false` | Marks the session cookie `Secure` and names it `__Host-cfddns_session`. Turn it on behind HTTPS |
+| `PUBLIC_ORIGIN` | unset | The exact origin your reverse proxy serves, such as `https://dns-admin.example.com`. It must be HTTPS (HTTP only on loopback) and needs `SECURE_COOKIES=true`; an HTTPS origin also turns on HSTS. When unset, only IP addresses and `localhost` are accepted as the host |
 
 ### Domains
 
 | Variable | Description |
 |----------|-------------|
-| `DOMAINS` | Comma-separated domains to show on the dashboard and update with both IPv4 (A) and IPv6 (AAAA) |
-| `IP4_DOMAINS` | Comma-separated domains to update with IPv4 only |
-| `IP6_DOMAINS` | Comma-separated domains to update with IPv6 only |
+| `DOMAINS` | Domains to show on the DDNS page and update with A and AAAA records |
+| `IP4_DOMAINS` | Domains for A records only |
+| `IP6_DOMAINS` | Domains for AAAA records only |
 
-These mean the same as in cloudflare-ddns, so you can copy the values across. Record management works without them.
+The lists are comma-separated and mean the same as in cloudflare-ddns, so you can copy the values across. Record editing works without them.
 
 ### IP detection providers
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `IP4_PROVIDER` | `ipify` | How to find the public IPv4 address |
-| `IP6_PROVIDER` | `cloudflare.trace` | How to find the public IPv6 address |
+| `IP4_PROVIDER` | `ipify` | How to detect the IPv4 address |
+| `IP6_PROVIDER` | `cloudflare.trace` | How to detect the IPv6 address |
 
-| Provider | What it does |
-|----------|--------------|
+| Provider | Description |
+|----------|-------------|
 | `ipify` | Asks ipify.org |
 | `cloudflare.trace` | Reads Cloudflare's `/cdn-cgi/trace` |
-| `cloudflare.trace:<url>` | The same, from a trace URL you choose |
-| `url:<url>` | Fetches a URL that returns the address as plain text |
-| `literal:<ip>` | Uses a fixed address. It may be private, since you chose it on purpose |
-| `none` | Disables that family |
+| `cloudflare.trace:<url>` | The same, from your own trace URL |
+| `url:<url>` | Any `http` or `https` URL that returns the address as plain text |
+| `literal:<ip>` | A fixed address, which may be private because you chose it |
+| `none` | Don't detect this family |
 
-Provider URLs must be `http` or `https` and must not contain credentials or a fragment. Interface binding (`ipify@eth1`), the `local` providers, `cloudflare.doh` and detection groups are not supported.
+URLs must not contain credentials or a fragment. Interface binding (`ipify@eth1`), the `local` providers, `cloudflare.doh` and detection groups are not supported.
 
 ### DNS records
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `TTL` | `1` (Auto) | TTL for records created or updated by Update now. `1` or `30` to `86400`; Cloudflare may require at least 60 outside Enterprise zones |
-| `PROXIED` | `false` | Proxy status for records created by Update now. Proxying forces TTL to `1` |
-| `RECORD_COMMENT` | unset | Comment for records created or updated by Update now |
+| `TTL` | `1` (Auto) | TTL for records written by Update now: `1`, or `30` to `86400`. Cloudflare may require at least 60 outside Enterprise zones |
+| `PROXIED` | `false` | Proxy status for records created by Update now. Proxied records use TTL `1` |
+| `RECORD_COMMENT` | unset | Comment for records written by Update now. At most 500 bytes; Free zones allow 100 characters |
+| `GUI_DDNS_CONTRACT` | `standalone-v1` | How Update now treats records that cloudflare-ddns also manages |
 
-### Sharing a zone with cloudflare-ddns
-
-`GUI_DDNS_CONTRACT` sets how careful Update now is about records that cloudflare-ddns also manages:
-
-- `standalone-v1` (default) updates the A and AAAA records of the configured domains.
-- `shared-v1` only touches records whose comment matches `MANAGED_RECORDS_COMMENT_REGEX`. That value must be an anchored exact match (`^...$`, with punctuation escaped) and must match `RECORD_COMMENT`. General regular expressions are not supported. This contract also requires `GUI_SHARED_UPDATER_PAUSED=true`, which is your statement that cloudflare-ddns is paused before you press Update now. The GUI cannot check this.
-
-Both contracts were written against cloudflare-ddns 2.3.0 (commit `3f1a722`). Neither one watches the updater.
+With `standalone-v1`, Update now updates the A and AAAA records of the configured domains. With `shared-v1`, it only touches records whose comment matches `MANAGED_RECORDS_COMMENT_REGEX`. That value must be an anchored exact match (`^...$`, punctuation escaped) that also matches `RECORD_COMMENT`, and the contract needs `GUI_SHARED_UPDATER_PAUSED=true` to say that you paused cloudflare-ddns before pressing Update now. The GUI cannot check that. Both contracts were written against cloudflare-ddns 2.3.0 (commit `3f1a722`).
 
 ### Timeouts and output
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `UPDATE_TIMEOUT` | `30s` | Timeout for Cloudflare API requests |
+| `UPDATE_TIMEOUT` | `30s` | Timeout for each Cloudflare API request |
 | `DETECTION_TIMEOUT` | `5s` | Timeout for IP detection |
-| `EMOJI` | `true` | Emoji in log messages |
+| `EMOJI` | `true` | Emoji in log output |
 | `QUIET` | `false` | Less log output |
 
 ### Value formats
 
-Booleans are `true` or `false`. Durations are positive whole seconds with an optional `s`, `m` or `h` suffix (`90`, `30s`, `5m`, `24h`), up to one year.
+- Booleans: `true`, `yes` or `1`, and `false`, `no` or `0`, in any case. Anything else stops startup.
+- Durations: whole seconds with an optional `s`, `m` or `h` suffix (`90`, `30s`, `5m`, `24h`), from 1 second to 365 days.
+- Empty values: a variable set to an empty string counts as unset, so the default applies.
 
 ### Updater settings the GUI rejects
 
-The GUI refuses to start when it sees settings it does not implement, so you never get a silent mismatch. Rejected names are `UPDATE_CRON`, `UPDATE_ON_START`, `DELETE_ON_STOP`, `DELETE_ON_FAILURE`, `WAF_LISTS`, `WAF_LIST_DESCRIPTION`, `WAF_LIST_ITEM_COMMENT`, `MANAGED_WAF_LIST_ITEMS_COMMENT_REGEX`, `SHOUTRRR`, `HEALTHCHECKS`, `UPTIMEKUMA`, `CONFIG_PATH`, `CF_API_TOKEN`, `CF_API_TOKEN_FILE`, `CF_ACCOUNT_ID`, `IP4_POLICY`, `IP6_POLICY`, `PUID`, `PGID`, anything starting with `CF_DDNS_`, and numbered group settings such as `DOMAINS_2` or `IP4_PROVIDER_2`. `REJECT_CLOUDFLARE_IPS=false` is rejected as well.
-
-Give the GUI its own environment rather than reusing the updater's env file.
+The GUI refuses to start when it finds a cloudflare-ddns setting it does not implement, even with an empty value: `UPDATE_CRON`, `UPDATE_ON_START`, `DELETE_ON_STOP`, `DELETE_ON_FAILURE`, `WAF_LISTS`, `WAF_LIST_DESCRIPTION`, `WAF_LIST_ITEM_COMMENT`, `MANAGED_WAF_LIST_ITEMS_COMMENT_REGEX`, `SHOUTRRR`, `HEALTHCHECKS`, `UPTIMEKUMA`, `CONFIG_PATH`, `CF_API_TOKEN`, `CF_API_TOKEN_FILE`, `CF_ACCOUNT_ID`, `IP4_POLICY`, `IP6_POLICY`, `PUID`, `PGID`, names starting with `CF_DDNS_`, numbered groups such as `DOMAINS_2`, and `REJECT_CLOUDFLARE_IPS=false`. Give the GUI its own environment instead of the updater's env file.
 
 ## 📋 Environment variable reference
 
-| Variable | Default | Section |
-|----------|---------|---------|
-| `CLOUDFLARE_API_TOKEN` | required | [Authentication](#authentication) |
-| `CLOUDFLARE_API_TOKEN_FILE` | unset | [Authentication](#authentication) |
-| `LISTEN` | `0.0.0.0:8080` | [Server](#server) |
-| `DATA_DIR` | `/data` | [Server](#server) |
-| `SESSION_TTL` | `24h` | [Server](#server) |
-| `SECURE_COOKIES` | `false` | [Server](#server) |
-| `PUBLIC_ORIGIN` | unset | [Server](#server) |
-| `DOMAINS` | unset | [Domains](#domains) |
-| `IP4_DOMAINS` | unset | [Domains](#domains) |
-| `IP6_DOMAINS` | unset | [Domains](#domains) |
-| `IP4_PROVIDER` | `ipify` | [IP detection providers](#ip-detection-providers) |
-| `IP6_PROVIDER` | `cloudflare.trace` | [IP detection providers](#ip-detection-providers) |
-| `REJECT_CLOUDFLARE_IPS` | `true` | [How DDNS updates work](#-how-ddns-updates-work) (cannot be disabled) |
-| `TTL` | `1` | [DNS records](#dns-records) |
-| `PROXIED` | `false` | [DNS records](#dns-records) |
-| `RECORD_COMMENT` | unset | [DNS records](#dns-records) |
-| `GUI_DDNS_CONTRACT` | `standalone-v1` | [Sharing a zone](#sharing-a-zone-with-cloudflare-ddns) |
-| `MANAGED_RECORDS_COMMENT_REGEX` | unset | [Sharing a zone](#sharing-a-zone-with-cloudflare-ddns) |
-| `GUI_SHARED_UPDATER_PAUSED` | `false` | [Sharing a zone](#sharing-a-zone-with-cloudflare-ddns) |
-| `UPDATE_TIMEOUT` | `30s` | [Timeouts and output](#timeouts-and-output) |
-| `DETECTION_TIMEOUT` | `5s` | [Timeouts and output](#timeouts-and-output) |
-| `EMOJI` | `true` | [Timeouts and output](#timeouts-and-output) |
-| `QUIET` | `false` | [Timeouts and output](#timeouts-and-output) |
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CLOUDFLARE_API_TOKEN` | required | API token, or use the file below |
+| `CLOUDFLARE_API_TOKEN_FILE` | unset | File holding the API token |
+| `LISTEN` | `0.0.0.0:8080` | Listen address |
+| `DATA_DIR` | `/data` | Data directory |
+| `SESSION_TTL` | `24h` | Session lifetime |
+| `SECURE_COOKIES` | `false` | `Secure`, `__Host-` session cookie |
+| `PUBLIC_ORIGIN` | unset | Origin your reverse proxy serves |
+| `DOMAINS` | unset | Domains for A and AAAA records |
+| `IP4_DOMAINS` | unset | Domains for A records only |
+| `IP6_DOMAINS` | unset | Domains for AAAA records only |
+| `IP4_PROVIDER` | `ipify` | IPv4 detection provider |
+| `IP6_PROVIDER` | `cloudflare.trace` | IPv6 detection provider |
+| `REJECT_CLOUDFLARE_IPS` | `true` | Discard detected Cloudflare IPs; `false` is rejected |
+| `TTL` | `1` | TTL for Update now |
+| `PROXIED` | `false` | Proxy status for Update now |
+| `RECORD_COMMENT` | unset | Comment for Update now |
+| `GUI_DDNS_CONTRACT` | `standalone-v1` | `standalone-v1` or `shared-v1` |
+| `MANAGED_RECORDS_COMMENT_REGEX` | unset | Comment match for `shared-v1` |
+| `GUI_SHARED_UPDATER_PAUSED` | `false` | Confirms the updater is paused, for `shared-v1` |
+| `UPDATE_TIMEOUT` | `30s` | Cloudflare API timeout |
+| `DETECTION_TIMEOUT` | `5s` | IP detection timeout |
+| `EMOJI` | `true` | Emoji in output |
+| `QUIET` | `false` | Less output |
 
-`CLOUDFLARE_API_BASE` exists for tests against the local mock and only accepts loopback addresses.
+`CLOUDFLARE_API_BASE` is only for tests against the local mock and accepts loopback addresses only.
 
 ## 🚢 Deployment
 
-The supported setup is a private admin network, or loopback behind an HTTPS reverse proxy. The GUI is not hardened for direct exposure to the public internet.
+Run the GUI on a private admin network, or on loopback behind an HTTPS reverse proxy. It is not hardened for direct exposure to the internet.
 
 ### Behind a reverse proxy
 
 1. Publish the container on loopback or on a network only the proxy can reach.
-2. Set `PUBLIC_ORIGIN` to the exact HTTPS origin and `SECURE_COOKIES=true`.
-3. Have the proxy talk HTTP/1.1 to the GUI.
-4. Create the admin account before opening the proxy to anyone else.
-5. Check that HTTPS works, that the session cookie is `Secure`, that the account survives a restart, and that requests with any other Host or Origin get `403`.
+2. Set `PUBLIC_ORIGIN` to the exact HTTPS origin, and `SECURE_COOKIES=true`.
+3. Talk HTTP/1.1 to the GUI; nginx older than 1.29.7 needs `proxy_http_version 1.1`. The GUI closes idle connections after 5 seconds, so set the proxy's upstream idle timeout lower (nginx `keepalive_timeout` in the `upstream` block, Traefik `idleConnTimeout`).
+4. Create the admin account before anyone else can reach the proxy.
+5. Check that the session cookie is `__Host-cfddns_session` and `Secure`, that the account survives a restart, and that other Host or Origin values get `403`.
 
 ### Dokploy
 
-1. Fork this repository or push it to your own GitHub account.
-2. In Dokploy, choose **Create Service › Application** and pick the repository.
-3. Set the build type to **Dockerfile** at the repository root. No build arguments are needed.
-4. Set `CLOUDFLARE_API_TOKEN`, `PUBLIC_ORIGIN=https://dns-admin.example.com` (with your own hostname) and `SECURE_COOKIES=true`. Add `DOMAINS` only if you want the DDNS dashboard.
-5. Under **Mounts › Add Volume**, mount a volume at `/data` so the admin account survives redeploys.
-6. Restrict the domain to your admin network, create the account, then attach the hostname. Keep the container port unreachable from the public network.
+1. Push this repository to your own GitHub account. In Dokploy, choose **Create Service › Application** and pick it.
+2. Set the build type to **Dockerfile** at the repository root.
+3. Set `CLOUDFLARE_API_TOKEN`, `PUBLIC_ORIGIN` with your hostname and `SECURE_COOKIES=true`. Add `DOMAINS` if you want the DDNS page.
+4. Under **Mounts › Add Volume**, mount a volume at `/data`.
+5. Restrict the domain to your admin network, create the account, then attach the hostname. Keep the container port off the public network.
 
 ### Build from source
 
 ```bash
 cargo build --locked --release     # binary: target/release/cloudflare-ddns-webui
 DATA_DIR=./data ./target/release/cloudflare-ddns-webui
-docker build -t cloudflare-ddns-webui .
 ```
 
-The Dockerfile builds a static musl binary, compresses it with UPX and copies it into a `FROM scratch` image that runs as UID/GID 65534 with a writable `/data`.
+The Dockerfile builds a static musl binary, compresses it with UPX and runs it in a `FROM scratch` image as UID/GID 65534. On SIGTERM (`docker stop`) or SIGINT (Ctrl+C) the GUI stops accepting connections, gives requests in progress up to 5 seconds and exits with status 0, inside Docker's 10-second stop timeout.
 
-## 🛡️ Two-factor authentication and recovery
+## 🛡️ Two-factor authentication
 
-1. Go to **Settings › Security › Enable 2FA** and enter your current password.
-2. Scan the QR code with an authenticator app (Aegis, Bitwarden, 2FAS, Google Authenticator and others) and confirm with a 6-digit code.
-3. Save the backup codes right away. They are shown once, can be downloaded as a `.txt` file, and each one works once. The page keeps showing them until you press Done; reloading the page or logging out clears them.
-4. Later logins accept either the current TOTP code or one backup code.
-5. Disabling 2FA needs a valid TOTP or backup code. Changing the password needs the current password, plus a 2FA code when 2FA is on.
+1. Go to **Settings › Security › Enable 2FA**, enter your password, scan the QR code with an authenticator app and confirm with a 6-digit code.
+2. Save the backup codes. They are shown once, can be downloaded as a `.txt` file, and each one works once.
+3. Logins then need the current TOTP code or one backup code. Each TOTP code works once, so right after logging in, wait for the next code before disabling 2FA or changing the password.
 
-If you lose both the authenticator and the backup codes, stop the service and remove remote access. Then delete `state.json` from the data volume, start the GUI on loopback, and create the new account before reopening the proxy. If `state.json` is present but unreadable or invalid, the GUI refuses to start instead of resetting the account.
+Disabling 2FA needs a code, and changing the password needs the current password plus a code.
+
+If you lose both the authenticator and the backup codes, stop the service and remove remote access. Delete `state.json` from the data volume, then create a new account over loopback. If `state.json` is present but unreadable or invalid, the GUI refuses to start instead of resetting the account.
 
 ## 🔒 Security notes
 
-- The admin password is stored only as a PBKDF2-HMAC-SHA256 hash (100,000 iterations, per-account salt) in `state.json` with mode `600`. Backup codes are stored as salted one-way hashes and are consumed when used.
-- Sessions are random 256-bit tokens kept in memory, so a restart logs everyone out. Changing the password or 2FA revokes existing sessions and pending login challenges.
-- Failed passwords are rate-limited per source IP. Failed 2FA codes share one account-wide limit of five attempts per five minutes across logins and sensitive actions. These counters reset when the process restarts.
-- Every write needs both the session cookie and a custom header that browsers will not send cross-site.
-- Responses carry a strict Content-Security-Policy (`default-src 'self'`, no inline scripts or styles), `X-Frame-Options: DENY`, `nosniff` and `no-referrer`.
-- Logo and favicon uploads accept PNG, JPEG, WebP and GIF only, with checks on type, container format, size and dimensions. SVG is rejected. The image data itself is not decoded.
-- The HTTP server accepts at most 16 connections, limits request bodies to 2 MiB, and gives each request 30 seconds to arrive and 30 seconds to be answered.
-- The BIND import check supports the documented record types, `$ORIGIN` and `$TTL`, default and inherited TTLs, omitted owners, escaped names and multi-line records. It is not a complete RFC parser. If Cloudflare's reply to an import is missing its counts, the result is reported as unknown; check the zone before you retry, because the import may already have gone through.
-- State changes are written to a private temporary file, synced and renamed before the in-memory state changes. A failed save does not consume a backup code or log you in. Durability after a power loss is not guaranteed, because the parent directory is not synced.
+- The password is stored in `state.json` (mode `600`) as a PBKDF2-HMAC-SHA256 hash with 600,000 iterations. Hashes from older versions use 100,000 and are upgraded at your next login. Older versions then reject the password, so keep a copy of `state.json` before upgrading if you might roll back; restoring it also undoes later password and 2FA changes.
+- Backup codes are stored as salted PBKDF2 hashes with 100,000 iterations and removed when used. Codes from older versions have no salt of their own; while any are left, the GUI logs a warning at startup, and disabling and re-enabling 2FA replaces them.
+- Sessions are random 256-bit tokens kept in memory, so a restart logs everyone out. Changing the password or 2FA signs out existing sessions.
+- Failed passwords are limited per IP address, or per /64 for IPv6. Behind a reverse proxy every client shares the proxy's address and its limit. Failed 2FA codes share one account-wide limit of five per five minutes. Both counters reset on restart.
+- Every write needs the session cookie and a header that browsers won't send cross-site. Request bodies with unknown fields are rejected.
+- Responses carry a strict Content-Security-Policy with no inline scripts or styles, plus anti-framing, `nosniff`, `no-referrer`, COOP, CORP and `Permissions-Policy` headers. An HTTPS `PUBLIC_ORIGIN` adds HSTS.
+- Logo uploads accept PNG, JPEG, WebP and GIF after checks on format, size and dimensions. SVG is rejected.
+- The server keeps at most 16 connections and answers more with `503`. Request bodies are capped at 2 MiB, each request and each response gets 30 seconds, and idle connections close after 5 seconds. It speaks HTTP/1.1 only and rejects absolute-form targets, which RFC 9112 §3.2.2 says a server must accept.
+- The BIND import check handles the supported record types, `$ORIGIN`, `$TTL` and multi-line records, but it is not a full RFC parser. If Cloudflare's import reply lacks its counts, the result is reported as unknown; check the zone before you retry.
+- Changes are written to a private temporary file, synced and renamed into place before the GUI's state changes, so a failed save never applies a password or 2FA change or uses up a backup code. An invalid `ui-settings.json` is renamed to `ui-settings.json.invalid` and the default appearance is used; an unreadable one stops startup.
 - The Cloudflare token stays on the server. The browser only talks to the GUI.
 
 ## 🩺 Troubleshooting
 
 ### "... is unsupported by the GUI DDNS v1 contract"
 
-The GUI found one of the [updater settings it rejects](#updater-settings-the-gui-rejects), usually because it was given the updater's env file. Remove the setting from the GUI's environment.
+The GUI found a [setting it rejects](#updater-settings-the-gui-rejects), usually from the updater's env file. Remove it from the GUI's environment.
 
 ### "untrusted Host or Origin"
 
-The request came through a hostname the GUI does not trust. Set `PUBLIC_ORIGIN` to the exact origin your proxy serves, including the scheme and any non-default port. Without it, only numeric IP and `localhost` addresses work.
+Set `PUBLIC_ORIGIN` to the exact origin your proxy serves, with the scheme and any non-default port. Without it, only IP addresses and `localhost` work.
 
 ### The admin account is gone after an update
 
@@ -299,51 +288,44 @@ The container was recreated without a volume at `/data`. Mount one, then create 
 
 ### "Permission denied" writing to `/data`
 
-The image runs as UID 65534. A bind-mounted directory must be writable by that user, or start the container with `--user` set to the directory owner's UID and GID.
+The image runs as UID 65534. Make the bind-mounted directory writable by that user, or start the container with `--user` set to the directory owner's UID and GID.
+
+### "cannot load UI settings"
+
+The GUI cannot read `ui-settings.json` or the icon file it names. Fix the permissions, or move the file out of the data directory to start with the default appearance.
 
 ### Update now skips IPv6
 
-Docker's default bridge network has no IPv6, so `cloudflare.trace` cannot reach Cloudflare over IPv6. Run the container with host networking, or set `IP6_PROVIDER=none` if you do not need AAAA records.
+Docker's default bridge network has no IPv6, so `cloudflare.trace` cannot reach Cloudflare over IPv6. Use host networking, or set `IP6_PROVIDER=none` if you don't need AAAA records.
 
 ### "no matching Cloudflare zone"
 
-The token cannot see the zone for that domain. Add **Zone › Zone › Read** and include the zone under **Zone Resources**.
+The token cannot see the zone. Add **Zone › Zone › Read** and include the zone under **Zone Resources**.
 
 ## 🧪 Development
 
-[`scripts/mock-cloudflare-api.py`](scripts/mock-cloudflare-api.py) mocks the Cloudflare API with a synthetic `example.com` zone, so you can work on the UI without a real token. The smoke harness starts the GUI against it with temporary state and never reads the local `.env` or `data/`:
+[`scripts/mock-cloudflare-api.py`](scripts/mock-cloudflare-api.py) mocks the Cloudflare API with a synthetic `example.com` zone. The smoke harness runs the GUI against it with temporary state and never reads `.env` or `data/`:
 
 ```bash
 cargo build --locked --release
-python3 scripts/smoke-test.py --serve              # disposable instance on a random loopback port
-python3 scripts/smoke-test.py --serve --port 8888  # fixed port
+python3 scripts/smoke-test.py --serve --port 8888   # disposable instance on loopback
+python3 scripts/smoke-test.py                        # full smoke test
 ```
 
-The harness prints a synthetic password for the instance.
-
-Checks to run before opening a PR:
-
-```bash
-git diff --check
-cargo fmt -- --check
-cargo clippy --locked --all-targets -- -D warnings
-cargo test --locked
-cargo build --locked --release
-node --check web/app.js
-node --test web/app.test.cjs web/appearance.test.cjs
-python3 scripts/smoke-test.py
-```
-
-For container changes, also run `docker build -t cloudflare-ddns-webui:test .` and `python3 scripts/smoke-test.py --container-image cloudflare-ddns-webui:test`.
-
-Contributors and AI agents should read [AGENTS.md](AGENTS.md) first.
+Log in to the disposable instance with the `PASSWORD` constant from `scripts/smoke-test.py`. Contributors and AI agents should read [AGENTS.md](AGENTS.md) first; it lists every check to run before a PR.
 
 ## 🔗 Helpful links
 
-- [cloudflare-ddns](https://github.com/timothymiller/cloudflare-ddns), the updater this GUI is built to sit beside
+- [cloudflare-ddns](https://github.com/timothymiller/cloudflare-ddns), the updater this GUI sits beside
 - [Cloudflare API tokens](https://dash.cloudflare.com/profile/api-tokens) ([how to create one](https://developers.cloudflare.com/fundamentals/api/get-started/create-token/))
 - [Cloudflare IP ranges](https://www.cloudflare.com/ips/)
 
 ## 📜 License
 
 This project is licensed under the GNU General Public License, version 3 (GPLv3).
+
+## 👨‍💻 Author
+
+FilipNone
+
+[View my GitHub profile 💡](https://github.com/FilipNone)

@@ -1,31 +1,72 @@
 //! HTTP routing: static GUI assets, session auth (first-run setup, 2FA),
 //! UI customization, and the JSON API that proxies the Cloudflare API.
 
-use crate::auth::{Auth, Login2faOutcome, LoginStep1Outcome};
-use crate::cloudflare::{ApiFailure, CloudflareClient, DnsRecord, RecordPatch, RecordPayload};
-use crate::config::Config;
-use crate::customize::UiStore;
+use crate::auth::{Auth, AuthError, Login2faOutcome, LoginStep1Outcome};
+use crate::cloudflare::{
+    ApiFailure, BatchDelete, BatchPatch, BatchRequest, CaaData, CloudflareClient, DnsRecord,
+    RecordData, RecordPatch, RecordPayload, SrvData, SvcbData, BATCH_LIMIT,
+};
+use crate::config::{bare_url, host_ip, is_loopback_host, valid_ttl, Config, MAX_RECORD_COMMENT};
+use crate::customize::{UiError, UiStore};
 use crate::ddns;
 use crate::http::{Request, Response};
-use crate::pp::PP;
+use crate::pp::{self, PP};
+use serde::de::DeserializeOwned;
 use serde::Deserialize;
-use serde_json::json;
-use std::sync::Arc;
+use serde_json::{json, Value};
+use std::sync::{Arc, LazyLock};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const SESSION_COOKIE: &str = "cfddns_session";
+/// The cookie name with `SECURE_COOKIES=true`. Browsers accept the `__Host-`
+/// prefix only on a Secure cookie with `Path=/` and no Domain, so another
+/// subdomain cannot set or shadow it.
+const SECURE_SESSION_COOKIE: &str = "__Host-cfddns_session";
 
-const INDEX_HTML: &str = include_str!("../web/index.html");
+static INDEX_HTML: LazyLock<String> =
+    LazyLock::new(|| include_str!("../web/index.html").replace("__VERSION__", VERSION));
 const STYLE_CSS: &str = include_str!("../web/style.css");
-const APP_JS: &str = include_str!("../web/app.js");
 const FAVICON_SVG: &str = include_str!("../web/favicon.svg");
+
+const JAVASCRIPT: &str = "application/javascript; charset=utf-8";
+
+/// Embeds `web/<file>` as a script served at `/static/<file>`.
+macro_rules! script {
+    ($file:literal) => {
+        (
+            concat!("/static/", $file),
+            include_str!(concat!("../web/", $file)),
+        )
+    };
+}
+
+/// Path and body of every script that index.html loads.
+const SCRIPTS: &[(&str, &str)] = &[
+    script!("js/core.js"),
+    script!("js/i18n.js"),
+    script!("js/ui.js"),
+    script!("js/api.js"),
+    script!("js/login.js"),
+    script!("js/dashboard.js"),
+    script!("js/records.js"),
+    script!("js/record-modals.js"),
+    script!("js/settings.js"),
+    script!("app.js"),
+];
 
 const PROXIABLE_TYPES: [&str; 3] = ["A", "AAAA", "CNAME"];
 pub const GITHUB_URL: &str = "https://github.com/FilipNone/cloudflare-ddns-webui";
 
+const CONTENT_SECURITY_POLICY: &str = "default-src 'self'; script-src 'self'; style-src 'self'; \
+    img-src 'self' data:; connect-src 'self'; font-src 'self'; frame-ancestors 'none'; \
+    base-uri 'self'; form-action 'self'";
+/// The GUI uses none of these browser features.
+const PERMISSIONS_POLICY: &str = "camera=(), microphone=(), geolocation=(), payment=(), usb=()";
+
 pub struct AppState {
     pub cfg: Config,
     pub cf: CloudflareClient,
+    pub detector: ddns::Detector,
     pub auth: Auth,
     pub ui: UiStore,
     pub pp: PP,
@@ -41,30 +82,36 @@ impl Drop for DdnsCycleGuard<'_> {
 }
 
 // --- DTOs ---
+// Unknown fields are rejected, so a misspelled field gets a 400.
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PasswordBody {
     password: String,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SetupBody {
     password: String,
     confirm: String,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct TotpBody {
     code: String,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Login2faBody {
     challenge: String,
     code: String,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ChangePasswordBody {
     current_password: String,
     code: Option<String>,
@@ -73,12 +120,15 @@ struct ChangePasswordBody {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct AccentBody {
     accent: Option<String>,
 }
 
+/// Body of record create and update requests.
 #[derive(Deserialize)]
-struct CreateRecordBody {
+#[serde(deny_unknown_fields)]
+struct RecordBody {
     #[serde(rename = "type")]
     record_type: String,
     name: String,
@@ -88,10 +138,12 @@ struct CreateRecordBody {
     comment: Option<String>,
     tags: Option<Vec<String>>,
     priority: Option<u16>,
-    data: Option<serde_json::Value>,
+    /// Its shape depends on the record type, so `record_data` parses it.
+    data: Option<Value>,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct BulkBody {
     action: String,
     ids: Vec<String>,
@@ -99,6 +151,7 @@ struct BulkBody {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct BulkPatch {
     ttl: Option<i64>,
     proxied: Option<bool>,
@@ -108,22 +161,54 @@ struct BulkPatch {
 
 // --- Response helpers ---
 
-fn security_headers(resp: Response) -> Response {
-    resp.header("X-Content-Type-Options", "nosniff")
-        .header("X-Frame-Options", "DENY")
-        .header("Referrer-Policy", "no-referrer")
-        .header(
-            "Content-Security-Policy",
-            "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; font-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'",
-        )
+/// The headers every response from `handle` carries.
+fn security_headers(cfg: &Config) -> Vec<(String, String)> {
+    let mut headers = vec![
+        ("X-Content-Type-Options", "nosniff"),
+        ("X-Frame-Options", "DENY"),
+        ("Referrer-Policy", "no-referrer"),
+        ("Content-Security-Policy", CONTENT_SECURITY_POLICY),
+        ("Cross-Origin-Opener-Policy", "same-origin"),
+        ("Cross-Origin-Resource-Policy", "same-origin"),
+        ("Permissions-Policy", PERMISSIONS_POLICY),
+    ];
+    // An https PUBLIC_ORIGIN is the only setup where browsers are known to
+    // reach the GUI over HTTPS.
+    if cfg
+        .public_origin
+        .as_ref()
+        .is_some_and(|origin| origin.scheme() == "https")
+    {
+        headers.push(("Strict-Transport-Security", "max-age=31536000"));
+    }
+    headers
+        .into_iter()
+        .map(|(name, value)| (name.to_string(), value.to_string()))
+        .collect()
 }
 
 fn api_response(resp: Response) -> Response {
-    security_headers(resp.header("Cache-Control", "no-store"))
+    resp.header("Cache-Control", "no-store")
 }
 
-fn bad_request(msg: &str) -> Response {
-    api_response(Response::json_error(400, msg))
+fn api_json<T: serde::Serialize>(status: u16, value: &T) -> Response {
+    api_response(Response::json(status, value))
+}
+
+fn api_error(status: u16, message: &str) -> Response {
+    api_response(Response::json_error(status, message))
+}
+
+fn bad_request(message: &str) -> Response {
+    api_error(400, message)
+}
+
+fn not_found() -> Response {
+    api_error(404, "not found")
+}
+
+fn ok() -> Response {
+    api_json(200, &json!({ "ok": true }))
 }
 
 fn cf_error_response(e: ApiFailure) -> Response {
@@ -133,24 +218,47 @@ fn cf_error_response(e: ApiFailure) -> Response {
         429 => 429,
         _ => 502,
     };
-    api_response(Response::json_error(status, &e.to_string()))
+    api_error(status, &e.to_string())
 }
 
-fn session_cookie(state: &AppState, token: &str) -> String {
+fn json_body<T: DeserializeOwned>(req: &Request) -> Result<T, Response> {
+    req.json().map_err(|e| bad_request(&e))
+}
+
+fn cookie_name(cfg: &Config) -> &'static str {
+    if cfg.secure_cookies {
+        SECURE_SESSION_COOKIE
+    } else {
+        SESSION_COOKIE
+    }
+}
+
+/// Builds the session Set-Cookie value. Logout sends an empty value with
+/// `Max-Age=0` and the same attributes, which makes the browser drop it.
+fn session_cookie(cfg: &Config, token: &str, max_age: u64) -> String {
     let mut cookie = format!(
-        "{SESSION_COOKIE}={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age={}",
-        state.cfg.session_ttl.as_secs()
+        "{}={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age={max_age}",
+        cookie_name(cfg)
     );
-    if state.cfg.secure_cookies {
+    if cfg.secure_cookies {
         cookie.push_str("; Secure");
     }
     cookie
 }
 
+fn with_session(resp: Response, cfg: &Config, token: &str) -> Response {
+    resp.header(
+        "Set-Cookie",
+        &session_cookie(cfg, token, cfg.session_ttl.as_secs()),
+    )
+}
+
+fn session_token(state: &AppState, req: &Request) -> Option<String> {
+    req.cookie(cookie_name(&state.cfg))
+}
+
 fn authenticated(state: &AppState, req: &Request) -> bool {
-    req.cookie(SESSION_COOKIE)
-        .map(|t| state.auth.session_valid(&t))
-        .unwrap_or(false)
+    session_token(state, req).is_some_and(|token| state.auth.session_valid(&token))
 }
 
 fn mutation_allowed(req: &Request) -> bool {
@@ -166,143 +274,155 @@ fn valid_record_type(t: &str) -> bool {
     )
 }
 
-fn normalize_ttl(ttl: Option<i64>) -> Result<i64, String> {
-    match ttl.unwrap_or(1) {
-        1 => Ok(1),
-        v if (30..=86400).contains(&v) => Ok(v),
+/// Checks a record TTL, where a missing one means 1 (automatic).
+fn record_ttl(ttl: Option<i64>) -> Result<i64, String> {
+    let ttl = ttl.unwrap_or(1);
+    match u32::try_from(ttl) {
+        Ok(seconds) if valid_ttl(seconds) => Ok(ttl),
         _ => Err("TTL must be 1 (auto) or between 30 and 86400 seconds".to_string()),
     }
 }
 
-fn auth_error(error: &str) -> Response {
+fn auth_error(error: AuthError) -> Response {
     let status = match error {
-        "locked_out" | "too_many_attempts" => 429,
-        "persistence_failed" => 500,
-        "invalid_password" | "invalid_code" | "challenge_expired" => 401,
-        _ => 400,
+        AuthError::LockedOut => 429,
+        AuthError::PersistenceFailed | AuthError::Internal => 500,
+        AuthError::InvalidPassword
+        | AuthError::InvalidCode
+        | AuthError::CodeAlreadyUsed
+        | AuthError::ChallengeExpired => 401,
+        AuthError::AlreadyConfigured => 409,
+        AuthError::NotConfigured
+        | AuthError::TotpAlreadyEnabled
+        | AuthError::TotpNotEnabled
+        | AuthError::EnrollmentExpired
+        | AuthError::EnrollmentCodeRejected
+        | AuthError::PasswordTooShort
+        | AuthError::PasswordTooLong => 400,
     };
-    api_response(Response::json_error(status, error))
+    api_error(status, error.message())
+}
+
+/// Runs an `Auth` call on the blocking pool. PBKDF2 is slow on purpose, and
+/// on the single runtime thread it would stall every other connection.
+async fn run_auth<T, F>(state: &Arc<AppState>, call: F) -> Result<T, AuthError>
+where
+    T: Send + 'static,
+    F: FnOnce(&Auth) -> Result<T, AuthError> + Send + 'static,
+{
+    let state = Arc::clone(state);
+    tokio::task::spawn_blocking(move || call(&state.auth))
+        .await
+        .unwrap_or(Err(AuthError::Internal))
+}
+
+/// Runs a UI settings change on the blocking pool, because saving writes
+/// and syncs files.
+async fn run_ui<F>(state: &Arc<AppState>, change: F) -> Result<Response, Response>
+where
+    F: FnOnce(&UiStore) -> Result<(), UiError> + Send + 'static,
+{
+    let task_state = Arc::clone(state);
+    match tokio::task::spawn_blocking(move || change(&task_state.ui)).await {
+        Ok(Ok(())) => Ok(ok()),
+        Ok(Err(UiError::Invalid(message))) => Err(bad_request(&message)),
+        Ok(Err(UiError::Save(error))) => {
+            state.pp.errorf(
+                pp::EMOJI_ERROR,
+                format!("Cannot save appearance settings: {error}"),
+            );
+            Err(api_error(500, "cannot save appearance settings"))
+        }
+        Err(_) => Err(api_error(500, "internal_error")),
+    }
 }
 
 // --- Router ---
 
 pub async fn handle(state: Arc<AppState>, req: Request) -> Response {
-    if !request_origin_allowed(&state.cfg, &req) {
-        return api_response(Response::json_error(403, "untrusted Host or Origin"));
-    }
-    let method = req.method.clone();
-    let method = method.as_str();
-    let path = req.path.clone();
-    let path = path.as_str();
+    let mut resp = respond(&state, req).await;
+    // The shared headers go first, so a route's own policy, such as the
+    // favicon's sandbox CSP, comes after the general one.
+    resp.headers.splice(0..0, security_headers(&state.cfg));
+    resp
+}
 
-    if method == "GET" || method == "HEAD" {
-        match path {
-            "/" => {
-                let html = INDEX_HTML.replace("__VERSION__", VERSION);
-                return security_headers(Response::new(200, "text/html; charset=utf-8", html))
-                    .header("Cache-Control", "no-cache");
-            }
-            "/static/style.css" => {
-                let css = state
-                    .ui
-                    .accent()
-                    .map(|accent| format!("{STYLE_CSS}\n:root{{--accent:{accent};}}"))
-                    .unwrap_or_else(|| STYLE_CSS.to_owned());
-                return security_headers(Response::new(200, "text/css; charset=utf-8", css))
-                    .header("Cache-Control", "no-cache");
-            }
-            "/static/default-logo.svg" => {
-                // Always the built-in cloud, even after a custom favicon upload.
-                return security_headers(Response::new(200, "image/svg+xml", FAVICON_SVG))
-                    .header("Cache-Control", "no-cache");
-            }
-            "/static/app.js" => {
-                return security_headers(Response::new(
-                    200,
-                    "application/javascript; charset=utf-8",
-                    APP_JS,
-                ))
-                .header("Cache-Control", "no-cache");
-            }
-            "/static/favicon.svg" => {
-                if let Some((mime, data)) = state.ui.icon() {
-                    return security_headers(Response::new(200, &mime, data))
-                        .header("Content-Security-Policy", "sandbox; default-src 'none'")
-                        .header("Cache-Control", "no-cache");
-                }
-                return security_headers(Response::new(200, "image/svg+xml", FAVICON_SVG))
-                    .header("Cache-Control", "no-cache");
-            }
-            _ => {}
+async fn respond(state: &Arc<AppState>, req: Request) -> Response {
+    if !request_origin_allowed(&state.cfg, &req) {
+        return api_error(403, "untrusted Host or Origin");
+    }
+    // The HTTP layer serves HEAD requests as GET.
+    if req.method == "GET" {
+        if let Some(resp) = static_file(state, &req.path) {
+            return resp;
         }
     }
-
-    if let Some(rest) = path.strip_prefix("/api/") {
-        let segments: Vec<&str> = rest.split('/').filter(|s| !s.is_empty()).collect();
-        return handle_api(state, req, &segments).await;
+    let path = req.path.clone();
+    let Some(rest) = path.strip_prefix("/api/") else {
+        return Response::json_error(404, "not found");
+    };
+    let segments: Vec<&str> = rest.split('/').filter(|s| !s.is_empty()).collect();
+    match route(state, req, &segments).await {
+        Ok(resp) | Err(resp) => resp,
     }
+}
 
-    security_headers(Response::json_error(404, "not found"))
+fn static_file(state: &AppState, path: &str) -> Option<Response> {
+    let resp = match path {
+        "/" => Response::new(200, "text/html; charset=utf-8", INDEX_HTML.as_str()),
+        "/static/style.css" => {
+            let css = state
+                .ui
+                .accent()
+                .map(|accent| format!("{STYLE_CSS}\n:root{{--accent:{accent};}}"))
+                .unwrap_or_else(|| STYLE_CSS.to_owned());
+            Response::new(200, "text/css; charset=utf-8", css)
+        }
+        // Always the built-in cloud, even after a custom favicon upload.
+        "/static/default-logo.svg" => Response::new(200, "image/svg+xml", FAVICON_SVG),
+        "/static/favicon.svg" => match state.ui.icon() {
+            Some((mime, data)) => Response::new(200, &mime, data)
+                .header("Content-Security-Policy", "sandbox; default-src 'none'"),
+            None => Response::new(200, "image/svg+xml", FAVICON_SVG),
+        },
+        _ => {
+            let (_, body) = SCRIPTS.iter().find(|(file, _)| *file == path)?;
+            Response::new(200, JAVASCRIPT, *body)
+        }
+    };
+    Some(resp.header("Cache-Control", "no-cache"))
 }
 
 fn request_origin_allowed(cfg: &Config, req: &Request) -> bool {
     let Some(host) = req.header("host") else {
         return false;
     };
-    let scheme = if cfg
+    let scheme = cfg
         .public_origin
-        .as_deref()
-        .is_some_and(|s| s.starts_with("https://"))
-    {
-        "https"
-    } else {
-        "http"
-    };
+        .as_ref()
+        .map_or("http", |url| url.scheme());
     let Ok(host_url) = reqwest::Url::parse(&format!("{scheme}://{host}")) else {
         return false;
     };
-    if !host_url.username().is_empty()
-        || host_url.password().is_some()
-        || host_url.path() != "/"
-        || host_url.query().is_some()
-        || host_url.fragment().is_some()
-    {
+    if !bare_url(&host_url) || host_url.path() != "/" {
         return false;
     }
-    let expected_origin = if let Some(origin) = &cfg.public_origin {
-        let Ok(trusted) = reqwest::Url::parse(origin) else {
-            return false;
-        };
-        let host_port =
-            host_url
-                .port()
-                .unwrap_or(if trusted.scheme() == "https" { 443 } else { 80 });
+    let expected_origin = if let Some(trusted) = &cfg.public_origin {
         if trusted.host_str() != host_url.host_str()
-            || trusted.port_or_known_default() != Some(host_port)
+            || trusted.port_or_known_default() != host_url.port_or_known_default()
         {
             return false;
         }
         trusted.origin().ascii_serialization()
     } else {
-        let Ok(listen) = cfg.listen.parse::<std::net::SocketAddr>() else {
-            return false;
-        };
-        if host_url.port_or_known_default() != Some(listen.port()) {
-            return false;
-        }
-        let host_name = host_url.host_str().unwrap_or("").trim_matches(['[', ']']);
-        let address = if host_name == "localhost" {
-            Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
+        let listen = cfg.listen.ip();
+        let host_matches = if listen.is_unspecified() {
+            host_ip(&host_url).is_some() || is_loopback_host(&host_url)
         } else {
-            host_name.parse::<std::net::IpAddr>().ok()
+            host_ip(&host_url) == Some(listen)
+                || (listen.is_loopback() && is_loopback_host(&host_url))
         };
-        let Some(address) = address else {
-            return false;
-        };
-        if !listen.ip().is_unspecified()
-            && address != listen.ip()
-            && !(listen.ip().is_loopback() && address.is_loopback())
-        {
+        if !host_matches || host_url.port_or_known_default() != Some(cfg.listen.port()) {
             return false;
         }
         host_url.origin().ascii_serialization()
@@ -311,185 +431,164 @@ fn request_origin_allowed(cfg: &Config, req: &Request) -> bool {
         .is_none_or(|origin| origin == expected_origin)
 }
 
-async fn handle_api(state: Arc<AppState>, req: Request, segments: &[&str]) -> Response {
-    let method = req.method.as_str();
-
-    // --- Public endpoints ---
-    match (method, segments) {
-        ("GET", ["config"]) => {
-            let ui = state.ui.status();
-            return api_response(Response::json(
-                200,
-                &json!({
-                    "version": VERSION,
-                    "languages": [{ "code": "en", "name": "English" }],
-                    "ddns_configured": !state.cfg.domains.is_empty(),
-                    "configured": state.auth.is_configured(),
-                    "totp_enabled": state.auth.totp_enabled(),
-                    "accent": ui.accent,
-                    "has_icon": ui.has_icon,
-                    "github": GITHUB_URL,
-                }),
-            ));
-        }
-        ("POST", ["auth", "setup"]) => {
-            if state.auth.is_configured() {
-                return api_response(Response::json_error(409, "already configured"));
-            }
-            if !mutation_allowed(&req) {
-                return api_response(Response::json_error(403, "missing request header"));
-            }
-            let body: SetupBody = match req.json() {
-                Ok(b) => b,
-                Err(e) => return bad_request(&e),
-            };
-            if body.password != body.confirm {
-                return bad_request("passwords do not match");
-            }
-            match state.auth.setup_password_session(&body.password) {
-                Ok(token) => {
-                    state.pp.infof(
-                        crate::pp::EMOJI_LOCK,
-                        "Admin password created (first-run setup)",
-                    );
-                    return api_response(Response::json(200, &json!({ "ok": true })))
-                        .header("Set-Cookie", &session_cookie(&state, &token));
-                }
-                Err(e) => return bad_request(&e),
-            }
-        }
-        ("POST", ["auth", "login"]) => {
-            if !mutation_allowed(&req) {
-                return api_response(Response::json_error(403, "missing request header"));
-            }
-            if !state.auth.is_configured() {
-                return api_response(Response::json_error(428, "setup required"));
-            }
-            let ip = req.remote.ip();
-            if state.auth.limiter().is_locked_out(ip) {
-                return api_response(Response::json_error(
-                    429,
-                    "too many failed attempts - try again in a few minutes",
-                ));
-            }
-            let body: PasswordBody = match req.json() {
-                Ok(b) => b,
-                Err(e) => return bad_request(&e),
-            };
-            match state.auth.login_step1_session(ip, &body.password) {
-                Ok(LoginStep1Outcome::Session(token)) => {
-                    state.pp.infof(
-                        crate::pp::EMOJI_LOCK,
-                        &format!("Successful login from {ip}"),
-                    );
-                    return api_response(Response::json(
-                        200,
-                        &json!({ "ok": true, "requires_2fa": false }),
-                    ))
-                    .header("Set-Cookie", &session_cookie(&state, &token));
-                }
-                Ok(LoginStep1Outcome::Challenge(challenge)) => {
-                    return api_response(Response::json(
-                        200,
-                        &json!({ "ok": false, "requires_2fa": true, "challenge": challenge }),
-                    ));
-                }
-                Err("locked_out") => {
-                    return api_response(Response::json_error(429, "too many failed attempts"));
-                }
-                Err(_) => {
-                    state
-                        .pp
-                        .warningf(crate::pp::EMOJI_LOCK, &format!("Failed login from {ip}"));
-                    return api_response(Response::json_error(401, "invalid password"));
-                }
-            }
-        }
-        ("POST", ["auth", "login", "2fa"]) => {
-            if !mutation_allowed(&req) {
-                return api_response(Response::json_error(403, "missing request header"));
-            }
-            let ip = req.remote.ip();
-            let body: Login2faBody = match req.json() {
-                Ok(b) => b,
-                Err(e) => return bad_request(&e),
-            };
-            match state
-                .auth
-                .login_step2_session(ip, &body.challenge, &body.code)
-            {
-                Ok((Login2faOutcome::Totp, token)) => {
-                    state.pp.infof(
-                        crate::pp::EMOJI_LOCK,
-                        &format!("Successful 2FA login from {ip}"),
-                    );
-                    return api_response(Response::json(200, &json!({ "ok": true })))
-                        .header("Set-Cookie", &session_cookie(&state, &token));
-                }
-                Ok((Login2faOutcome::BackupCode { remaining }, token)) => {
-                    state.pp.warningf(
-                        crate::pp::EMOJI_LOCK,
-                        &format!("Backup code used from {ip} ({remaining} remaining)"),
-                    );
-                    return api_response(Response::json(
-                        200,
-                        &json!({ "ok": true, "backup_code_used": true, "backup_codes_remaining": remaining }),
-                    ))
-                    .header("Set-Cookie", &session_cookie(&state, &token));
-                }
-                Err("challenge_expired") => {
-                    return api_response(Response::json_error(
-                        401,
-                        "login session expired - sign in again",
-                    ));
-                }
-                Err("too_many_attempts" | "locked_out") => {
-                    return api_response(Response::json_error(
-                        429,
-                        "too many attempts - sign in again",
-                    ));
-                }
-                Err("persistence_failed") => return auth_error("persistence_failed"),
-                Err(_) => {
-                    return api_response(Response::json_error(401, "invalid code"));
-                }
-            }
-        }
+async fn route(
+    state: &Arc<AppState>,
+    req: Request,
+    segments: &[&str],
+) -> Result<Response, Response> {
+    // A cross-site page cannot add this header without a CORS preflight,
+    // which this server never approves.
+    if req.method != "GET" && !mutation_allowed(&req) {
+        return Err(api_error(403, "missing request header"));
+    }
+    match (req.method.as_str(), segments) {
+        ("GET", ["config"]) => return Ok(public_config(state)),
+        ("POST", ["auth", "setup"]) => return setup(state, &req).await,
+        ("POST", ["auth", "login"]) => return login(state, &req).await,
+        ("POST", ["auth", "login", "2fa"]) => return login_2fa(state, &req).await,
+        // Needs no valid session, so an expired one can still clear its cookie.
+        ("POST", ["auth", "logout"]) => return Ok(logout(state, &req)),
         _ => {}
     }
-
-    // --- Auth required below ---
-    if !authenticated(&state, &req) {
-        return api_response(Response::json_error(401, "authentication required"));
+    if !authenticated(state, &req) {
+        return Err(api_error(401, "authentication required"));
     }
-    if matches!(method, "POST" | "PUT" | "PATCH" | "DELETE") && !mutation_allowed(&req) {
-        return api_response(Response::json_error(403, "missing request header"));
+    match segments {
+        ["auth", ..] => account_routes(state, &req, segments).await,
+        ["ui", ..] => appearance_routes(state, req, segments).await,
+        ["zones", rest @ ..] => zone_routes(state, req, rest).await,
+        ["ddns", ..] => ddns_routes(state, &req, segments).await,
+        _ => Err(not_found()),
     }
+}
 
-    if let ["zones", zone_id, rest @ ..] = segments {
-        if let Err(e) = crate::cloudflare::validate_identifier(zone_id) {
-            return cf_error_response(e);
-        }
-        if let ["records", record_id] = rest {
-            if *record_id != "bulk" {
-                if let Err(e) = crate::cloudflare::validate_identifier(record_id) {
-                    return cf_error_response(e);
-                }
-            }
-        }
+// --- Public routes ---
+
+fn public_config(state: &AppState) -> Response {
+    let ui = state.ui.status();
+    api_json(
+        200,
+        &json!({
+            "version": VERSION,
+            "languages": [{ "code": "en", "name": "English" }],
+            "ddns_configured": !state.cfg.domains.is_empty(),
+            "configured": state.auth.is_configured(),
+            "accent": ui.accent,
+            "has_icon": ui.has_icon,
+            "github": GITHUB_URL,
+        }),
+    )
+}
+
+async fn setup(state: &Arc<AppState>, req: &Request) -> Result<Response, Response> {
+    if state.auth.is_configured() {
+        return Err(api_error(409, "already configured"));
     }
+    let body: SetupBody = json_body(req)?;
+    if body.password != body.confirm {
+        return Err(bad_request("passwords do not match"));
+    }
+    let token = run_auth(state, move |auth| {
+        auth.setup_password_session(&body.password)
+    })
+    .await
+    .map_err(auth_error)?;
+    state
+        .pp
+        .infof(pp::EMOJI_LOCK, "Admin password created (first-run setup)");
+    Ok(with_session(ok(), &state.cfg, &token))
+}
 
-    match (method, segments) {
-        ("POST", ["auth", "logout"]) => {
-            if let Some(token) = req.cookie(SESSION_COOKIE) {
-                state.auth.destroy_session(&token);
-            }
-            api_response(Response::json(200, &json!({ "ok": true }))).header(
-                "Set-Cookie",
-                &format!("{SESSION_COOKIE}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0"),
-            )
+async fn login(state: &Arc<AppState>, req: &Request) -> Result<Response, Response> {
+    if !state.auth.is_configured() {
+        return Err(api_error(428, "setup required"));
+    }
+    let ip = req.remote.ip();
+    if state.auth.limiter().is_locked_out(ip) {
+        return Err(api_error(
+            429,
+            "too many failed attempts - try again in a few minutes",
+        ));
+    }
+    let body: PasswordBody = json_body(req)?;
+    match run_auth(state, move |auth| {
+        auth.login_step1_session(ip, &body.password)
+    })
+    .await
+    {
+        Ok(LoginStep1Outcome::Session(token)) => {
+            state
+                .pp
+                .infof(pp::EMOJI_LOCK, format!("Successful login from {ip}"));
+            let resp = api_json(200, &json!({ "ok": true, "requires_2fa": false }));
+            Ok(with_session(resp, &state.cfg, &token))
         }
-        ("GET", ["auth", "me"]) => api_response(Response::json(
+        Ok(LoginStep1Outcome::Challenge(challenge)) => Ok(api_json(
+            200,
+            &json!({ "ok": false, "requires_2fa": true, "challenge": challenge }),
+        )),
+        Err(AuthError::LockedOut) => Err(api_error(429, "too many failed attempts")),
+        Err(AuthError::InvalidPassword) => {
+            state
+                .pp
+                .warningf(pp::EMOJI_LOCK, format!("Failed login from {ip}"));
+            Err(api_error(401, "invalid password"))
+        }
+        Err(e) => Err(auth_error(e)),
+    }
+}
+
+async fn login_2fa(state: &Arc<AppState>, req: &Request) -> Result<Response, Response> {
+    let ip = req.remote.ip();
+    let body: Login2faBody = json_body(req)?;
+    match run_auth(state, move |auth| {
+        auth.login_step2_session(ip, &body.challenge, &body.code)
+    })
+    .await
+    {
+        Ok((Login2faOutcome::Totp, token)) => {
+            state
+                .pp
+                .infof(pp::EMOJI_LOCK, format!("Successful 2FA login from {ip}"));
+            Ok(with_session(ok(), &state.cfg, &token))
+        }
+        Ok((Login2faOutcome::BackupCode { remaining }, token)) => {
+            state.pp.warningf(
+                pp::EMOJI_LOCK,
+                format!("Backup code used from {ip} ({remaining} remaining)"),
+            );
+            let resp = api_json(
+                200,
+                &json!({ "ok": true, "backup_code_used": true, "backup_codes_remaining": remaining }),
+            );
+            Ok(with_session(resp, &state.cfg, &token))
+        }
+        Err(AuthError::ChallengeExpired) => {
+            Err(api_error(401, "login session expired - sign in again"))
+        }
+        Err(AuthError::LockedOut) => Err(api_error(429, "too many attempts - sign in again")),
+        Err(e @ (AuthError::PersistenceFailed | AuthError::Internal)) => Err(auth_error(e)),
+        Err(_) => Err(api_error(401, "invalid code")),
+    }
+}
+
+fn logout(state: &AppState, req: &Request) -> Response {
+    if let Some(token) = session_token(state, req) {
+        state.auth.destroy_session(&token);
+    }
+    ok().header("Set-Cookie", &session_cookie(&state.cfg, "", 0))
+}
+
+// --- Account: 2FA and password ---
+
+async fn account_routes(
+    state: &Arc<AppState>,
+    req: &Request,
+    segments: &[&str],
+) -> Result<Response, Response> {
+    let ip = req.remote.ip();
+    match (req.method.as_str(), segments) {
+        ("GET", ["auth", "me"]) => Ok(api_json(
             200,
             &json!({
                 "authenticated": true,
@@ -498,251 +597,203 @@ async fn handle_api(state: Arc<AppState>, req: Request, segments: &[&str]) -> Re
                 "backup_codes_remaining": state.auth.backup_codes_remaining(),
             }),
         )),
-
-        // --- 2FA management ---
         ("POST", ["auth", "2fa", "begin"]) => {
-            let body: PasswordBody = match req.json() {
-                Ok(b) => b,
-                Err(e) => return bad_request(&e),
-            };
-            match state
-                .auth
-                .totp_enroll_begin_verified(req.remote.ip(), &body.password)
-            {
-                Ok((secret, uri, qr)) => api_response(Response::json(
-                    200,
-                    &json!({ "secret": secret, "uri": uri, "qr_svg": qr }),
-                )),
-                Err(e) => auth_error(&e),
-            }
+            let body: PasswordBody = json_body(req)?;
+            let (secret, uri, qr) = run_auth(state, move |auth| {
+                auth.totp_enroll_begin_verified(ip, &body.password)
+            })
+            .await
+            .map_err(auth_error)?;
+            Ok(api_json(
+                200,
+                &json!({ "secret": secret, "uri": uri, "qr_svg": qr }),
+            ))
         }
         ("POST", ["auth", "2fa", "confirm"]) => {
-            let body: TotpBody = match req.json() {
-                Ok(b) => b,
-                Err(e) => return bad_request(&e),
-            };
-            match state.auth.totp_enroll_confirm_session(&body.code) {
-                Ok((codes, token)) => {
-                    state.pp.infof(crate::pp::EMOJI_LOCK, "2FA enabled");
-                    api_response(Response::json(200, &json!({ "backup_codes": codes })))
-                        .header("Set-Cookie", &session_cookie(&state, &token))
-                }
-                Err(e) => auth_error(&e),
-            }
+            let body: TotpBody = json_body(req)?;
+            let (codes, token) = run_auth(state, move |auth| {
+                auth.totp_enroll_confirm_session(&body.code)
+            })
+            .await
+            .map_err(auth_error)?;
+            state.pp.infof(pp::EMOJI_LOCK, "2FA enabled");
+            let resp = api_json(200, &json!({ "backup_codes": codes }));
+            Ok(with_session(resp, &state.cfg, &token))
         }
         ("POST", ["auth", "2fa", "cancel"]) => {
-            state.auth.totp_enroll_cancel();
-            api_response(Response::json(200, &json!({ "ok": true })))
+            // Cancel waits for the lock that hashing calls hold.
+            run_auth(state, |auth| {
+                auth.totp_enroll_cancel();
+                Ok(())
+            })
+            .await
+            .map_err(auth_error)?;
+            Ok(ok())
         }
         ("POST", ["auth", "2fa", "disable"]) => {
-            let body: TotpBody = match req.json() {
-                Ok(b) => b,
-                Err(e) => return bad_request(&e),
-            };
+            let body: TotpBody = json_body(req)?;
             if !state.auth.totp_enabled() {
-                return bad_request("2FA is not enabled");
+                return Err(bad_request("2FA is not enabled"));
             }
-            match state
-                .auth
-                .totp_disable_verified(req.remote.ip(), &body.code)
-            {
-                Ok(token) => {
-                    state.pp.infof(crate::pp::EMOJI_LOCK, "2FA disabled");
-                    api_response(Response::json(200, &json!({ "ok": true })))
-                        .header("Set-Cookie", &session_cookie(&state, &token))
-                }
-                Err(e) => auth_error(e),
-            }
+            let token = run_auth(state, move |auth| {
+                auth.totp_disable_verified(ip, &body.code)
+            })
+            .await
+            .map_err(auth_error)?;
+            state.pp.infof(pp::EMOJI_LOCK, "2FA disabled");
+            Ok(with_session(ok(), &state.cfg, &token))
         }
-
-        // --- Password change ---
         ("POST", ["auth", "password"]) => {
-            let body: ChangePasswordBody = match req.json() {
-                Ok(b) => b,
-                Err(e) => return bad_request(&e),
-            };
+            let body: ChangePasswordBody = json_body(req)?;
             if body.new_password != body.confirm {
-                return bad_request("passwords do not match");
+                return Err(bad_request("passwords do not match"));
             }
-            match state.auth.change_password_verified(
-                req.remote.ip(),
-                &body.current_password,
-                body.code.as_deref(),
-                &body.new_password,
-            ) {
-                Ok(token) => {
-                    state
-                        .pp
-                        .infof(crate::pp::EMOJI_LOCK, "Admin password changed");
-                    // Issue a fresh session for the current caller.
-                    api_response(Response::json(200, &json!({ "ok": true })))
-                        .header("Set-Cookie", &session_cookie(&state, &token))
-                }
-                Err(e) => auth_error(&e),
-            }
+            let token = run_auth(state, move |auth| {
+                auth.change_password_verified(
+                    ip,
+                    &body.current_password,
+                    body.code.as_deref(),
+                    &body.new_password,
+                )
+            })
+            .await
+            .map_err(auth_error)?;
+            state.pp.infof(pp::EMOJI_LOCK, "Admin password changed");
+            // Issue a fresh session for the current caller.
+            Ok(with_session(ok(), &state.cfg, &token))
         }
+        _ => Err(not_found()),
+    }
+}
 
-        // --- UI customization ---
+// --- UI customization ---
+
+async fn appearance_routes(
+    state: &Arc<AppState>,
+    req: Request,
+    segments: &[&str],
+) -> Result<Response, Response> {
+    match (req.method.as_str(), segments) {
         ("POST", ["ui", "accent"]) => {
-            let body: AccentBody = match req.json() {
-                Ok(b) => b,
-                Err(e) => return bad_request(&e),
-            };
-            match state
-                .ui
-                .set_accent(body.accent.filter(|a| !a.trim().is_empty()))
-            {
-                Ok(()) => api_response(Response::json(200, &json!({ "ok": true }))),
-                Err(e) => bad_request(&e),
-            }
+            let body: AccentBody = json_body(&req)?;
+            let accent = body.accent.filter(|a| !a.trim().is_empty());
+            run_ui(state, move |ui| ui.set_accent(accent)).await
         }
         ("POST", ["ui", "icon"]) => {
+            if req.body.is_empty() {
+                return Err(bad_request("empty image"));
+            }
             let mime = req
                 .query
                 .get("mime")
                 .cloned()
                 .unwrap_or_else(|| "image/png".to_string());
-            if req.body.is_empty() {
-                return bad_request("empty image");
-            }
-            match state.ui.set_icon(&mime, req.body) {
-                Ok(()) => api_response(Response::json(200, &json!({ "ok": true }))),
-                Err(e) => bad_request(&e),
-            }
+            let data = req.body;
+            run_ui(state, move |ui| ui.set_icon(&mime, data)).await
         }
-        ("DELETE", ["ui", "icon"]) => match state.ui.reset_icon() {
-            Ok(()) => api_response(Response::json(200, &json!({ "ok": true }))),
-            Err(e) => api_response(Response::json_error(500, &e)),
-        },
+        ("DELETE", ["ui", "icon"]) => run_ui(state, |ui| ui.reset_icon()).await,
+        _ => Err(not_found()),
+    }
+}
 
-        // --- Zones / records (unchanged behavior) ---
-        ("GET", ["zones"]) => match state.cf.list_zones().await {
-            Ok(zones) => api_response(Response::json(200, &zones)),
-            Err(e) => cf_error_response(e),
-        },
-        ("GET", ["zones", zone_id, "records"]) => match state.cf.list_records(zone_id).await {
-            Ok((records, total)) => api_response(Response::json(
+// --- Zones and records ---
+
+/// Routes below `/api/zones`. `segments` starts after `zones`.
+async fn zone_routes(
+    state: &Arc<AppState>,
+    req: Request,
+    segments: &[&str],
+) -> Result<Response, Response> {
+    if let [zone_id, ..] = segments {
+        // cloudflare.rs checks IDs as well. Checking here also rejects a bad
+        // zone before a bulk delete reports one failure per record.
+        crate::cloudflare::validate_identifier(zone_id).map_err(cf_error_response)?;
+    }
+    let cf = &state.cf;
+    match (req.method.as_str(), segments) {
+        ("GET", []) => Ok(api_json(
+            200,
+            &cf.list_zones().await.map_err(cf_error_response)?,
+        )),
+        ("GET", [zone_id, "records"]) => {
+            let (records, total) = cf.list_records(zone_id).await.map_err(cf_error_response)?;
+            Ok(api_json(
                 200,
                 &json!({ "records": records, "total": total }),
-            )),
-            Err(e) => cf_error_response(e),
-        },
-        ("POST", ["zones", zone_id, "records"]) => {
-            let body: CreateRecordBody = match req.json() {
-                Ok(b) => b,
-                Err(e) => return bad_request(&e),
-            };
-            if let Err(e) = validate_record_payload(&body) {
-                return bad_request(&e);
-            }
-            let proxied = body.proxied.unwrap_or(false);
-            // Cloudflare forces TTL to automatic when a record is proxied.
-            let ttl = if proxied { 1 } else { body.ttl.unwrap_or(1) };
-            let payload = RecordPayload {
-                record_type: body.record_type,
-                name: body.name,
-                content: body.content,
-                proxied: Some(proxied),
-                ttl,
-                comment: body.comment,
-                tags: body.tags,
-                priority: body.priority,
-                data: body.data,
-            };
-            match state.cf.create_record(zone_id, &payload).await {
-                Ok(record) => api_response(Response::json(201, &record)),
-                Err(e) => cf_error_response(e),
-            }
+            ))
         }
-        ("PUT", ["zones", zone_id, "records", record_id]) => {
-            let body: CreateRecordBody = match req.json() {
-                Ok(b) => b,
-                Err(e) => return bad_request(&e),
-            };
-            if let Err(e) = validate_record_payload(&body) {
-                return bad_request(&e);
-            }
-            let proxied = body.proxied.unwrap_or(false);
-            let ttl = if proxied { 1 } else { body.ttl.unwrap_or(1) };
-            let payload = RecordPayload {
-                record_type: body.record_type,
-                name: body.name,
-                content: body.content,
-                proxied: Some(proxied),
-                ttl,
-                comment: body.comment,
-                tags: body.tags,
-                priority: body.priority,
-                data: body.data,
-            };
-            match state.cf.update_record(zone_id, record_id, &payload).await {
-                Ok(record) => api_response(Response::json(200, &record)),
-                Err(e) => cf_error_response(e),
-            }
+        ("POST", [zone_id, "records"]) => {
+            let payload = record_payload(json_body(&req)?).map_err(|e| bad_request(&e))?;
+            let record = cf
+                .create_record(zone_id, &payload)
+                .await
+                .map_err(cf_error_response)?;
+            Ok(api_json(201, &record))
         }
-        ("DELETE", ["zones", zone_id, "records", record_id]) => {
-            match state.cf.delete_record(zone_id, record_id).await {
-                Ok(()) => api_response(Response::json(200, &json!({ "ok": true }))),
-                Err(e) => cf_error_response(e),
-            }
+        ("POST", [zone_id, "records", "bulk"]) => bulk(state, &req, zone_id).await,
+        // "bulk" names the route above and is never a record ID.
+        (_, [_, "records", "bulk"]) => Err(not_found()),
+        // Sent to Cloudflare as PATCH, so fields the payload leaves out keep
+        // their values.
+        ("PUT", [zone_id, "records", record_id]) => {
+            let payload = record_payload(json_body(&req)?).map_err(|e| bad_request(&e))?;
+            let record = cf
+                .update_record(zone_id, record_id, &payload)
+                .await
+                .map_err(cf_error_response)?;
+            Ok(api_json(200, &record))
         }
-        ("POST", ["zones", zone_id, "records", "bulk"]) => {
-            let body: BulkBody = match req.json() {
-                Ok(b) => b,
-                Err(e) => return bad_request(&e),
-            };
-            if body.ids.is_empty() {
-                return bad_request("no record ids supplied");
-            }
-            if body.ids.len() > 500 {
-                return bad_request("too many records in one bulk operation (max 500)");
-            }
-            let mut seen = std::collections::HashSet::new();
-            for id in &body.ids {
-                if let Err(e) = crate::cloudflare::validate_identifier(id) {
-                    return cf_error_response(e);
-                }
-                if !seen.insert(id) {
-                    return bad_request("duplicate record ids are not allowed");
-                }
-            }
-            match body.action.as_str() {
-                "delete" => bulk_delete(&state, &req, zone_id, &body.ids).await,
-                "update" => bulk_update(&state, &req, zone_id, &body).await,
-                other => bad_request(&format!("unknown bulk action '{other}'")),
-            }
+        ("DELETE", [zone_id, "records", record_id]) => {
+            cf.delete_record(zone_id, record_id)
+                .await
+                .map_err(cf_error_response)?;
+            Ok(ok())
         }
-        ("GET", ["zones", zone_id, "export"]) => match state.cf.export_records(zone_id).await {
-            Ok(bind) => api_response(Response::new(200, "text/plain; charset=utf-8", bind))
-                .header("Content-Disposition", "attachment; filename=\"zone.txt\""),
-            Err(e) => cf_error_response(e),
-        },
-        ("POST", ["zones", zone_id, "import"]) => {
+        ("GET", [zone_id, "export"]) => {
+            let bind = cf
+                .export_records(zone_id)
+                .await
+                .map_err(cf_error_response)?;
+            Ok(
+                api_response(Response::new(200, "text/plain; charset=utf-8", bind))
+                    .header("Content-Disposition", "attachment; filename=\"zone.txt\""),
+            )
+        }
+        ("POST", [zone_id, "import"]) => {
             if req.body.is_empty() {
-                return bad_request("empty zone file");
+                return Err(bad_request("empty zone file"));
             }
-            if let Err(error) = crate::bind::validate(&req.body) {
-                return bad_request(&error);
-            }
+            crate::bind::validate(&req.body).map_err(|e| bad_request(&e))?;
             let filename = req
                 .query
                 .get("filename")
                 .cloned()
                 .unwrap_or_else(|| "zone.txt".to_string());
-            match state.cf.import_records(zone_id, &filename, req.body).await {
-                Ok(result) => api_response(Response::json(200, &result)),
-                Err(e) => cf_error_response(e),
-            }
+            let result = cf
+                .import_records(zone_id, &filename, req.body)
+                .await
+                .map_err(cf_error_response)?;
+            Ok(api_json(200, &result))
         }
+        _ => Err(not_found()),
+    }
+}
 
-        // --- DDNS ---
+// --- DDNS ---
+
+async fn ddns_routes(
+    state: &Arc<AppState>,
+    req: &Request,
+    segments: &[&str],
+) -> Result<Response, Response> {
+    match (req.method.as_str(), segments) {
         ("GET", ["ddns", "status"]) => {
-            let status = ddns::status(&state.cfg, &state.cf).await;
-            api_response(Response::json(200, &status))
+            let status = ddns::status(&state.cfg, &state.cf, &state.detector).await;
+            Ok(api_json(200, &status))
         }
         ("POST", ["ddns", "update"]) => {
             if state.cfg.domains.is_empty() {
-                return bad_request("no DDNS domains configured (set DOMAINS)");
+                return Err(bad_request("no DDNS domains configured (set DOMAINS)"));
             }
             if state
                 .ddns_running
@@ -754,28 +805,30 @@ async fn handle_api(state: Arc<AppState>, req: Request, segments: &[&str]) -> Re
                 )
                 .is_err()
             {
-                return api_response(Response::json_error(
-                    409,
-                    "a DDNS update is already running",
-                ));
+                return Err(api_error(409, "a DDNS update is already running"));
             }
             let _cycle = DdnsCycleGuard(&state.ddns_running);
-            let result =
-                ddns::update_now(&state.cfg, &state.cf, || authenticated(&state, &req)).await;
+            let result = ddns::update_now(&state.cfg, &state.cf, &state.detector, || {
+                authenticated(state, req)
+            })
+            .await;
             for line in &result.log {
                 state.pp.infof("", line);
             }
-            api_response(Response::json(200, &result))
+            Ok(api_json(200, &result))
         }
-
-        _ => api_response(Response::json_error(404, "not found")),
+        _ => Err(not_found()),
     }
 }
 
-// --- Validation of record payloads (server-side mirrors frontend checks) ---
+// --- Record payloads ---
+// The TTL rule and the comment limit come from config.rs, which applies them
+// to the DDNS settings too.
 
-fn validate_record_payload(body: &CreateRecordBody) -> Result<(), String> {
-    if !valid_record_type(&body.record_type) {
+/// Checks a create or update request and builds the payload for Cloudflare.
+fn record_payload(body: RecordBody) -> Result<RecordPayload, String> {
+    let record_type = body.record_type.as_str();
+    if !valid_record_type(record_type) {
         return Err("unsupported record type".to_string());
     }
     if body.name.trim().is_empty() {
@@ -791,19 +844,18 @@ fn validate_record_payload(body: &CreateRecordBody) -> Result<(), String> {
     }
     validate_metadata(body.comment.as_deref(), body.tags.as_deref())?;
     let proxied = body.proxied.unwrap_or(false);
-    if proxied && !PROXIABLE_TYPES.contains(&body.record_type.as_str()) {
+    if proxied && !PROXIABLE_TYPES.contains(&record_type) {
         return Err("only A, AAAA and CNAME records can be proxied".to_string());
     }
-    normalize_ttl(body.ttl)?;
-    match body.record_type.as_str() {
+    let ttl = record_ttl(body.ttl)?;
+    let content = body.content.as_deref();
+    match record_type {
         "A" | "AAAA" => {
-            let ip = body
-                .content
-                .as_deref()
+            let ip = content
                 .ok_or("content is required")?
                 .parse::<std::net::IpAddr>()
                 .map_err(|_| "invalid IP address")?;
-            if ip.is_ipv6() != (body.record_type == "AAAA") {
+            if ip.is_ipv6() != (record_type == "AAAA") {
                 return Err("IP address does not match the record type".to_string());
             }
         }
@@ -811,82 +863,72 @@ fn validate_record_payload(body: &CreateRecordBody) -> Result<(), String> {
             if body.priority.is_none() {
                 return Err("MX records require a priority".to_string());
             }
-            require_content(body)?;
+            require_content(content)?;
         }
+        "SRV" | "CAA" | "HTTPS" | "SVCB" => {}
+        _ => require_content(content)?,
+    }
+    let data = record_data(record_type, body.data)?;
+    Ok(RecordPayload {
+        record_type: body.record_type,
+        name: body.name,
+        content: body.content,
+        proxied: Some(proxied),
+        // Cloudflare forces TTL to automatic when a record is proxied.
+        ttl: if proxied { 1 } else { ttl },
+        comment: body.comment,
+        tags: body.tags,
+        priority: body.priority,
+        data,
+    })
+}
+
+/// Parses `data` into the shape of its record type. SRV, CAA, HTTPS and SVCB
+/// records require it, and other types must not send it.
+fn record_data(record_type: &str, data: Option<Value>) -> Result<Option<RecordData>, String> {
+    fn parse<T: DeserializeOwned>(record_type: &str, data: Value) -> Result<T, String> {
+        serde_json::from_value(data).map_err(|e| format!("invalid {record_type} data: {e}"))
+    }
+    let structured = matches!(record_type, "SRV" | "CAA" | "HTTPS" | "SVCB");
+    let Some(data) = data else {
+        return if structured {
+            Err(format!("{record_type} records require data fields"))
+        } else {
+            Ok(None)
+        };
+    };
+    let data = match record_type {
         "SRV" => {
-            let d = body
-                .data
-                .as_ref()
-                .ok_or("SRV records require data fields")?;
-            for k in ["priority", "weight", "port"] {
-                if !d
-                    .get(k)
-                    .and_then(|v| v.as_u64())
-                    .is_some_and(|n| n <= 65535)
-                {
-                    return Err(format!("SRV data requires numeric '{k}'"));
-                }
-            }
-            if d.get("target")
-                .and_then(|v| v.as_str())
-                .map(|s| s.is_empty())
-                .unwrap_or(true)
-            {
+            let srv: SrvData = parse(record_type, data)?;
+            if srv.target.is_empty() {
                 return Err("SRV data requires a target".to_string());
             }
+            RecordData::Srv(srv)
         }
         "CAA" => {
-            let d = body
-                .data
-                .as_ref()
-                .ok_or("CAA records require data fields")?;
-            if !d
-                .get("flags")
-                .and_then(|v| v.as_u64())
-                .is_some_and(|n| n <= 255)
-            {
-                return Err("CAA data requires numeric 'flags'".to_string());
+            let caa: CaaData = parse(record_type, data)?;
+            if caa.tag.is_empty() || caa.value.is_empty() {
+                return Err("CAA data requires a tag and a value".to_string());
             }
-            for k in ["tag", "value"] {
-                if d.get(k)
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.is_empty())
-                    .unwrap_or(true)
-                {
-                    return Err(format!("CAA data requires '{k}'"));
-                }
-            }
+            RecordData::Caa(caa)
         }
         "HTTPS" | "SVCB" => {
-            let d = body
-                .data
-                .as_ref()
-                .ok_or("HTTPS/SVCB records require data fields")?;
-            if !d
-                .get("priority")
-                .and_then(|v| v.as_u64())
-                .is_some_and(|n| n <= 65535)
-            {
-                return Err("HTTPS/SVCB data requires numeric 'priority'".to_string());
+            let svcb: SvcbData = parse(record_type, data)?;
+            if svcb.target.is_empty() {
+                return Err(format!("{record_type} data requires a target"));
             }
-            if d.get("target")
-                .and_then(|v| v.as_str())
-                .map(|s| s.is_empty())
-                .unwrap_or(true)
-            {
-                return Err("HTTPS/SVCB data requires a target".to_string());
-            }
+            RecordData::Svcb(svcb)
         }
-        _ => {
-            require_content(body)?;
-        }
-    }
-    Ok(())
+        _ => return Err("data is only allowed for SRV, CAA, HTTPS and SVCB records".to_string()),
+    };
+    Ok(Some(data))
 }
 
 fn validate_metadata(comment: Option<&str>, tags: Option<&[String]>) -> Result<(), String> {
-    if comment.is_some_and(|s| s.len() > 500 || s.chars().any(|c| c.is_control())) {
-        return Err("comment must be at most 500 bytes with no control characters".to_string());
+    if comment.is_some_and(|s| s.len() > MAX_RECORD_COMMENT || s.chars().any(|c| c.is_control())) {
+        return Err(format!(
+            "comment must be at most {MAX_RECORD_COMMENT} bytes with no control characters"
+        ));
     }
     if tags.is_some_and(|tags| {
         tags.len() > 20
@@ -901,73 +943,147 @@ fn validate_metadata(comment: Option<&str>, tags: Option<&[String]>) -> Result<(
     Ok(())
 }
 
-fn require_content(body: &CreateRecordBody) -> Result<(), String> {
-    match &body.content {
+fn require_content(content: Option<&str>) -> Result<(), String> {
+    match content {
         Some(c) if !c.trim().is_empty() => Ok(()),
         _ => Err("content is required".to_string()),
     }
 }
 
 // --- Bulk operations ---
+// Bulk requests answer 200 with one result per record; the counts tell the
+// caller whether some writes failed. Writes go to Cloudflare's batch endpoint
+// in chunks of at most BATCH_LIMIT records.
 
-async fn bulk_delete(state: &AppState, req: &Request, zone_id: &str, ids: &[String]) -> Response {
-    let mut results = Vec::new();
-    for id in ids {
-        if !authenticated(state, req) {
-            results.push(json!({ "id": id, "ok": false, "error": "session expired or revoked; write not sent" }));
-            continue;
-        }
-        match state.cf.delete_record(zone_id, id).await {
-            Ok(()) => results.push(json!({ "id": id, "ok": true })),
-            Err(e) => results.push(json!({ "id": id, "ok": false, "error": e.to_string() })),
+async fn bulk(state: &AppState, req: &Request, zone_id: &str) -> Result<Response, Response> {
+    let body: BulkBody = json_body(req)?;
+    if body.ids.is_empty() {
+        return Err(bad_request("no record ids supplied"));
+    }
+    if body.ids.len() > 500 {
+        return Err(bad_request(
+            "too many records in one bulk operation (max 500)",
+        ));
+    }
+    let mut seen = std::collections::HashSet::new();
+    for id in &body.ids {
+        crate::cloudflare::validate_identifier(id).map_err(cf_error_response)?;
+        if !seen.insert(id) {
+            return Err(bad_request("duplicate record ids are not allowed"));
         }
     }
-    let succeeded = results.iter().filter(|r| r["ok"] == true).count();
-    api_response(Response::json(
-        200,
-        &json!({ "results": results, "succeeded": succeeded, "failed": results.len() - succeeded }),
-    ))
+    match body.action.as_str() {
+        "delete" => Ok(bulk_delete(state, req, zone_id, &body.ids).await),
+        "update" => bulk_update(state, req, zone_id, &body).await,
+        other => Err(bad_request(&format!("unknown bulk action '{other}'"))),
+    }
 }
 
-async fn bulk_update(state: &AppState, req: &Request, zone_id: &str, body: &BulkBody) -> Response {
-    let patch = match &body.patch {
-        Some(p) => p,
-        None => return bad_request("missing patch"),
-    };
-    if let Err(e) = validate_metadata(patch.comment.as_deref(), patch.tags.as_deref()) {
-        return bad_request(&e);
-    }
-    let ttl = match patch.ttl {
-        Some(t) => match normalize_ttl(Some(t)) {
-            Ok(v) => Some(v),
-            Err(e) => return bad_request(&e),
-        },
-        None => None,
-    };
+/// The result entry for a write that was not sent because the session ended.
+fn unsent(id: &str) -> Value {
+    json!({ "id": id, "ok": false, "error": "session expired or revoked; write not sent" })
+}
 
-    let mut records: Vec<DnsRecord> = Vec::new();
-    {
-        match state.cf.list_records(zone_id).await {
-            Ok((all, _)) => {
-                for id in &body.ids {
-                    match all.iter().find(|r| &r.id == id) {
-                        Some(r) => {
-                            if patch.proxied.is_some()
-                                && !PROXIABLE_TYPES.contains(&r.record_type.as_str())
-                            {
-                                return bad_request(&format!(
-                                    "record '{}' is type {} - only A, AAAA and CNAME records can be proxied",
-                                    r.name, r.record_type
-                                ));
-                            }
-                            records.push(r.clone());
-                        }
-                        None => return bad_request(&format!("record id {id} not found in zone")),
-                    }
-                }
-            }
-            Err(e) => return cf_error_response(e),
+fn bulk_response(results: Vec<Value>) -> Response {
+    let succeeded = results.iter().filter(|r| r["ok"] == true).count();
+    let failed = results.len().saturating_sub(succeeded);
+    api_json(
+        200,
+        &json!({ "results": results, "succeeded": succeeded, "failed": failed }),
+    )
+}
+
+/// Sends the batches in order and returns one result per record. Every
+/// record in a failed batch is reported as failed: a Cloudflare error reply
+/// means none of them changed, and a lost reply carries an error saying the
+/// outcome is unknown. Later batches are still sent. The session is checked
+/// before each batch; once it has ended, no further batch is sent.
+async fn send_batches(
+    state: &AppState,
+    req: &Request,
+    zone_id: &str,
+    batches: Vec<BatchRequest>,
+) -> Response {
+    let mut results = Vec::new();
+    let mut signed_in = true;
+    for batch in &batches {
+        signed_in = signed_in && authenticated(state, req);
+        if !signed_in {
+            results.extend(batch.ids().map(unsent));
+            continue;
         }
+        match state.cf.batch(zone_id, batch).await {
+            Ok(()) => results.extend(batch.ids().map(|id| json!({ "id": id, "ok": true }))),
+            Err(e) => {
+                let error = e.to_string();
+                results.extend(
+                    batch
+                        .ids()
+                        .map(|id| json!({ "id": id, "ok": false, "error": error })),
+                );
+            }
+        }
+    }
+    bulk_response(results)
+}
+
+async fn bulk_delete(state: &AppState, req: &Request, zone_id: &str, ids: &[String]) -> Response {
+    let batches = ids
+        .chunks(BATCH_LIMIT)
+        .map(|chunk| BatchRequest {
+            deletes: chunk
+                .iter()
+                .map(|id| BatchDelete { id: id.clone() })
+                .collect(),
+            ..BatchRequest::default()
+        })
+        .collect();
+    send_batches(state, req, zone_id, batches).await
+}
+
+async fn bulk_update(
+    state: &AppState,
+    req: &Request,
+    zone_id: &str,
+    body: &BulkBody,
+) -> Result<Response, Response> {
+    let patch = body
+        .patch
+        .as_ref()
+        .ok_or_else(|| bad_request("missing patch"))?;
+    if patch.ttl.is_none()
+        && patch.proxied.is_none()
+        && patch.comment.is_none()
+        && patch.tags.is_none()
+    {
+        return Err(bad_request("patch changes nothing"));
+    }
+    validate_metadata(patch.comment.as_deref(), patch.tags.as_deref())
+        .map_err(|e| bad_request(&e))?;
+    let ttl = patch
+        .ttl
+        .map(|ttl| record_ttl(Some(ttl)))
+        .transpose()
+        .map_err(|e| bad_request(&e))?;
+
+    let (all, _) = state
+        .cf
+        .list_records(zone_id)
+        .await
+        .map_err(cf_error_response)?;
+    let mut records = Vec::new();
+    for id in &body.ids {
+        let record = all
+            .iter()
+            .find(|r| &r.id == id)
+            .ok_or_else(|| bad_request(&format!("record id {id} not found in zone")))?;
+        if patch.proxied.is_some() && !PROXIABLE_TYPES.contains(&record.record_type.as_str()) {
+            return Err(bad_request(&format!(
+                "record '{}' is type {} - only A, AAAA and CNAME records can be proxied",
+                record.name, record.record_type
+            )));
+        }
+        records.push(record);
     }
 
     // When enabling proxy, Cloudflare forces TTL to automatic.
@@ -984,13 +1100,7 @@ async fn bulk_update(state: &AppState, req: &Request, zone_id: &str, body: &Bulk
         content: None,
     };
 
-    let mut results = Vec::new();
-    for record in records {
-        let id = record.id;
-        if !authenticated(state, req) {
-            results.push(json!({ "id": id, "ok": false, "error": "session expired or revoked; write not sent" }));
-            continue;
-        }
+    let record_patch = |record: &DnsRecord| {
         let mut record_patch = cf_patch.clone();
         if patch.proxied != Some(false)
             && record.proxied == Some(true)
@@ -998,16 +1108,19 @@ async fn bulk_update(state: &AppState, req: &Request, zone_id: &str, body: &Bulk
         {
             record_patch.ttl = Some(1);
         }
-        match state.cf.patch_record(zone_id, &id, &record_patch).await {
-            Ok(_) => results.push(json!({ "id": id, "ok": true })),
-            Err(e) => results.push(json!({ "id": id, "ok": false, "error": e.to_string() })),
+        BatchPatch {
+            id: record.id.clone(),
+            patch: record_patch,
         }
-    }
-    let succeeded = results.iter().filter(|r| r["ok"] == true).count();
-    api_response(Response::json(
-        200,
-        &json!({ "results": results, "succeeded": succeeded, "failed": results.len() - succeeded }),
-    ))
+    };
+    let batches = records
+        .chunks(BATCH_LIMIT)
+        .map(|chunk| BatchRequest {
+            patches: chunk.iter().copied().map(&record_patch).collect(),
+            ..BatchRequest::default()
+        })
+        .collect();
+    Ok(send_batches(state, req, zone_id, batches).await)
 }
 
 #[cfg(test)]
@@ -1017,7 +1130,7 @@ mod tests {
     fn fixture_config() -> Config {
         Config {
             api_token: "synthetic".into(),
-            listen: "127.0.0.1:8888".into(),
+            listen: "127.0.0.1:8888".parse().unwrap(),
             data_dir: String::new(),
             session_ttl: std::time::Duration::from_secs(300),
             update_timeout: std::time::Duration::from_secs(5),
@@ -1055,55 +1168,762 @@ mod tests {
         }
     }
 
-    struct AppearanceFixture {
-        dir: std::path::PathBuf,
-        state: Arc<AppState>,
+    const PASSWORD: &str = "synthetic-password";
+    const ZONE: &str = "0123456789abcdef0123456789abcdef";
+
+    /// One request that reached the fake Cloudflare upstream.
+    struct Upstream {
+        method: String,
+        path: String,
+        body: Value,
     }
 
-    impl AppearanceFixture {
-        fn new() -> Self {
+    /// Picks the fake upstream's reply. `None` closes the connection unanswered.
+    type Responder = Box<dyn FnMut(&Upstream) -> Option<(u16, Value)> + Send>;
+
+    /// Reads one request with a Content-Length body, or `None` if the
+    /// connection ends first.
+    async fn read_upstream(socket: &mut tokio::net::TcpStream) -> Option<Upstream> {
+        use tokio::io::AsyncReadExt;
+        let mut data = Vec::new();
+        let mut buffer = [0; 8192];
+        let end = loop {
+            if let Some(end) = data.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                break end + 4;
+            }
+            let count = socket.read(&mut buffer).await.ok()?;
+            if count == 0 {
+                return None;
+            }
+            data.extend_from_slice(&buffer[..count]);
+        };
+        let head = String::from_utf8(data[..end].to_vec()).ok()?;
+        let mut line = head.lines().next()?.split(' ');
+        let (method, path) = (line.next()?.to_owned(), line.next()?.to_owned());
+        let length = head
+            .lines()
+            .find_map(|line| {
+                let (key, value) = line.split_once(':')?;
+                key.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())
+                    .flatten()
+            })
+            .unwrap_or(0);
+        while data.len() < end + length {
+            let count = socket.read(&mut buffer).await.ok()?;
+            if count == 0 {
+                return None;
+            }
+            data.extend_from_slice(&buffer[..count]);
+        }
+        let body = serde_json::from_slice(&data[end..]).unwrap_or(Value::Null);
+        Some(Upstream { method, path, body })
+    }
+
+    /// App state over a temporary data directory. Cloudflare calls go to a
+    /// loopback listener that counts connections, logs each request and
+    /// answers with the current responder. The default responder closes each
+    /// connection unanswered.
+    struct Fixture {
+        dir: std::path::PathBuf,
+        state: Arc<AppState>,
+        upstream_hits: Arc<std::sync::atomic::AtomicUsize>,
+        upstream_log: Arc<std::sync::Mutex<Vec<Upstream>>>,
+        responder: Arc<std::sync::Mutex<Responder>>,
+        upstream: tokio::task::JoinHandle<()>,
+    }
+
+    impl Fixture {
+        async fn new() -> Self {
+            Self::with_config(|_| {}).await
+        }
+
+        async fn with_config(change: impl FnOnce(&mut Config)) -> Self {
             let _ = rustls::crypto::ring::default_provider().install_default();
             static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let dir = std::env::temp_dir().join(format!(
-                "ddns-appearance-test-{}-{}",
+                "ddns-routes-test-{}-{}",
                 std::process::id(),
                 NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             ));
             std::fs::create_dir(&dir).unwrap();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let api_base = format!("http://{}/client/v4", listener.local_addr().unwrap());
+            let upstream_hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let upstream_log = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let responder: Arc<std::sync::Mutex<Responder>> =
+                Arc::new(std::sync::Mutex::new(Box::new(|_| None)));
+            let (hits, log, reply) = (
+                upstream_hits.clone(),
+                upstream_log.clone(),
+                responder.clone(),
+            );
+            let upstream = tokio::spawn(async move {
+                use tokio::io::AsyncWriteExt;
+                while let Ok((mut socket, _)) = listener.accept().await {
+                    hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let Some(request) = read_upstream(&mut socket).await else {
+                        continue;
+                    };
+                    let answer = (reply.lock().unwrap())(&request);
+                    log.lock().unwrap().push(request);
+                    if let Some((status, body)) = answer {
+                        let body = body.to_string();
+                        let response = format!(
+                            "HTTP/1.1 {status} Synthetic\r\nContent-Type: application/json\r\n\
+                             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                        let _ = socket.write_all(response.as_bytes()).await;
+                    }
+                }
+            });
             let mut cfg = fixture_config();
             cfg.data_dir = dir.to_str().unwrap().to_owned();
+            change(&mut cfg);
             let state = Arc::new(AppState {
-                cf: CloudflareClient::new(
-                    "synthetic",
-                    cfg.update_timeout,
-                    Some("http://127.0.0.1:1"),
-                ),
-                auth: Auth::new(cfg.session_ttl, dir.join("state.json").to_str().unwrap()).unwrap(),
-                ui: UiStore::new(&cfg.data_dir),
+                cf: CloudflareClient::new("synthetic", cfg.update_timeout, Some(&api_base))
+                    .unwrap(),
+                detector: ddns::Detector::new(cfg.detection_timeout).unwrap(),
+                auth: Auth::new(
+                    cfg.session_ttl,
+                    dir.join("state.json").to_str().unwrap(),
+                    PP::new(false, true),
+                )
+                .unwrap(),
+                ui: UiStore::new(&cfg.data_dir, PP::new(false, true)).unwrap(),
                 pp: PP::new(false, true),
                 ddns_running: std::sync::atomic::AtomicBool::new(false),
                 cfg,
             });
-            Self { dir, state }
+            Self {
+                dir,
+                state,
+                upstream_hits,
+                upstream_log,
+                responder,
+                upstream,
+            }
+        }
+
+        /// Sets how the fake upstream answers from now on.
+        fn respond(
+            &self,
+            responder: impl FnMut(&Upstream) -> Option<(u16, Value)> + Send + 'static,
+        ) {
+            *self.responder.lock().unwrap() = Box::new(responder);
+        }
+
+        /// The requests the upstream received since the last call.
+        fn take_upstream_requests(&self) -> Vec<Upstream> {
+            std::mem::take(&mut *self.upstream_log.lock().unwrap())
+        }
+
+        /// Creates the admin account and returns a Cookie header for it.
+        fn login(&self) -> String {
+            let token = self.state.auth.setup_password_session(PASSWORD).unwrap();
+            format!("{}={token}", SESSION_COOKIE)
+        }
+
+        fn upstream_hits(&self) -> usize {
+            self.upstream_hits.load(std::sync::atomic::Ordering::SeqCst)
         }
 
         async fn get(&self, path: &str) -> Response {
+            self.send("GET", path, None, b"").await
+        }
+
+        async fn send(
+            &self,
+            method: &str,
+            path: &str,
+            cookie: Option<&str>,
+            body: &[u8],
+        ) -> Response {
             let mut req = fixture_request("localhost:8888", None);
-            req.method = "GET".into();
+            req.method = method.into();
             req.path = path.into();
+            req.headers
+                .push(("x-requested-with".into(), "fetch".into()));
+            if let Some(cookie) = cookie {
+                req.headers.push(("cookie".into(), cookie.into()));
+            }
+            req.body = body.to_vec();
             handle(self.state.clone(), req).await
         }
     }
 
-    impl Drop for AppearanceFixture {
+    impl Drop for Fixture {
         fn drop(&mut self) {
+            self.upstream.abort();
             let _ = std::fs::remove_dir_all(&self.dir);
         }
     }
 
+    fn header<'a>(resp: &'a Response, name: &str) -> Option<&'a str> {
+        resp.headers
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
+
+    fn body_json(resp: &Response) -> serde_json::Value {
+        serde_json::from_slice(&resp.body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn logout_clears_the_cookie_without_a_valid_session() {
+        let fixture = Fixture::new().await;
+        fixture.login();
+        for cookie in [None, Some("cfddns_session=expired-or-forged")] {
+            let resp = fixture.send("POST", "/api/auth/logout", cookie, b"").await;
+            assert_eq!(resp.status, 200);
+            let cleared = header(&resp, "Set-Cookie").unwrap();
+            assert!(cleared.starts_with("cfddns_session=;"), "{cleared}");
+            assert!(cleared.contains("Max-Age=0") && cleared.contains("HttpOnly"));
+            assert!(cleared.contains("SameSite=Strict") && cleared.contains("Path=/"));
+        }
+        let mut req = fixture_request("localhost:8888", None);
+        req.path = "/api/auth/logout".into();
+        assert_eq!(handle(fixture.state.clone(), req).await.status, 403);
+    }
+
+    #[tokio::test]
+    async fn secure_cookies_use_the_host_prefix_for_issue_read_and_clear() {
+        let fixture = Fixture::with_config(|cfg| cfg.secure_cookies = true).await;
+        let token = fixture.state.auth.setup_password_session(PASSWORD).unwrap();
+        let plain = format!("cfddns_session={token}");
+        let prefixed = format!("__Host-cfddns_session={token}");
+        assert_eq!(
+            fixture
+                .send("GET", "/api/auth/me", Some(&plain), b"")
+                .await
+                .status,
+            401
+        );
+        assert_eq!(
+            fixture
+                .send("GET", "/api/auth/me", Some(&prefixed), b"")
+                .await
+                .status,
+            200
+        );
+        let login = fixture
+            .send(
+                "POST",
+                "/api/auth/login",
+                None,
+                br#"{"password":"synthetic-password"}"#,
+            )
+            .await;
+        let issued = header(&login, "Set-Cookie").unwrap();
+        assert!(issued.starts_with("__Host-cfddns_session=") && issued.contains("; Secure"));
+        assert!(!issued.contains("Domain"));
+        let logout = fixture
+            .send("POST", "/api/auth/logout", Some(&prefixed), b"")
+            .await;
+        let cleared = header(&logout, "Set-Cookie").unwrap();
+        assert!(cleared.starts_with("__Host-cfddns_session=;"), "{cleared}");
+        assert!(cleared.contains("Max-Age=0") && cleared.contains("; Secure"));
+        assert_eq!(
+            fixture
+                .send("GET", "/api/auth/me", Some(&prefixed), b"")
+                .await
+                .status,
+            401
+        );
+    }
+
+    #[tokio::test]
+    async fn bulk_is_a_post_route_and_never_a_record_id() {
+        let fixture = Fixture::new().await;
+        let cookie = fixture.login();
+        let path = format!("/api/zones/{ZONE}/records/bulk");
+        for method in ["DELETE", "PUT", "GET"] {
+            let resp = fixture
+                .send(
+                    method,
+                    &path,
+                    Some(&cookie),
+                    br#"{"type":"A","name":"example.com","content":"192.0.2.1"}"#,
+                )
+                .await;
+            assert_eq!(resp.status, 404, "{method}");
+        }
+        assert_eq!(fixture.upstream_hits(), 0);
+    }
+
+    #[tokio::test]
+    async fn bulk_update_rejects_an_empty_patch_before_any_request() {
+        let fixture = Fixture::new().await;
+        let cookie = fixture.login();
+        let path = format!("/api/zones/{ZONE}/records/bulk");
+        let body = json!({"action": "update", "ids": [ZONE], "patch": {}}).to_string();
+        let resp = fixture
+            .send("POST", &path, Some(&cookie), body.as_bytes())
+            .await;
+        assert_eq!(resp.status, 400);
+        assert_eq!(fixture.upstream_hits(), 0);
+    }
+
+    /// A success envelope that echoes the batch body as its result.
+    fn batch_applied(request: &Upstream) -> Option<(u16, Value)> {
+        Some((
+            200,
+            json!({"success": true, "errors": [], "messages": [], "result": request.body}),
+        ))
+    }
+
+    fn record_ids(count: usize) -> Vec<String> {
+        (0..count).map(|i| format!("{i:032x}")).collect()
+    }
+
+    /// Checks that every request is a batch whose body has only `key`, and
+    /// returns the record IDs of each batch.
+    fn batched_ids(requests: &[Upstream], key: &str) -> Vec<Vec<String>> {
+        let batch_path = format!("/client/v4/zones/{ZONE}/dns_records/batch");
+        requests
+            .iter()
+            .map(|request| {
+                assert_eq!(
+                    (request.method.as_str(), request.path.as_str()),
+                    ("POST", batch_path.as_str())
+                );
+                let body = request.body.as_object().unwrap();
+                assert_eq!(body.keys().collect::<Vec<_>>(), [key]);
+                body[key]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|item| item["id"].as_str().unwrap().to_owned())
+                    .collect()
+            })
+            .collect()
+    }
+
+    async fn bulk_request(fixture: &Fixture, cookie: &str, body: Value) -> Value {
+        let path = format!("/api/zones/{ZONE}/records/bulk");
+        let resp = fixture
+            .send("POST", &path, Some(cookie), body.to_string().as_bytes())
+            .await;
+        assert_eq!(resp.status, 200);
+        body_json(&resp)
+    }
+
+    #[tokio::test]
+    async fn bulk_delete_sends_batches_of_at_most_200_records() {
+        let fixture = Fixture::new().await;
+        let cookie = fixture.login();
+        fixture.respond(batch_applied);
+        for (count, sizes) in [
+            (1, vec![1]),
+            (200, vec![200]),
+            (201, vec![200, 1]),
+            (500, vec![200, 200, 100]),
+        ] {
+            let ids = record_ids(count);
+            let result =
+                bulk_request(&fixture, &cookie, json!({"action": "delete", "ids": ids})).await;
+            let requests = fixture.take_upstream_requests();
+            for item in requests
+                .iter()
+                .flat_map(|r| r.body["deletes"].as_array().unwrap())
+            {
+                assert_eq!(item.as_object().unwrap().len(), 1, "{item}");
+            }
+            let batches = batched_ids(&requests, "deletes");
+            assert_eq!(batches.iter().map(Vec::len).collect::<Vec<_>>(), sizes);
+            assert_eq!(batches.concat(), ids);
+            let results: Vec<Value> = ids.iter().map(|id| json!({"id": id, "ok": true})).collect();
+            assert_eq!(
+                result,
+                json!({"results": results, "succeeded": count, "failed": 0})
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_batch_fails_every_record_in_it_and_later_batches_still_run() {
+        let fixture = Fixture::new().await;
+        let cookie = fixture.login();
+        let mut sent = 0;
+        fixture.respond(move |request| {
+            sent += 1;
+            if sent > 1 {
+                return batch_applied(request);
+            }
+            let errors = json!([{"code": 81044, "message": "Record not found"}]);
+            Some((
+                404,
+                json!({"success": false, "errors": errors, "result": null}),
+            ))
+        });
+        let ids = record_ids(201);
+        let result = bulk_request(&fixture, &cookie, json!({"action": "delete", "ids": ids})).await;
+        assert_eq!(
+            batched_ids(&fixture.take_upstream_requests(), "deletes").len(),
+            2
+        );
+        let mut results: Vec<Value> = ids[..200]
+            .iter()
+            .map(|id| json!({"id": id, "ok": false, "error": "[81044] Record not found"}))
+            .collect();
+        results.push(json!({"id": ids[200], "ok": true}));
+        assert_eq!(
+            result,
+            json!({"results": results, "succeeded": 1, "failed": 200})
+        );
+    }
+
+    #[tokio::test]
+    async fn unconfirmed_batch_is_reported_failed_with_an_unknown_outcome() {
+        let fixture = Fixture::new().await;
+        let cookie = fixture.login();
+        fixture.respond(|_| Some((200, json!({"success": true, "errors": [], "result": null}))));
+        let ids = record_ids(2);
+        let result = bulk_request(&fixture, &cookie, json!({"action": "delete", "ids": ids})).await;
+        assert_eq!(
+            (&result["succeeded"], &result["failed"]),
+            (&json!(0), &json!(2))
+        );
+        for item in result["results"].as_array().unwrap() {
+            assert_eq!(item["ok"], false, "{item}");
+            let error = item["error"].as_str().unwrap();
+            assert!(error.contains("outcome is unknown"), "{error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn revoking_the_session_during_a_batch_stops_the_later_ones() {
+        let fixture = Fixture::new().await;
+        let token = fixture.state.auth.setup_password_session(PASSWORD).unwrap();
+        let cookie = format!("{SESSION_COOKIE}={token}");
+        let state = fixture.state.clone();
+        fixture.respond(move |request| {
+            state.auth.destroy_session(&token);
+            batch_applied(request)
+        });
+        let ids = record_ids(401);
+        let result = bulk_request(&fixture, &cookie, json!({"action": "delete", "ids": ids})).await;
+        assert_eq!(
+            batched_ids(&fixture.take_upstream_requests(), "deletes"),
+            [ids[..200].to_vec()]
+        );
+        let mut results: Vec<Value> = ids[..200]
+            .iter()
+            .map(|id| json!({"id": id, "ok": true}))
+            .collect();
+        results.extend(ids[200..].iter().map(|id| unsent(id)));
+        assert_eq!(
+            result,
+            json!({"results": results, "succeeded": 200, "failed": 201})
+        );
+        assert_eq!(
+            results[200]["error"],
+            "session expired or revoked; write not sent"
+        );
+    }
+
+    #[tokio::test]
+    async fn bulk_update_batches_one_patch_per_record_with_only_the_changed_fields() {
+        let fixture = Fixture::new().await;
+        let cookie = fixture.login();
+        let ids = record_ids(201);
+        // The first record is proxied, so a TTL change must leave it at Auto.
+        let records: Vec<Value> = ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| {
+                json!({"id": id, "type": "A", "name": format!("r{i}.example.com"),
+                       "content": "192.0.2.1", "proxied": i == 0, "ttl": if i == 0 { 1 } else { 300 }})
+            })
+            .collect();
+        let listing = json!({"success": true, "errors": [], "result": records,
+            "result_info": {"page": 1, "per_page": 100, "total_pages": 1, "total_count": 201}});
+        fixture.respond(move |request| {
+            if request.method == "GET" {
+                return Some((200, listing.clone()));
+            }
+            batch_applied(request)
+        });
+        let synthetic = json!({"ttl": 600, "comment": "synthetic"});
+        let tags = json!({"tags": ["test:bulk"]});
+        let proxied = json!({"ttl": 1, "proxied": true});
+        let dns_only = json!({"ttl": 600, "proxied": false});
+        for (patch, first, rest) in [
+            (
+                &synthetic,
+                &json!({"ttl": 1, "comment": "synthetic"}),
+                &synthetic,
+            ),
+            (&tags, &tags, &tags),
+            (&json!({"proxied": true, "ttl": 3600}), &proxied, &proxied),
+            (&dns_only, &dns_only, &dns_only),
+        ] {
+            let body = json!({"action": "update", "ids": ids, "patch": patch});
+            let result = bulk_request(&fixture, &cookie, body).await;
+            assert_eq!(
+                (&result["succeeded"], &result["failed"]),
+                (&json!(201), &json!(0)),
+                "{patch}"
+            );
+            let requests = fixture.take_upstream_requests();
+            assert_eq!(requests[0].method, "GET");
+            let batches = batched_ids(&requests[1..], "patches");
+            assert_eq!(batches.iter().map(Vec::len).collect::<Vec<_>>(), [200, 1]);
+            let items = requests[1..]
+                .iter()
+                .flat_map(|r| r.body["patches"].as_array().unwrap());
+            for (i, item) in items.enumerate() {
+                let mut expected = if i == 0 { first.clone() } else { rest.clone() };
+                expected["id"] = json!(ids[i]);
+                assert_eq!(item, &expected, "{patch}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn bulk_checks_every_id_before_the_first_batch() {
+        let fixture = Fixture::new().await;
+        let cookie = fixture.login();
+        fixture.respond(batch_applied);
+        let path = format!("/api/zones/{ZONE}/records/bulk");
+        let mut late_bad_id = record_ids(300);
+        late_bad_id[250] = "bad.identifier".into();
+        for ids in [late_bad_id, record_ids(501)] {
+            for action in ["delete", "update"] {
+                let body = json!({"action": action, "ids": ids, "patch": {"ttl": 600}});
+                let resp = fixture
+                    .send("POST", &path, Some(&cookie), body.to_string().as_bytes())
+                    .await;
+                assert_eq!(resp.status, 400, "{action}");
+            }
+        }
+        assert_eq!(fixture.upstream_hits(), 0);
+    }
+
+    #[tokio::test]
+    async fn appearance_save_failures_are_server_errors_without_details() {
+        let fixture = Fixture::new().await;
+        let cookie = fixture.login();
+        std::fs::create_dir(fixture.dir.join("ui-settings.json")).unwrap();
+        let accent = fixture
+            .send(
+                "POST",
+                "/api/ui/accent",
+                Some(&cookie),
+                br##"{"accent":"#123456"}"##,
+            )
+            .await;
+        let mut req = fixture_request("localhost:8888", None);
+        req.path = "/api/ui/icon".into();
+        req.query.insert("mime".into(), "image/png".into());
+        req.headers
+            .push(("x-requested-with".into(), "fetch".into()));
+        req.headers.push(("cookie".into(), cookie.clone()));
+        req.body = fixture_png();
+        let icon = handle(fixture.state.clone(), req).await;
+        let reset = fixture
+            .send("DELETE", "/api/ui/icon", Some(&cookie), b"")
+            .await;
+        for resp in [accent, icon, reset] {
+            assert_eq!(resp.status, 500);
+            let message = body_json(&resp)["error"].as_str().unwrap().to_owned();
+            assert!(
+                !message.contains(fixture.dir.to_str().unwrap()),
+                "{message}"
+            );
+            assert!(!message.contains("os error"), "{message}");
+        }
+    }
+
+    #[tokio::test]
+    async fn request_bodies_reject_unknown_fields() {
+        let fixture = Fixture::new().await;
+        let cookie = fixture.login();
+        for (method, path, body) in [
+            (
+                "POST",
+                "/api/ui/accent",
+                json!({"accent": "#123456", "extra": 1}),
+            ),
+            (
+                "POST",
+                "/api/auth/login",
+                json!({"password": PASSWORD, "remember": true}),
+            ),
+            (
+                "POST",
+                "/api/auth/password",
+                json!({"current_password": PASSWORD, "new_password": "synthetic-new",
+                       "confirm": "synthetic-new", "code": null, "admin": true}),
+            ),
+            (
+                "POST",
+                &format!("/api/zones/{ZONE}/records"),
+                json!({"type": "A", "name": "example.com", "content": "192.0.2.1", "zone": ZONE}),
+            ),
+            (
+                "POST",
+                &format!("/api/zones/{ZONE}/records/bulk"),
+                json!({"action": "update", "ids": [ZONE], "patch": {"content": "192.0.2.1"}}),
+            ),
+        ] {
+            let resp = fixture
+                .send(method, path, Some(&cookie), body.to_string().as_bytes())
+                .await;
+            assert_eq!(resp.status, 400, "{path}");
+        }
+        assert_eq!(fixture.state.ui.accent(), None);
+        assert_eq!(fixture.upstream_hits(), 0);
+    }
+
+    #[tokio::test]
+    async fn structured_data_is_rejected_for_other_record_types() {
+        let fixture = Fixture::new().await;
+        let cookie = fixture.login();
+        let body = json!({"type": "A", "name": "example.com", "content": "192.0.2.1",
+                          "data": {"priority": 1, "weight": 1, "port": 443, "target": "example.com"}});
+        let path = format!("/api/zones/{ZONE}/records");
+        let resp = fixture
+            .send("POST", &path, Some(&cookie), body.to_string().as_bytes())
+            .await;
+        assert_eq!(resp.status, 400);
+        assert_eq!(fixture.upstream_hits(), 0);
+    }
+
+    #[tokio::test]
+    async fn public_config_does_not_reveal_two_factor_state() {
+        let fixture = Fixture::new().await;
+        let config = body_json(&fixture.get("/api/config").await);
+        assert!(config.get("totp_enabled").is_none(), "{config}");
+        assert_eq!(config["configured"], false);
+    }
+
+    #[tokio::test]
+    async fn every_response_carries_isolation_headers() {
+        let fixture = Fixture::new().await;
+        fixture
+            .state
+            .ui
+            .set_icon("image/png", fixture_png())
+            .unwrap();
+        for path in [
+            "/",
+            "/static/app.js",
+            "/static/favicon.svg",
+            "/api/config",
+            "/missing",
+        ] {
+            let resp = fixture.get(path).await;
+            assert_eq!(
+                header(&resp, "Cross-Origin-Opener-Policy"),
+                Some("same-origin"),
+                "{path}"
+            );
+            assert_eq!(
+                header(&resp, "Cross-Origin-Resource-Policy"),
+                Some("same-origin"),
+                "{path}"
+            );
+            let permissions = header(&resp, "Permissions-Policy").unwrap_or_default();
+            for feature in ["camera=()", "microphone=()", "geolocation=()"] {
+                assert!(permissions.contains(feature), "{path}: {permissions}");
+            }
+            assert_eq!(header(&resp, "Strict-Transport-Security"), None, "{path}");
+        }
+        let favicon = fixture.get("/static/favicon.svg").await;
+        assert_eq!(
+            (favicon.status, favicon.content_type.as_str()),
+            (200, "image/png")
+        );
+        assert_eq!(favicon.body, fixture_png());
+        let policies: Vec<&str> = favicon
+            .headers
+            .iter()
+            .filter(|(name, _)| name == "Content-Security-Policy")
+            .map(|(_, value)| value.as_str())
+            .collect();
+        assert_eq!(
+            policies,
+            [CONTENT_SECURITY_POLICY, "sandbox; default-src 'none'"]
+        );
+    }
+
+    #[tokio::test]
+    async fn every_script_in_index_html_is_served_as_javascript() {
+        let fixture = Fixture::new().await;
+        let html = String::from_utf8(fixture.get("/").await.body).unwrap();
+        let mut listed = Vec::new();
+        for tag in html.split("<script").skip(1) {
+            let (attributes, rest) = tag.split_once('>').unwrap();
+            // Any text before </script> would be an inline script.
+            assert!(rest.starts_with("</script>"), "inline script: {tag}");
+            let src = attributes
+                .split_once(" src=\"")
+                .and_then(|(_, rest)| rest.split_once('"'))
+                .map(|(src, _)| src)
+                .unwrap_or_else(|| panic!("script without src: {attributes}"));
+            let path = src
+                .strip_suffix(&format!("?v={VERSION}"))
+                .unwrap_or_else(|| panic!("{src} lacks the version query"));
+            let resp = fixture.get(path).await;
+            assert_eq!(
+                (resp.status, resp.content_type.as_str()),
+                (200, JAVASCRIPT),
+                "{path}"
+            );
+            assert!(!resp.body.is_empty(), "{path}");
+            assert_eq!(header(&resp, "Cache-Control"), Some("no-cache"), "{path}");
+            listed.push(path);
+        }
+        assert_eq!(listed.last(), Some(&"/static/app.js"));
+        let mut served: Vec<&str> = SCRIPTS.iter().map(|(path, _)| *path).collect();
+        listed.sort_unstable();
+        served.sort_unstable();
+        assert_eq!(
+            listed, served,
+            "index.html and SCRIPTS list different files"
+        );
+        for path in [
+            "/static/js/missing.js",
+            "/static/js/",
+            "/static/core.js",
+            "/js/core.js",
+        ] {
+            assert_eq!(fixture.get(path).await.status, 404, "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn hsts_is_sent_only_for_an_https_public_origin() {
+        let fixture = Fixture::with_config(|cfg| {
+            cfg.public_origin = Some("https://admin.example.com".parse().unwrap());
+            cfg.secure_cookies = true;
+        })
+        .await;
+        let mut req = fixture_request("admin.example.com", None);
+        req.method = "GET".into();
+        req.path = "/".into();
+        let resp = handle(fixture.state.clone(), req).await;
+        assert_eq!(resp.status, 200);
+        assert_eq!(
+            header(&resp, "Strict-Transport-Security"),
+            Some("max-age=31536000")
+        );
+    }
+
+    fn fixture_png() -> Vec<u8> {
+        vec![
+            137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1,
+            8, 4, 0, 0, 0, 181, 28, 12, 2, 0, 0, 0, 11, 73, 68, 65, 84, 120, 218, 99, 100, 248, 15,
+            0, 1, 5, 1, 1, 39, 24, 227, 102, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
+        ]
+    }
+
     #[tokio::test]
     async fn appearance_static_accent_is_csp_safe_and_refreshes_after_reset() {
-        let fixture = AppearanceFixture::new();
+        let fixture = Fixture::new().await;
         fixture.state.ui.set_accent(Some("#123456".into())).unwrap();
         let css = fixture.get("/static/style.css").await;
         assert_eq!(css.status, 200);
@@ -1131,12 +1951,8 @@ mod tests {
 
     #[tokio::test]
     async fn appearance_default_logo_is_independent_of_uploaded_favicon() {
-        let fixture = AppearanceFixture::new();
-        let png = vec![
-            137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1,
-            8, 4, 0, 0, 0, 181, 28, 12, 2, 0, 0, 0, 11, 73, 68, 65, 84, 120, 218, 99, 100, 248, 15,
-            0, 1, 5, 1, 1, 39, 24, 227, 102, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
-        ];
+        let fixture = Fixture::new().await;
+        let png = fixture_png();
         fixture.state.ui.set_icon("image/png", png.clone()).unwrap();
         let logo = fixture.get("/static/default-logo.svg").await;
         assert_eq!(logo.status, 200);
@@ -1164,6 +1980,10 @@ mod tests {
                 false,
             ),
             ("localhost:8888", Some("http://attacker.example"), false),
+            ("[::1]:8888", Some("http://[::1]:8888"), true),
+            ("LOCALHOST:8888", Some("http://localhost:8888"), true),
+            ("localhost:8888", Some("null"), false),
+            ("[::1]:80", None, false),
             ("127.0.0.1:80", None, false),
             ("127.0.0.1:8888/extra", None, false),
             ("attacker@127.0.0.1:8888", None, false),
@@ -1179,7 +1999,7 @@ mod tests {
     #[test]
     fn trusted_proxy_origin_has_exact_host_port_and_scheme() {
         let mut cfg = fixture_config();
-        cfg.public_origin = Some("https://admin.example.com".into());
+        cfg.public_origin = Some("https://admin.example.com".parse().unwrap());
         cfg.secure_cookies = true;
         for (host, origin, allowed) in [
             ("admin.example.com", Some("https://admin.example.com"), true),
@@ -1192,6 +2012,8 @@ mod tests {
             ("admin.example.com", Some("http://admin.example.com"), false),
             ("attacker.example", None, false),
             ("127.0.0.1:8888", None, false),
+            ("ADMIN.example.com", Some("https://admin.example.com"), true),
+            ("admin.example.com", Some("null"), false),
         ] {
             assert_eq!(
                 request_origin_allowed(&cfg, &fixture_request(host, origin)),
@@ -1208,14 +2030,74 @@ mod tests {
             ("A", "2001:db8::1"),
             ("AAAA", "192.0.2.1"),
         ] {
-            let body: CreateRecordBody = serde_json::from_value(
+            let body: RecordBody = serde_json::from_value(
                 json!({"type":record_type,"name":"example.com","content":content}),
             )
             .unwrap();
             assert!(
-                validate_record_payload(&body).is_err(),
+                record_payload(body).is_err(),
                 "invalid address accepted for {record_type}"
             );
+        }
+    }
+
+    #[test]
+    fn structured_record_data_reaches_cloudflare_unchanged() {
+        for body in [
+            json!({"type": "SRV", "name": "_sip._tcp.example.com", "ttl": 300, "proxied": false,
+                   "content": "5 5060 sip.example.com",
+                   "data": {"priority": 10, "weight": 5, "port": 5060, "target": "sip.example.com"}}),
+            json!({"type": "CAA", "name": "example.com", "ttl": 1, "proxied": false,
+                   "content": "0 issue \"ca.example.net\"",
+                   "data": {"flags": 0, "tag": "issue", "value": "ca.example.net"}}),
+            json!({"type": "HTTPS", "name": "example.com", "ttl": 3600, "proxied": false,
+                   "content": "1 . alpn=\"h2\"", "comment": "synthetic",
+                   "data": {"priority": 1, "target": ".", "value": "alpn=\"h2\""}}),
+            json!({"type": "SVCB", "name": "_dns.example.com", "ttl": 60, "proxied": false,
+                   "content": "1 dns.example.com", "tags": ["test:svcb"],
+                   "data": {"priority": 1, "target": "dns.example.com"}}),
+        ] {
+            let payload = record_payload(serde_json::from_value(body.clone()).unwrap()).unwrap();
+            assert_eq!(serde_json::to_value(payload).unwrap(), body);
+        }
+    }
+
+    #[test]
+    fn record_data_must_match_the_record_type() {
+        let srv = json!({"priority": 1, "weight": 1, "port": 443, "target": "example.com"});
+        let caa = json!({"flags": 0, "tag": "issue", "value": "ca.example.net"});
+        for (record_type, data) in [
+            ("A", Some(srv.clone())),
+            ("CNAME", Some(srv.clone())),
+            ("TXT", Some(json!({}))),
+            ("SRV", None),
+            ("SRV", Some(caa.clone())),
+            (
+                "SRV",
+                Some(json!({"priority": 1, "weight": 1, "port": 443, "target": ""})),
+            ),
+            (
+                "SRV",
+                Some(json!({"priority": 1, "weight": 1, "port": 443, "target": "x", "extra": 1})),
+            ),
+            ("CAA", Some(srv.clone())),
+            (
+                "CAA",
+                Some(json!({"flags": 0, "tag": "", "value": "ca.example.net"})),
+            ),
+            (
+                "HTTPS",
+                Some(json!({"priority": 1, "target": ".", "port": 443})),
+            ),
+            ("SVCB", Some(json!({"priority": 1, "target": ""}))),
+        ] {
+            let mut body =
+                json!({"type": record_type, "name": "example.com", "content": "192.0.2.1"});
+            if let Some(data) = data {
+                body["data"] = data;
+            }
+            let body: RecordBody = serde_json::from_value(body).unwrap();
+            assert!(record_payload(body).is_err(), "accepted {record_type} data");
         }
     }
 
@@ -1232,11 +2114,11 @@ mod tests {
             ),
             ("HTTPS", json!({"priority":65536,"target":"example.com"})),
         ] {
-            let body: CreateRecordBody = serde_json::from_value(
+            let body: RecordBody = serde_json::from_value(
                 json!({"type":record_type,"name":"example.com","data":data}),
             )
             .unwrap();
-            assert!(validate_record_payload(&body).is_err());
+            assert!(record_payload(body).is_err());
         }
     }
 }

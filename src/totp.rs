@@ -3,6 +3,7 @@
 //! implementation), the same generator used by the `totp-rs` crate.
 
 use ring::hmac;
+use std::fmt::Write;
 
 const BASE32_ALPHABET: &[u8; 32] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
 
@@ -83,22 +84,18 @@ pub fn totp_at(secret: &[u8], timestamp_secs: u64) -> u32 {
 }
 
 /// Verify a user-supplied 6-digit code, allowing ±1 time step drift.
-pub fn totp_verify(secret: &[u8], code: &str, timestamp_secs: u64) -> bool {
+/// Returns the time step the code matched, so the caller can refuse a
+/// second use of the same code.
+pub fn totp_verify(secret: &[u8], code: &str, timestamp_secs: u64) -> Option<u64> {
     if secret.is_empty() || code.len() != 6 || !code.bytes().all(|byte| byte.is_ascii_digit()) {
-        return false;
+        return None;
     }
-    let code: u32 = match code.parse() {
-        Ok(c) => c,
-        Err(_) => return false,
-    };
+    let code: u32 = code.parse().ok()?;
     let step = timestamp_secs / 30;
-    for drift in [0i64, -1, 1] {
-        let s = step as i64 + drift;
-        if s >= 0 && hotp(secret, s as u64) == code {
-            return true;
-        }
-    }
-    false
+    [Some(step), step.checked_sub(1), step.checked_add(1)]
+        .into_iter()
+        .flatten()
+        .find(|&candidate| hotp(secret, candidate) == code)
 }
 
 /// otpauth:// URI for authenticator apps.
@@ -121,7 +118,8 @@ pub fn qr_svg(data: &str) -> Option<String> {
     for y in 0..size {
         for x in 0..size {
             if qr.get_module(x, y) {
-                paths.push_str(&format!("M{x},{y}h1v1h-1z"));
+                // Writing to a String cannot fail.
+                let _ = write!(paths, "M{x},{y}h1v1h-1z");
             }
         }
     }
@@ -167,14 +165,14 @@ mod tests {
         let timestamp = 1111111109;
         let code = format!("{:06}", totp_at(secret, timestamp));
         assert!(code.starts_with('0'));
-        assert!(totp_verify(secret, &code, timestamp));
+        assert!(totp_verify(secret, &code, timestamp).is_some());
         for malformed in [
             code[1..].to_string(),
             format!("+{code}"),
             format!("0{code}"),
             format!(" {code} "),
         ] {
-            assert!(!totp_verify(secret, &malformed, timestamp));
+            assert!(totp_verify(secret, &malformed, timestamp).is_none());
         }
     }
 
@@ -201,21 +199,36 @@ mod tests {
     fn totp_verify_accepts_current_and_neighbors() {
         let secret = b"12345678901234567890";
         let ts = 1_700_000_000u64;
+        let step = ts / 30;
         let code = format!("{:06}", totp_at(secret, ts));
-        assert!(totp_verify(secret, &code, ts));
-        // ±30s drift accepted
-        assert!(totp_verify(
-            secret,
-            &format!("{:06}", totp_at(secret, ts - 30)),
-            ts
-        ));
-        assert!(totp_verify(
-            secret,
-            &format!("{:06}", totp_at(secret, ts + 30)),
-            ts
-        ));
+        assert_eq!(totp_verify(secret, &code, ts), Some(step));
+        // ±30s drift accepted, and the matched step is reported
+        assert_eq!(
+            totp_verify(secret, &format!("{:06}", totp_at(secret, ts - 30)), ts),
+            Some(step - 1)
+        );
+        assert_eq!(
+            totp_verify(secret, &format!("{:06}", totp_at(secret, ts + 30)), ts),
+            Some(step + 1)
+        );
+        // Two steps away is outside the window
+        assert_eq!(
+            totp_verify(secret, &format!("{:06}", totp_at(secret, ts + 60)), ts),
+            None
+        );
         // Wrong code rejected
-        assert!(!totp_verify(secret, "000000", ts) || totp_at(secret, ts) == 0);
+        assert!(totp_verify(secret, "000000", ts).is_none() || totp_at(secret, ts) == 0);
+    }
+
+    #[test]
+    fn totp_verify_at_step_zero_has_no_previous_step() {
+        let secret = b"12345678901234567890";
+        let code = format!("{:06}", totp_at(secret, 0));
+        assert_eq!(totp_verify(secret, &code, 0), Some(0));
+        assert_eq!(
+            totp_verify(secret, &format!("{:06}", totp_at(secret, 30)), 0),
+            Some(1)
+        );
     }
 
     #[test]

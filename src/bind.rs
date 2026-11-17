@@ -1,4 +1,10 @@
 use std::collections::HashSet;
+use std::net::{Ipv4Addr, Ipv6Addr};
+use std::str::FromStr;
+
+const MAX_RECORDS: usize = 10_000;
+const MAX_PAREN_DEPTH: u32 = 16;
+const INVALID_RDATA: &str = "unsupported record type or invalid record data";
 
 pub fn validate(input: &[u8]) -> Result<(), String> {
     let text = std::str::from_utf8(input).map_err(|_| "zone file must be UTF-8")?;
@@ -8,6 +14,32 @@ pub fn validate(input: &[u8]) -> Result<(), String> {
     {
         return Err("zone file contains a control character".to_string());
     }
+    let mut zone = ZoneCheck::default();
+    for statement in statements(text)? {
+        let line = statement.line;
+        zone.statement(&statement)
+            .map_err(|msg| format!("line {line}: {msg}"))?;
+        if zone.records > MAX_RECORDS {
+            return Err(format!("line {line}: too many records (max {MAX_RECORDS})"));
+        }
+    }
+    if zone.records == 0 {
+        return Err("zone file contains no importable records".to_string());
+    }
+    Ok(())
+}
+
+/// One record or directive, with parenthesised continuation lines joined
+/// and comments removed.
+struct Statement {
+    line: usize,
+    omitted_owner: bool,
+    fields: Vec<String>,
+}
+
+/// Split a zone file into statements. Quotes and escapes stay in the fields
+/// so the rdata checks can decode them later.
+fn statements(text: &str) -> Result<Vec<Statement>, String> {
     let mut statements = Vec::new();
     let mut words = Vec::new();
     let mut word = String::new();
@@ -29,7 +61,11 @@ pub fn validate(input: &[u8]) -> Result<(), String> {
             }
             if depth == 0 {
                 if !words.is_empty() {
-                    statements.push((start, leading_space, std::mem::take(&mut words)));
+                    statements.push(Statement {
+                        line: start,
+                        omitted_owner: leading_space,
+                        fields: std::mem::take(&mut words),
+                    });
                 }
                 start = line + 1;
                 leading_space = false;
@@ -71,7 +107,7 @@ pub fn validate(input: &[u8]) -> Result<(), String> {
                     .checked_sub(1)
                     .ok_or("unmatched closing parenthesis")?;
             }
-            if depth > 16 {
+            if depth > MAX_PAREN_DEPTH {
                 return Err("zone-file parentheses are nested too deeply".to_string());
             }
             if !word.is_empty() {
@@ -93,215 +129,299 @@ pub fn validate(input: &[u8]) -> Result<(), String> {
     if depth != 0 {
         return Err("unclosed zone-file parenthesis".to_string());
     }
-    let mut origin = String::new();
-    let mut owner = None;
-    let mut default_ttl = false;
-    let mut inherited_ttl = false;
-    let mut seen = HashSet::new();
-    let mut count = 0;
-    for (line, omitted_owner, fields) in statements {
-        let error = |msg: &str| format!("line {line}: {msg}");
-        if fields[0].starts_with('$') {
-            match fields[0].to_ascii_uppercase().as_str() {
-                "$TTL" if fields.len() == 2 && valid_ttl(&fields[1]) => default_ttl = true,
-                "$ORIGIN" if fields.len() == 2 && valid_name(&fields[1]) => {
-                    origin = canonical_name(&fields[1], &origin)
-                        .ok_or_else(|| error("invalid resolved origin"))?;
-                }
-                _ => {
-                    return Err(error(
-                        "unsupported or invalid directive; only $TTL and $ORIGIN are supported",
-                    ))
-                }
-            }
-            continue;
+    Ok(statements)
+}
+
+/// State carried from one statement to the next.
+#[derive(Default)]
+struct ZoneCheck {
+    origin: String,
+    owner: Option<String>,
+    default_ttl: bool,
+    inherited_ttl: bool,
+    seen: HashSet<(String, String, Vec<Vec<u8>>)>,
+    records: usize,
+}
+
+impl ZoneCheck {
+    fn statement(&mut self, statement: &Statement) -> Result<(), &'static str> {
+        let fields = statement.fields.as_slice();
+        if fields.first().is_some_and(|field| field.starts_with('$')) {
+            return self.directive(fields);
         }
-        let mut i = 0;
-        if !omitted_owner {
-            if !valid_name(&fields[0]) {
-                return Err(error("invalid record owner"));
-            }
-            owner = canonical_name(&fields[0], &origin);
-            i += 1;
+        let (owner, fields) = self.record_owner(fields, statement.omitted_owner)?;
+        let fields = self.ttl_and_class(fields)?;
+        let [kind, data @ ..] = fields else {
+            return Err("missing record type");
+        };
+        let kind = kind.to_ascii_uppercase();
+        let rdata = canonical_rdata(&kind, data, &self.origin)?;
+        let counted = kind != "SOA";
+        if !self.seen.insert((owner, kind, rdata)) {
+            return Err("duplicate record in zone file");
         }
-        let name = owner
-            .as_ref()
-            .ok_or_else(|| error("omitted owner has no preceding record"))?;
-        let mut ttl = default_ttl || inherited_ttl;
-        let mut explicit_ttl = false;
+        if counted {
+            self.records += 1;
+        }
+        Ok(())
+    }
+
+    fn directive(&mut self, fields: &[String]) -> Result<(), &'static str> {
+        match fields {
+            [name, ttl] if name.eq_ignore_ascii_case("$TTL") && valid_ttl(ttl) => {
+                self.default_ttl = true;
+            }
+            [name, origin] if name.eq_ignore_ascii_case("$ORIGIN") && valid_name(origin) => {
+                self.origin =
+                    canonical_name(origin, &self.origin).ok_or("invalid resolved origin")?;
+            }
+            _ => {
+                return Err("unsupported or invalid directive; only $TTL and $ORIGIN are supported")
+            }
+        }
+        Ok(())
+    }
+
+    /// Return the record owner and the fields after it. A line that starts
+    /// with whitespace reuses the previous owner.
+    fn record_owner<'a>(
+        &mut self,
+        fields: &'a [String],
+        omitted: bool,
+    ) -> Result<(String, &'a [String]), &'static str> {
+        if omitted {
+            let owner = self
+                .owner
+                .clone()
+                .ok_or("omitted owner has no preceding record")?;
+            return Ok((owner, fields));
+        }
+        let [owner, rest @ ..] = fields else {
+            return Err("invalid record owner");
+        };
+        if !valid_name(owner) {
+            return Err("invalid record owner");
+        }
+        let owner = canonical_name(owner, &self.origin)
+            .ok_or("invalid owner name after applying $ORIGIN")?;
+        self.owner = Some(owner.clone());
+        Ok((owner, rest))
+    }
+
+    /// Skip the optional TTL and class, which may come in either order, and
+    /// return the fields that follow them.
+    fn ttl_and_class<'a>(
+        &mut self,
+        mut fields: &'a [String],
+    ) -> Result<&'a [String], &'static str> {
         let mut class = false;
-        while let Some(field) = fields.get(i) {
-            if field.eq_ignore_ascii_case("IN") && !class {
-                class = true;
-                i += 1;
-            } else if valid_ttl(field) && !explicit_ttl {
-                ttl = true;
-                explicit_ttl = true;
-                i += 1;
-            } else {
-                break;
-            }
-        }
-        if !ttl {
-            return Err(error("record needs a TTL or a $TTL default"));
-        }
-        if explicit_ttl {
-            inherited_ttl = true;
-        }
-        let kind = fields
-            .get(i)
-            .ok_or_else(|| error("missing record type"))?
-            .to_ascii_uppercase();
-        i += 1;
-        let data = &fields[i..];
-        let valid = match kind.as_str() {
-            "A" => data.len() == 1 && data[0].parse::<std::net::Ipv4Addr>().is_ok(),
-            "AAAA" => data.len() == 1 && data[0].parse::<std::net::Ipv6Addr>().is_ok(),
-            "CNAME" | "NS" | "PTR" => data.len() == 1 && valid_name(&data[0]),
-            "MX" => data.len() == 2 && data[0].parse::<u16>().is_ok() && valid_name(&data[1]),
-            "SRV" => {
-                data.len() == 4
-                    && data[..3].iter().all(|s| s.parse::<u16>().is_ok())
-                    && valid_name(&data[3])
-            }
-            "CAA" => {
-                data.len() == 3
-                    && data[0].parse::<u8>().is_ok()
-                    && decode_value(&data[1]).is_some_and(|s| {
-                        !s.is_empty() && s.len() <= 15 && s.iter().all(u8::is_ascii_alphanumeric)
-                    })
-                    && decode_value(&data[2]).is_some()
-            }
-            "TXT" => {
-                !data.is_empty()
-                    && data
-                        .iter()
-                        .all(|s| decode_value(s).is_some_and(|s| s.len() <= 255))
-            }
-            "HTTPS" | "SVCB" => {
-                data.len() >= 2
-                    && data[0].parse::<u16>().is_ok()
-                    && valid_name(&data[1])
-                    && valid_service_params(&data[2..])
-            }
-            "SOA" => {
-                data.len() == 7
-                    && data[..2].iter().all(|s| valid_name(s))
-                    && data[2].parse::<u32>().is_ok()
-                    && data[3..].iter().all(|s| valid_ttl(s))
-            }
-            "URI" => {
-                data.len() == 3
-                    && data[..2].iter().all(|s| s.parse::<u16>().is_ok())
-                    && decode_value(&data[2]).is_some()
-            }
-            "NAPTR" => {
-                data.len() == 6
-                    && data[..2].iter().all(|s| s.parse::<u16>().is_ok())
-                    && data[2..5].iter().all(|s| decode_value(s).is_some())
-                    && valid_name(&data[5])
-            }
-            "DS" => {
-                data.len() >= 4
-                    && data[0].parse::<u16>().is_ok()
-                    && data[1..3].iter().all(|s| s.parse::<u8>().is_ok())
-                    && valid_hex_data(&data[3..])
-            }
-            "SSHFP" => {
-                data.len() >= 3
-                    && data[..2].iter().all(|s| s.parse::<u8>().is_ok())
-                    && valid_hex_data(&data[2..])
-            }
-            "TLSA" | "SMIMEA" => {
-                data.len() >= 4
-                    && data[..3].iter().all(|s| s.parse::<u8>().is_ok())
-                    && valid_hex_data(&data[3..])
-            }
-            "DNSKEY" => {
-                data.len() >= 4
-                    && data[0].parse::<u16>().is_ok()
-                    && data[1] == "3"
-                    && data[2].parse::<u8>().is_ok()
-                    && valid_base64_data(&data[3..])
-            }
-            "CERT" => {
-                data.len() >= 4
-                    && (data[0].parse::<u16>().is_ok()
-                        || matches!(
-                            data[0].as_str(),
-                            "PKIX"
-                                | "SPKI"
-                                | "PGP"
-                                | "IPKIX"
-                                | "ISPKI"
-                                | "IPGP"
-                                | "ACPKIX"
-                                | "IACPKIX"
-                                | "URI"
-                                | "OID"
-                        ))
-                    && data[1].parse::<u16>().is_ok()
-                    && data[2].parse::<u8>().is_ok()
-                    && valid_base64_data(&data[3..])
-            }
-            _ => false,
-        };
-        if !valid {
-            return Err(error("unsupported record type or invalid record data"));
-        }
-        let resolve = |s: &str| {
-            canonical_name(s, &origin).ok_or_else(|| error("invalid origin-relative DNS name"))
-        };
-        let mut canonical_data: Vec<Vec<u8>> = data
-            .iter()
-            .map(|s| decode_value(s).unwrap_or_else(|| s.as_bytes().to_vec()))
-            .collect();
-        match kind.as_str() {
-            "A" | "AAAA" => {
-                canonical_data[0] = data[0]
-                    .parse::<std::net::IpAddr>()
-                    .unwrap()
-                    .to_string()
-                    .into_bytes()
-            }
-            "CNAME" | "NS" | "PTR" => canonical_data[0] = resolve(&data[0])?.into_bytes(),
-            "MX" => {
-                canonical_data[0] = data[0].parse::<u16>().unwrap().to_string().into_bytes();
-                canonical_data[1] = resolve(&data[1])?.into_bytes();
-            }
-            "SRV" => {
-                for i in 0..3 {
-                    canonical_data[i] = data[i].parse::<u16>().unwrap().to_string().into_bytes();
+        let mut ttl = false;
+        loop {
+            match fields {
+                [field, rest @ ..] if !class && field.eq_ignore_ascii_case("IN") => {
+                    class = true;
+                    fields = rest;
                 }
-                canonical_data[3] = resolve(&data[3])?.into_bytes();
+                [field, rest @ ..] if !ttl && valid_ttl(field) => {
+                    ttl = true;
+                    fields = rest;
+                }
+                _ => break,
             }
-            "HTTPS" | "SVCB" => {
-                canonical_data[0] = data[0].parse::<u16>().unwrap().to_string().into_bytes();
-                canonical_data[1] = resolve(&data[1])?.into_bytes();
-                canonical_data[2..].sort();
-            }
-            "CAA" => canonical_data[0] = data[0].parse::<u8>().unwrap().to_string().into_bytes(),
-            "SOA" => {
-                canonical_data[0] = resolve(&data[0])?.into_bytes();
-                canonical_data[1] = resolve(&data[1])?.into_bytes();
-            }
-            "NAPTR" => canonical_data[5] = resolve(&data[5])?.into_bytes(),
-            _ => {}
         }
-        if !seen.insert((name.clone(), kind.clone(), canonical_data)) {
-            return Err(error("duplicate record in zone file"));
+        if ttl {
+            // Later records without a TTL reuse the last explicit one.
+            self.inherited_ttl = true;
+        } else if !self.default_ttl && !self.inherited_ttl {
+            return Err("record needs a TTL or a $TTL default");
         }
-        if kind != "SOA" {
-            count += 1;
-        }
-        if count > 10000 {
-            return Err(error("too many records (max 10000)"));
-        }
+        Ok(fields)
     }
-    if count == 0 {
-        return Err("zone file contains no importable records".to_string());
+}
+
+/// Check one record's data and return it in canonical form, so that two
+/// spellings of the same record are caught by the duplicate check. Fields
+/// that are not normalised here keep their decoded text.
+fn canonical_rdata(
+    kind: &str,
+    data: &[String],
+    origin: &str,
+) -> Result<Vec<Vec<u8>>, &'static str> {
+    let name = |s: &str| rdata_name(s, origin);
+    let rdata = match (kind, data) {
+        ("A", [address]) => vec![canonical::<Ipv4Addr>(address)?],
+        ("AAAA", [address]) => vec![canonical::<Ipv6Addr>(address)?],
+        ("CNAME" | "NS" | "PTR", [target]) => vec![name(target)?],
+        ("MX", [preference, exchange]) => vec![canonical::<u16>(preference)?, name(exchange)?],
+        ("SRV", [priority, weight, port, target]) => vec![
+            canonical::<u16>(priority)?,
+            canonical::<u16>(weight)?,
+            canonical::<u16>(port)?,
+            name(target)?,
+        ],
+        ("CAA", [flags, tag, value]) => {
+            vec![canonical::<u8>(flags)?, caa_tag(tag)?, text(value)?]
+        }
+        ("TXT", [_, ..]) => data
+            .iter()
+            .map(|s| character_string(s))
+            .collect::<Result<_, _>>()?,
+        ("HTTPS" | "SVCB", [priority, target, params @ ..]) => {
+            if !valid_service_params(params) {
+                return Err(INVALID_RDATA);
+            }
+            // Parameter order carries no meaning.
+            let mut params: Vec<Vec<u8>> = params.iter().map(|s| raw(s)).collect();
+            params.sort();
+            [vec![canonical::<u16>(priority)?, name(target)?], params].concat()
+        }
+        ("SOA", [mname, rname, serial, refresh, retry, expire, minimum]) => vec![
+            name(mname)?,
+            name(rname)?,
+            checked::<u32>(serial)?,
+            ttl_field(refresh)?,
+            ttl_field(retry)?,
+            ttl_field(expire)?,
+            ttl_field(minimum)?,
+        ],
+        ("URI", [priority, weight, target]) => vec![
+            checked::<u16>(priority)?,
+            checked::<u16>(weight)?,
+            text(target)?,
+        ],
+        ("NAPTR", [order, preference, flags, services, regexp, replacement]) => vec![
+            checked::<u16>(order)?,
+            checked::<u16>(preference)?,
+            text(flags)?,
+            text(services)?,
+            text(regexp)?,
+            name(replacement)?,
+        ],
+        ("DS", [key_tag, algorithm, digest_type, digest @ ..]) => [
+            vec![
+                checked::<u16>(key_tag)?,
+                checked::<u8>(algorithm)?,
+                checked::<u8>(digest_type)?,
+            ],
+            hex_fields(digest)?,
+        ]
+        .concat(),
+        ("SSHFP", [algorithm, fingerprint_type, fingerprint @ ..]) => [
+            vec![checked::<u8>(algorithm)?, checked::<u8>(fingerprint_type)?],
+            hex_fields(fingerprint)?,
+        ]
+        .concat(),
+        ("TLSA" | "SMIMEA", [usage, selector, matching_type, association @ ..]) => [
+            vec![
+                checked::<u8>(usage)?,
+                checked::<u8>(selector)?,
+                checked::<u8>(matching_type)?,
+            ],
+            hex_fields(association)?,
+        ]
+        .concat(),
+        // DNSKEY protocol is always 3 (RFC 4034).
+        ("DNSKEY", [flags, protocol, algorithm, key @ ..]) if protocol == "3" => [
+            vec![
+                checked::<u16>(flags)?,
+                raw(protocol),
+                checked::<u8>(algorithm)?,
+            ],
+            base64_fields(key)?,
+        ]
+        .concat(),
+        ("CERT", [cert_type, key_tag, algorithm, certificate @ ..]) => [
+            vec![
+                cert_type_field(cert_type)?,
+                checked::<u16>(key_tag)?,
+                checked::<u8>(algorithm)?,
+            ],
+            base64_fields(certificate)?,
+        ]
+        .concat(),
+        _ => return Err(INVALID_RDATA),
+    };
+    Ok(rdata)
+}
+
+/// Decoded field text, or the field as written when it does not decode.
+fn raw(s: &str) -> Vec<u8> {
+    decode_value(s).unwrap_or_else(|| s.as_bytes().to_vec())
+}
+
+/// Parse a field and keep the parsed value's spelling, so 010 and 10 match.
+fn canonical<T: FromStr + ToString>(s: &str) -> Result<Vec<u8>, &'static str> {
+    s.parse::<T>()
+        .map(|value| value.to_string().into_bytes())
+        .map_err(|_| INVALID_RDATA)
+}
+
+/// Check that a field parses, keeping it as written.
+fn checked<T: FromStr>(s: &str) -> Result<Vec<u8>, &'static str> {
+    s.parse::<T>().map(|_| raw(s)).map_err(|_| INVALID_RDATA)
+}
+
+fn text(s: &str) -> Result<Vec<u8>, &'static str> {
+    decode_value(s).ok_or(INVALID_RDATA)
+}
+
+fn character_string(s: &str) -> Result<Vec<u8>, &'static str> {
+    decode_value(s)
+        .filter(|value| value.len() <= 255)
+        .ok_or(INVALID_RDATA)
+}
+
+fn caa_tag(s: &str) -> Result<Vec<u8>, &'static str> {
+    decode_value(s)
+        .filter(|tag| {
+            !tag.is_empty() && tag.len() <= 15 && tag.iter().all(u8::is_ascii_alphanumeric)
+        })
+        .ok_or(INVALID_RDATA)
+}
+
+fn ttl_field(s: &str) -> Result<Vec<u8>, &'static str> {
+    if valid_ttl(s) {
+        Ok(raw(s))
+    } else {
+        Err(INVALID_RDATA)
     }
-    Ok(())
+}
+
+fn cert_type_field(s: &str) -> Result<Vec<u8>, &'static str> {
+    const MNEMONICS: [&str; 10] = [
+        "PKIX", "SPKI", "PGP", "IPKIX", "ISPKI", "IPGP", "ACPKIX", "IACPKIX", "URI", "OID",
+    ];
+    if s.parse::<u16>().is_ok() || MNEMONICS.contains(&s) {
+        Ok(raw(s))
+    } else {
+        Err(INVALID_RDATA)
+    }
+}
+
+fn hex_fields(data: &[String]) -> Result<Vec<Vec<u8>>, &'static str> {
+    if valid_hex_data(data) {
+        Ok(data.iter().map(|s| raw(s)).collect())
+    } else {
+        Err(INVALID_RDATA)
+    }
+}
+
+fn base64_fields(data: &[String]) -> Result<Vec<Vec<u8>>, &'static str> {
+    if valid_base64_data(data) {
+        Ok(data.iter().map(|s| raw(s)).collect())
+    } else {
+        Err(INVALID_RDATA)
+    }
+}
+
+/// A domain name inside rdata, made absolute with the current $ORIGIN.
+fn rdata_name(s: &str, origin: &str) -> Result<Vec<u8>, &'static str> {
+    if !valid_name(s) {
+        return Err(INVALID_RDATA);
+    }
+    canonical_name(s, origin)
+        .map(String::into_bytes)
+        .ok_or("invalid origin-relative DNS name")
 }
 
 fn valid_hex_data(data: &[String]) -> bool {
@@ -441,10 +561,7 @@ fn valid_service_params(params: &[String]) -> bool {
     let mut keys = HashSet::new();
     for param in params {
         let (key, value) = param.split_once('=').unwrap_or((param, ""));
-        if key.is_empty()
-            || !key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
-            || !keys.insert(key)
-        {
+        if !valid_service_key(key) || !keys.insert(key) {
             return false;
         }
         let Some(decoded) = decode_value(value) else {
@@ -477,6 +594,26 @@ fn valid_service_params(params: &[String]) -> bool {
         }
     }
     true
+}
+
+/// RFC 9460 section 2.1: 1 to 63 characters from a-z, 0-9 and "-". Keys
+/// without a name are written keyNNNNN, a number up to 65535 without
+/// leading zeros.
+fn valid_service_key(key: &str) -> bool {
+    if key.is_empty()
+        || key.len() > 63
+        || !key
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+    {
+        return false;
+    }
+    match key.strip_prefix("key") {
+        Some(number) if number.starts_with(|c: char| c.is_ascii_digit()) => {
+            number.parse::<u16>().is_ok() && (number == "0" || !number.starts_with('0'))
+        }
+        _ => true,
+    }
 }
 
 fn valid_ttl(s: &str) -> bool {
@@ -554,6 +691,33 @@ mod tests {
     }
 
     #[test]
+    fn canonical_rdata_catches_respelled_duplicates() {
+        for file in [
+            "$TTL 300\n@ MX 010 mail.example.com.\n@ MX 10 MAIL.example.com.\n",
+            "$TTL 300\n@ SRV 01 2 3 a.example.com.\n@ SRV 1 02 3 A.example.com.\n",
+            "$TTL 300\n@ HTTPS 1 . alpn=h2 port=443\n@ HTTPS 01 . port=443 alpn=h2\n",
+            "$TTL 300\n@ CAA 00 issue \"ca.example\"\n@ CAA 0 \"issue\" ca.example\n",
+            "$ORIGIN example.com.\n$TTL 300\n@ NS ns1\n@ NS ns1.example.com.\n",
+            "$TTL 300\n@ SOA ns.example.com. h.example.com. 1 1h 2h 3d 300\n@ SOA NS.example.com. h.example.com. 1 1h 2h 3d 300\n",
+        ] {
+            let error = validate(file.as_bytes()).unwrap_err();
+            assert!(error.contains("duplicate record"), "{file}: {error}");
+        }
+    }
+
+    #[test]
+    fn distinct_spellings_that_are_not_canonicalised_stay_distinct() {
+        // Only some numeric fields are canonicalised; these must not collide.
+        for file in [
+            "$TTL 300\n@ DS 12345 8 2 ABCD\n@ DS 12345 08 2 ABCD\n",
+            "$TTL 300\n@ URI 10 1 \"https://example.com/\"\n@ URI 010 1 \"https://example.com/\"\n",
+            "$TTL 300\n@ A 192.0.2.1\n@ A 192.0.2.2\n@ AAAA 2001:db8::1\n",
+        ] {
+            assert!(validate(file.as_bytes()).is_ok(), "{file}");
+        }
+    }
+
+    #[test]
     fn long_resolved_origins_are_errors_not_panics() {
         let origin = format!(
             "{}.{}.{}.com.",
@@ -567,6 +731,53 @@ mod tests {
         ] {
             let file = format!("$ORIGIN {origin}\n{suffix}");
             assert!(validate(file.as_bytes()).is_err());
+        }
+    }
+
+    #[test]
+    fn overlong_owner_reports_an_invalid_owner_name() {
+        let origin = format!(
+            "{}.{}.{}.com.",
+            "a".repeat(63),
+            "b".repeat(63),
+            "c".repeat(63)
+        );
+        let file = format!(
+            "$ORIGIN {origin}\n$TTL 300\n{} A 192.0.2.1\n",
+            "d".repeat(63)
+        );
+        let error = validate(file.as_bytes()).unwrap_err();
+        assert!(error.contains("invalid owner name"), "{error}");
+        assert!(!error.contains("omitted owner"), "{error}");
+    }
+
+    #[test]
+    fn svc_param_keys_follow_rfc_9460() {
+        let longest = format!("{}=1", "a".repeat(63));
+        for params in [
+            "alpn=h2",
+            "no-default-alpn",
+            "ech=AAAA",
+            "key0=x",
+            "key65535=x",
+            longest.as_str(),
+        ] {
+            let file = format!("$TTL 300\n@ HTTPS 1 . {params}\n");
+            assert!(validate(file.as_bytes()).is_ok(), "{params}");
+        }
+        let too_long = format!("{}=1", "a".repeat(64));
+        for params in [
+            "ALPN=h2",
+            "Port=443",
+            "key65536=x",
+            "key007=x",
+            "key1a=x",
+            "a_b=1",
+            "=1",
+            too_long.as_str(),
+        ] {
+            let file = format!("$TTL 300\n@ HTTPS 1 . {params}\n");
+            assert!(validate(file.as_bytes()).is_err(), "{params}");
         }
     }
 

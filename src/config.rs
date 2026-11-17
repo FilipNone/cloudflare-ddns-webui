@@ -6,6 +6,9 @@
 //! password on first access and stores only a PBKDF2 hash in the data dir.
 
 use crate::pp::PP;
+use reqwest::Url;
+use std::io::Read;
+use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
 pub const DEFAULT_LISTEN: &str = "0.0.0.0:8080";
@@ -14,13 +17,44 @@ pub const DEFAULT_SESSION_TTL_SECS: u64 = 24 * 60 * 60; // 24h
 pub const DEFAULT_UPDATE_TIMEOUT_SECS: u64 = 30;
 pub const DEFAULT_DETECTION_TIMEOUT_SECS: u64 = 5;
 pub const DDNS_UPSTREAM_COMMIT: &str = "3f1a7220645a3f56eac94a6975b167bfd0f4ac5e";
+const MAX_TOKEN_FILE_BYTES: usize = 4096;
+/// Longest record comment the GUI accepts, in bytes, for record edits and
+/// RECORD_COMMENT. Cloudflare allows 500 characters on paid plans and 100 on
+/// Free, and rejects longer comments itself. Counting bytes is stricter for
+/// non-ASCII text, where 500 bytes hold fewer than 500 characters.
+pub(crate) const MAX_RECORD_COMMENT: usize = 500;
 
-#[derive(Debug, Clone)]
+/// Cloudflare accepts TTL 1 (automatic) or 30 to 86400 seconds. Zones
+/// outside Enterprise may need at least 60, which Cloudflare checks.
+pub(crate) fn valid_ttl(ttl: u32) -> bool {
+    ttl == 1 || (30..=86400).contains(&ttl)
+}
+
+/// The address in a URL's host when the host is an IP literal.
+pub(crate) fn host_ip(url: &Url) -> Option<IpAddr> {
+    url.host_str()?.trim_matches(['[', ']']).parse().ok()
+}
+
+/// True for `localhost` and loopback IP literals. URL parsing lowercases
+/// host names, so `LOCALHOST` matches too.
+pub(crate) fn is_loopback_host(url: &Url) -> bool {
+    url.host_str() == Some("localhost") || host_ip(url).is_some_and(|ip| ip.is_loopback())
+}
+
+/// True when a URL has no user name, password, query or fragment.
+pub(crate) fn bare_url(url: &Url) -> bool {
+    url.username().is_empty()
+        && url.password().is_none()
+        && url.query().is_none()
+        && url.fragment().is_none()
+}
+
+#[derive(Clone)]
 pub struct Config {
     /// Cloudflare API token (Bearer).
     pub api_token: String,
     /// Address the HTTP server binds to.
-    pub listen: String,
+    pub listen: SocketAddr,
     /// Directory holding state.json, ui settings and uploaded icon.
     pub data_dir: String,
     /// How long a login session stays valid.
@@ -32,7 +66,7 @@ pub struct Config {
     /// Add the `Secure` attribute to session cookies (enable behind HTTPS).
     pub secure_cookies: bool,
     /// Trusted browser origin for a reverse proxy; HTTPS requires secure cookies.
-    pub public_origin: Option<String>,
+    pub public_origin: Option<Url>,
     /// Union of configured names for independent DNS status and manual updates.
     pub domains: Vec<String>,
     /// Effective domain sets, including DOMAINS, for each family.
@@ -57,6 +91,18 @@ pub struct Config {
     pub quiet: bool,
     /// Override the Cloudflare API base URL (testing only).
     pub api_base: Option<String>,
+}
+
+// Written by hand so a debug print can never show the API token.
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            .field("listen", &self.listen)
+            .field("data_dir", &self.data_dir)
+            .field("ddns_contract", &self.ddns_contract)
+            .field("domains", &self.domains)
+            .finish_non_exhaustive()
+    }
 }
 
 fn parse_bool(value: &str) -> Result<bool, String> {
@@ -88,15 +134,16 @@ fn parse_duration(value: &str) -> Result<Duration, String> {
     Ok(Duration::from_secs(seconds))
 }
 
-/// Read a secret from `NAME`, falling back to reading a file from `NAME_FILE`.
-fn secret_env(get: &impl Fn(&str) -> Result<Option<String>, String>) -> Result<String, String> {
+/// Reads the API token from `CLOUDFLARE_API_TOKEN`, or from the file named by
+/// `CLOUDFLARE_API_TOKEN_FILE` when the first is unset.
+fn api_token(get: &impl Fn(&str) -> Result<Option<String>, String>) -> Result<String, String> {
     let token = match get("CLOUDFLARE_API_TOKEN")?.filter(|v| !v.trim().is_empty()) {
         Some(v) => v,
         None => {
             let path = get("CLOUDFLARE_API_TOKEN_FILE")?
                 .filter(|v| !v.trim().is_empty())
                 .ok_or("CLOUDFLARE_API_TOKEN (or CLOUDFLARE_API_TOKEN_FILE) must be set")?;
-            std::fs::read_to_string(path).map_err(|_| "Cannot read CLOUDFLARE_API_TOKEN_FILE")?
+            read_token_file(&path)?
         }
     };
     let token = token.trim();
@@ -109,6 +156,25 @@ fn secret_env(get: &impl Fn(&str) -> Result<Option<String>, String>) -> Result<S
         return Err("Invalid CLOUDFLARE_API_TOKEN (value omitted)".into());
     }
     Ok(token.to_string())
+}
+
+/// Reads a token file of at most `MAX_TOKEN_FILE_BYTES`. A failed read
+/// reports the I/O error, such as a missing file or denied permission, and
+/// never the file content.
+fn read_token_file(path: &str) -> Result<String, String> {
+    let failed = |error: std::io::Error| format!("Cannot read CLOUDFLARE_API_TOKEN_FILE: {error}");
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)
+        .map_err(failed)?
+        .take(MAX_TOKEN_FILE_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(failed)?;
+    if bytes.len() > MAX_TOKEN_FILE_BYTES {
+        return Err(format!(
+            "CLOUDFLARE_API_TOKEN_FILE is larger than {MAX_TOKEN_FILE_BYTES} bytes"
+        ));
+    }
+    String::from_utf8(bytes).map_err(|_| "CLOUDFLARE_API_TOKEN_FILE is not UTF-8 text".into())
 }
 
 fn parse_domains(value: &str) -> Result<Vec<String>, String> {
@@ -145,30 +211,49 @@ fn parse_domains(value: &str) -> Result<Vec<String>, String> {
 }
 
 fn validate_provider(provider: &str, ipv6: bool) -> Result<(), String> {
-    match provider {
-        "none" | "ipify" | "cloudflare.trace" => Ok(()),
-        _ if provider.starts_with("literal:") => {
-            let mut matching = 0;
-            for entry in provider[8..].split(',') {
-                let address = entry.trim().parse::<std::net::IpAddr>()
-                    .map_err(|_| "invalid literal provider address")?;
-                if address.is_ipv6() == ipv6 { matching += 1; }
-            }
-            if matching != 1 { return Err("literal provider requires exactly one address of its family".into()); }
-            Ok(())
-        }
-        _ if provider.starts_with("url:") || provider.starts_with("cloudflare.trace:") => {
-            let (_, endpoint) = provider.split_once(':').unwrap();
-            let url = reqwest::Url::parse(endpoint).map_err(|_| "invalid provider URL")?;
-            if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none()
-                || !url.username().is_empty() || url.password().is_some()
-                || endpoint.contains('@') || url.fragment().is_some() {
-                return Err("provider requires an http(s) URL without credentials, interface binding or fragment".into());
-            }
-            Ok(())
-        }
-        _ => Err("unsupported provider; use ipify, cloudflare.trace, cloudflare.trace:<url>, url:<url>, literal:<ip> or none".into()),
+    if matches!(provider, "none" | "ipify" | "cloudflare.trace") {
+        return Ok(());
     }
+    if let Some(list) = provider.strip_prefix("literal:") {
+        let mut matching = 0;
+        for entry in list.split(',') {
+            // ddns.rs treats ::ffff:a.b.c.d as IPv4, so count it as IPv4 here.
+            let address = entry
+                .trim()
+                .parse::<IpAddr>()
+                .map_err(|_| "invalid literal provider address")?
+                .to_canonical();
+            if address.is_ipv6() == ipv6 {
+                matching += 1;
+            }
+        }
+        if matching != 1 {
+            return Err("literal provider requires exactly one address of its family".into());
+        }
+        return Ok(());
+    }
+    let Some(endpoint) = provider
+        .strip_prefix("url:")
+        .or_else(|| provider.strip_prefix("cloudflare.trace:"))
+    else {
+        return Err("unsupported provider; use ipify, cloudflare.trace, \
+                    cloudflare.trace:<url>, url:<url>, literal:<ip> or none"
+            .into());
+    };
+    let url = Url::parse(endpoint).map_err(|_| "invalid provider URL")?;
+    // Provider URLs may carry a query, so `bare_url` is too strict here.
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || endpoint.contains('@')
+        || url.fragment().is_some()
+    {
+        return Err("provider requires an http(s) URL without credentials, \
+                    interface binding or fragment"
+            .into());
+    }
+    Ok(())
 }
 
 fn exact_comment_filter(value: &str) -> Result<String, String> {
@@ -247,14 +332,20 @@ pub fn load_config() -> Result<Config, String> {
 }
 
 fn load_config_from(
-    get: impl Fn(&str) -> Result<Option<String>, String>,
+    get_raw: impl Fn(&str) -> Result<Option<String>, String>,
     names: &[String],
 ) -> Result<Config, String> {
+    // Names are checked whatever their value, so an empty updater setting
+    // still stops startup.
     for name in names {
         if unsupported_setting(name) {
             return Err(format!("{name} is unsupported by the GUI DDNS v1 contract; use a separate companion environment"));
         }
     }
+    // As in cloudflare-ddns, a variable set to an empty string counts as unset.
+    let get = |name: &str| -> Result<Option<String>, String> {
+        Ok(get_raw(name)?.filter(|v| !v.is_empty()))
+    };
     let value = |name: &str, default: &str| -> Result<String, String> {
         Ok(get(name)?.unwrap_or_else(|| default.into()))
     };
@@ -272,10 +363,9 @@ fn load_config_from(
     };
     let emoji = boolean("EMOJI", true)?;
     let quiet = boolean("QUIET", false)?;
-    let api_token = secret_env(&get)?;
-    let listen = value("LISTEN", DEFAULT_LISTEN)?;
-    listen
-        .parse::<std::net::SocketAddr>()
+    let api_token = api_token(&get)?;
+    let listen: SocketAddr = value("LISTEN", DEFAULT_LISTEN)?
+        .parse()
         .map_err(|_| "LISTEN: expected IP:port")?;
     let data_dir = value("DATA_DIR", DEFAULT_DATA_DIR)?;
     if data_dir.trim().is_empty() {
@@ -287,29 +377,19 @@ fn load_config_from(
     let secure_cookies = boolean("SECURE_COOKIES", false)?;
     let public_origin = get("PUBLIC_ORIGIN")?
         .map(|v| {
-            let url =
-                reqwest::Url::parse(&v).map_err(|_| "PUBLIC_ORIGIN: expected an HTTP(S) origin")?;
-            let loopback = url.host_str().is_some_and(|host| {
-                host == "localhost"
-                    || host
-                        .trim_matches(['[', ']'])
-                        .parse::<std::net::IpAddr>()
-                        .is_ok_and(|ip| ip.is_loopback())
-            });
+            let url = Url::parse(&v).map_err(|_| "PUBLIC_ORIGIN: expected an HTTP(S) origin")?;
             if url.host_str().is_none()
-                || !url.username().is_empty()
-                || url.password().is_some()
+                || !bare_url(&url)
                 || url.path() != "/"
-                || url.query().is_some()
-                || url.fragment().is_some()
-                || !(url.scheme() == "https" || url.scheme() == "http" && loopback)
+                || !(url.scheme() == "https" || url.scheme() == "http" && is_loopback_host(&url))
             {
                 return Err("PUBLIC_ORIGIN: HTTPS origin required (HTTP allowed only on loopback)");
             }
             if url.scheme() == "https" && !secure_cookies {
                 return Err("PUBLIC_ORIGIN: HTTPS requires SECURE_COOKIES=true");
             }
-            Ok(url.origin().ascii_serialization())
+            // Parsing already lowercased the host and dropped a default port.
+            Ok(url)
         })
         .transpose()?;
     let common = parse_domains(&value("DOMAINS", "")?).map_err(|e| format!("DOMAINS: {e}"))?;
@@ -344,28 +424,25 @@ fn load_config_from(
         );
     }
     let ttl_text = value("TTL", "1")?;
-    if ttl_text.trim().is_empty() || !ttl_text.trim().bytes().all(|b| b.is_ascii_digit()) {
-        return Err("TTL: expected 1 or 30..86400".into());
-    }
-    let ttl = ttl_text
-        .trim()
-        .parse::<i64>()
-        .map_err(|_| "TTL: expected 1 or 30..86400")?;
-    if ttl != 1 && !(30..=86400).contains(&ttl) {
-        return Err("TTL: expected 1 or 30..86400".into());
-    }
+    // `parse` alone would also accept a leading `+`.
+    let ttl = Some(ttl_text.trim())
+        .filter(|t| !t.is_empty() && t.bytes().all(|b| b.is_ascii_digit()))
+        .and_then(|t| t.parse::<u32>().ok())
+        .filter(|&t| valid_ttl(t))
+        .ok_or("TTL: expected 1 or 30..86400")?;
     let proxied = boolean("PROXIED", false)?;
     let record_comment = get("RECORD_COMMENT")?
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty());
     if record_comment
         .as_ref()
-        .is_some_and(|v| v.len() > 1024 || v.chars().any(char::is_control))
+        .is_some_and(|v| v.len() > MAX_RECORD_COMMENT || v.chars().any(char::is_control))
     {
-        return Err("RECORD_COMMENT: at most 1024 bytes, without control characters".into());
+        return Err(format!(
+            "RECORD_COMMENT: at most {MAX_RECORD_COMMENT} bytes, without control characters"
+        ));
     }
     let managed_record_comment = get("MANAGED_RECORDS_COMMENT_REGEX")?
-        .filter(|v| !v.is_empty())
         .map(|v| exact_comment_filter(&v))
         .transpose()
         .map_err(|e| format!("MANAGED_RECORDS_COMMENT_REGEX: {e}"))?;
@@ -385,19 +462,14 @@ fn load_config_from(
     if ddns_contract == "shared-v1" && !shared_updater_paused {
         return Err("shared-v1 requires the companion to be paused and GUI_SHARED_UPDATER_PAUSED=true; concurrent updater coordination is unavailable".into());
     }
-    let api_base = get("CLOUDFLARE_API_BASE")?.filter(|v| !v.is_empty());
+    let api_base = get("CLOUDFLARE_API_BASE")?;
     if let Some(base) = &api_base {
-        let url = reqwest::Url::parse(base).map_err(|_| "invalid CLOUDFLARE_API_BASE")?;
-        let loopback = url
-            .host_str()
-            .and_then(|h| h.trim_matches(['[', ']']).parse::<std::net::IpAddr>().ok())
-            .is_some_and(|ip| ip.is_loopback());
-        if !loopback
+        let url = Url::parse(base).map_err(|_| "invalid CLOUDFLARE_API_BASE")?;
+        // The API token goes to this URL, so only an IP literal counts as
+        // loopback here. A name could resolve elsewhere.
+        if !host_ip(&url).is_some_and(|ip| ip.is_loopback())
             || !matches!(url.scheme(), "http" | "https")
-            || !url.username().is_empty()
-            || url.password().is_some()
-            || url.query().is_some()
-            || url.fragment().is_some()
+            || !bare_url(&url)
         {
             return Err(
                 "CLOUDFLARE_API_BASE is restricted to credential-free loopback test URLs".into(),
@@ -421,7 +493,7 @@ fn load_config_from(
         managed_record_comment,
         ip4_provider,
         ip6_provider,
-        ttl: if proxied { 1 } else { ttl },
+        ttl: if proxied { 1 } else { i64::from(ttl) },
         proxied,
         record_comment,
         emoji,
@@ -434,23 +506,23 @@ pub fn print_config_summary(cfg: &Config, ppfmt: &PP) {
     if cfg.quiet {
         return;
     }
-    ppfmt.infof("", &format!("Listen address: {}", cfg.listen));
-    ppfmt.infof("", &format!("Data directory: {}", cfg.data_dir));
-    ppfmt.infof("", &format!("Session TTL: {}s", cfg.session_ttl.as_secs()));
-    ppfmt.infof("", &format!("Secure cookies: {}", cfg.secure_cookies));
-    ppfmt.infof("", &format!("GUI DDNS contract: {} (upstream comparison {DDNS_UPSTREAM_COMMIT}; daemon not observed)", cfg.ddns_contract));
+    ppfmt.infof("", format!("Listen address: {}", cfg.listen));
+    ppfmt.infof("", format!("Data directory: {}", cfg.data_dir));
+    ppfmt.infof("", format!("Session TTL: {}s", cfg.session_ttl.as_secs()));
+    ppfmt.infof("", format!("Secure cookies: {}", cfg.secure_cookies));
+    ppfmt.infof("", format!("GUI DDNS contract: {} (upstream comparison {DDNS_UPSTREAM_COMMIT}; daemon not observed)", cfg.ddns_contract));
     if cfg.domains.is_empty() {
         ppfmt.infof(
             "",
             "DDNS domains: (none configured - dashboard DDNS features disabled)",
         );
     } else {
-        ppfmt.infof("", &format!("DDNS domains: {}", cfg.domains.join(", ")));
+        ppfmt.infof("", format!("DDNS domains: {}", cfg.domains.join(", ")));
         for (family, provider) in [("IPv4", &cfg.ip4_provider), ("IPv6", &cfg.ip6_provider)] {
             let kind = provider
                 .split_once(':')
                 .map_or(provider.as_str(), |(kind, _)| kind);
-            ppfmt.infof("", &format!("{family} provider: {kind} (details omitted)"));
+            ppfmt.infof("", format!("{family} provider: {kind} (details omitted)"));
         }
     }
 }
@@ -510,7 +582,7 @@ mod tests {
             "REJECT_CLOUDFLARE_IPS",
         ] {
             assert!(config(&[(name, "typo")]).unwrap_err().contains(name));
-            assert!(config(&[(name, "")]).unwrap_err().contains(name));
+            assert!(config(&[(name, " ")]).unwrap_err().contains(name));
         }
         for name in ["SESSION_TTL", "UPDATE_TIMEOUT", "DETECTION_TIMEOUT"] {
             for value in ["0", "junk", "18446744073709551615h", "31536001"] {
@@ -541,7 +613,7 @@ mod tests {
     #[test]
     fn ttl_is_validated_before_proxy_normalization() {
         for value in [
-            "",
+            " ",
             "junk",
             "0",
             "2",
@@ -628,7 +700,7 @@ mod tests {
             );
         }
         for provider in [
-            "",
+            " ",
             "typo",
             "cloudflare.doh",
             "local",
@@ -748,7 +820,8 @@ mod tests {
                 ("SECURE_COOKIES", "true")
             ])
             .unwrap()
-            .public_origin,
+            .public_origin
+            .map(|url| url.origin().ascii_serialization()),
             Some("https://example.com".into())
         );
         for origin in [
@@ -767,6 +840,106 @@ mod tests {
             assert!(config(&[("CLOUDFLARE_API_BASE", base)]).is_err());
         }
         assert!(config(&[("CLOUDFLARE_API_BASE", "http://127.0.0.1:1234/client/v4")]).is_ok());
+    }
+
+    #[test]
+    fn empty_values_count_as_unset() {
+        let cfg = config(&[
+            ("PUBLIC_ORIGIN", ""),
+            ("LISTEN", ""),
+            ("DATA_DIR", ""),
+            ("SESSION_TTL", ""),
+            ("SECURE_COOKIES", ""),
+            ("TTL", ""),
+            ("PROXIED", ""),
+            ("IP4_PROVIDER", ""),
+            ("IP6_PROVIDER", ""),
+            ("RECORD_COMMENT", ""),
+            ("GUI_DDNS_CONTRACT", ""),
+            ("CLOUDFLARE_API_BASE", ""),
+            ("REJECT_CLOUDFLARE_IPS", ""),
+        ])
+        .unwrap();
+        assert!(cfg.public_origin.is_none());
+        assert_eq!(cfg.listen.to_string(), DEFAULT_LISTEN);
+        assert_eq!(cfg.data_dir, DEFAULT_DATA_DIR);
+        assert_eq!(cfg.session_ttl.as_secs(), DEFAULT_SESSION_TTL_SECS);
+        assert!(!cfg.secure_cookies && !cfg.proxied);
+        assert_eq!(cfg.ttl, 1);
+        assert_eq!(
+            (cfg.ip4_provider.as_str(), cfg.ip6_provider.as_str()),
+            ("ipify", "cloudflare.trace")
+        );
+        assert_eq!(cfg.record_comment, None);
+        assert_eq!(cfg.ddns_contract, "standalone-v1");
+        assert_eq!(cfg.api_base, None);
+    }
+
+    #[test]
+    fn record_comment_has_the_api_comment_limit() {
+        let comment = "c".repeat(MAX_RECORD_COMMENT);
+        assert!(config(&[("RECORD_COMMENT", &comment)]).is_ok());
+        let longer = comment + "c";
+        assert!(config(&[("RECORD_COMMENT", &longer)])
+            .unwrap_err()
+            .contains("RECORD_COMMENT"));
+    }
+
+    #[test]
+    fn mapped_ipv4_literals_are_checked_as_ipv4() {
+        assert!(config(&[("IP4_PROVIDER", "literal:::ffff:192.0.2.1")]).is_ok());
+        assert!(config(&[("IP6_PROVIDER", "literal:::ffff:192.0.2.1")]).is_err());
+        assert!(config(&[("IP6_PROVIDER", "literal:::ffff:192.0.2.1,2001:db8::1")]).is_ok());
+    }
+
+    #[test]
+    fn token_file_read_is_bounded_and_reports_why_it_failed() {
+        let dir = std::env::temp_dir().join(format!(
+            "ddns-config-test-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("token");
+        let file = |path: &std::path::Path| {
+            config(&[
+                ("CLOUDFLARE_API_TOKEN", ""),
+                ("CLOUDFLARE_API_TOKEN_FILE", path.to_str().unwrap()),
+            ])
+        };
+        std::fs::write(&path, "dummy-file-token\n").unwrap();
+        assert_eq!(file(&path).unwrap().api_token, "dummy-file-token");
+
+        let mut oversized = b"dummy-file-token".to_vec();
+        oversized.resize(MAX_TOKEN_FILE_BYTES + 1, b'\n');
+        std::fs::write(&path, &oversized).unwrap();
+        let error = file(&path).unwrap_err();
+        assert!(error.contains("CLOUDFLARE_API_TOKEN_FILE") && !error.contains("dummy-file-token"));
+
+        let missing = dir.join("missing");
+        let expected = std::fs::File::open(&missing).unwrap_err().to_string();
+        let error = file(&missing).unwrap_err();
+        assert!(error.contains(&expected), "{error}");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::write(&path, "dummy-file-token").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+            // Root ignores file modes, so the check only runs as a normal user.
+            if let Err(denied) = std::fs::File::open(&path) {
+                let error = file(&path).unwrap_err();
+                assert!(error.contains(&denied.to_string()), "{error}");
+                assert!(!error.contains("dummy-file-token"));
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn debug_output_never_includes_the_token() {
+        let cfg = config(&[("CLOUDFLARE_API_TOKEN", "dummy-debug-marker")]).unwrap();
+        assert!(!format!("{cfg:?}").contains("dummy-debug-marker"));
     }
 
     #[test]

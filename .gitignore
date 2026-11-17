@@ -1,6 +1,5 @@
 target/
 .env
-.env.*
 data/
 __pycache__/
 .kilo/

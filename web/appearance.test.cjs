@@ -6,8 +6,34 @@ const path = require("node:path");
 const test = require("node:test");
 const vm = require("node:vm");
 
-const source = fs.readFileSync(path.join(__dirname, "app.js"), "utf8");
+const html = fs.readFileSync(path.join(__dirname, "index.html"), "utf8");
+// index.html is the one list of scripts and their load order; /static/<file> is web/<file>.
+const scriptFiles = [...html.matchAll(/<script\b[^>]*\bsrc="\/static\/([^"?]+)/gi)].map((match) => match[1]);
+const scriptSources = scriptFiles.map((file) => fs.readFileSync(path.join(__dirname, file), "utf8"));
+const source = scriptSources.join("\n");
 const css = fs.readFileSync(path.join(__dirname, "style.css"), "utf8");
+const BOOT_MARKER = "(async function boot()";
+
+// Tests load everything before the boot call so they can drive the app without a server.
+// Fail loudly if the marker moves; slicing at -1 would quietly load almost the whole file.
+function bootlessSource(text) {
+  const end = text.indexOf(BOOT_MARKER);
+  if (end < 0) throw new Error(`app.js no longer contains "${BOOT_MARKER}"; update the test loader`);
+  return text.slice(0, end);
+}
+
+// Each match is [tag, attributes, body]. Browsers accept any case and
+// "</script >", so the pattern does too.
+function scriptTags(text) {
+  return [...text.matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script\b[^>]*>/gi)];
+}
+
+// Runs every script as one, in index.html order, stopping before app.js boots.
+function loadApp(context) {
+  vm.runInContext(bootlessSource(source), context);
+}
+
+module.exports = { bootlessSource, loadApp, source };
 
 function rgb(color) {
   if (color.startsWith("#")) return [1, 3, 5].map((offset) => parseInt(color.slice(offset, offset + 2), 16));
@@ -41,6 +67,8 @@ function node(tag = "div") {
     replaceWith(replacement) { this.replacement = replacement; },
     getBoundingClientRect() { return { left: 20, top: 30, width: 40, height: 40 }; },
     click() { this.clicked = true; }, focus() {},
+    get className() { return [...classes].join(" "); },
+    set className(value) { classes.clear(); String(value).split(/\s+/).filter(Boolean).forEach((name) => classes.add(name)); },
   };
 }
 
@@ -60,9 +88,9 @@ function app({ reducedMotion = false } = {}) {
     document, localStorage: { getItem: (key) => storage.get(key) || null, setItem: (key, value) => storage.set(key, value) },
     location: { hash: "#/settings" },
     window: { innerWidth: 800, innerHeight: 600, matchMedia: (query) => ({ matches: query.includes("reduced-motion") && reducedMotion, addEventListener() {} }), addEventListener() {} },
-    setTimeout, clearTimeout, console,
+    setTimeout, clearTimeout, console, URL,
   });
-  vm.runInContext(source.slice(0, source.indexOf("(async function boot()")), context);
+  loadApp(context);
   vm.runInContext("state.config = { accent: null, has_icon: false, version: 'synthetic' }; toast = () => {};", context);
   return { context, nodes, root, document, storage, favicon, logo, run: (code) => vm.runInContext(code, context) };
 }
@@ -107,6 +135,92 @@ test("custom color has a square swatch with a pencil and accessible picker", () 
   assert.equal(picker.attributes["aria-label"], "Custom color");
   assert.equal(picker.value, "#123456");
   assert.match(css, /\.swatch-custom\s*\{[^}]*position:\s*relative/);
+});
+
+test("preset swatches get their color through CSSOM like the custom swatch", () => {
+  const { nodes, run } = app();
+  const row = node(); nodes.set("accent-row", row);
+  run("renderAccentRow()");
+  const presets = row.children.filter((child) => /^swatch\b/.test(child.className || "") && !child.className.includes("swatch-custom"));
+  assert.deepEqual(presets.map((swatch) => swatch.style.values["--swatch-color"]), JSON.parse(run("JSON.stringify(ACCENT_PRESETS)")));
+  assert.doesNotMatch(css, /\.sw-\d/);
+  assert.match(css, /\.swatch\s*\{[^}]*background:\s*var\(--swatch-color/);
+});
+
+test("accent picker labels come from the translation table", () => {
+  const { nodes, run } = app();
+  const row = node(); nodes.set("accent-row", row);
+  run("renderAccentRow()");
+  const custom = row.children.find((child) => child.className?.includes("swatch-custom"));
+  const picker = custom.children.find((child) => child.type === "color");
+  const reset = row.children.find((child) => child.className?.includes("btn"));
+  assert.equal(picker.title, run("I18N.en['settings.accent.custom']"));
+  assert.equal(reset.textContent, run("I18N.en['settings.accent.default']"));
+  assert.equal(reset.textContent, "Default");
+});
+
+test("the test loader refuses an app.js without the boot marker", () => {
+  assert.equal(bootlessSource("const a = 1;\n(async function boot() {})();"), "const a = 1;\n");
+  assert.throws(() => bootlessSource("const a = 1;\n(async function start() {})();"), /boot/);
+});
+
+test("the script tag check sees tags in any case and end tags with spaces", () => {
+  const found = scriptTags('<SCRIPT>inline()</SCRIPT >\n<script src="/static/app.js"></script\n>');
+  assert.deepEqual(found.map(([, , body]) => body), ["inline()", ""]);
+});
+
+test("index.html loads every frontend script with defer, app.js last, and each one parses", () => {
+  const tags = scriptTags(html);
+  assert.equal(tags.length, scriptFiles.length, "every script tag needs a /static/ src");
+  for (const [tag, attributes, body] of tags) {
+    assert.match(attributes, /^ src="\/static\/[^"?]+\?v=__VERSION__" defer$/, tag);
+    assert.equal(body, "", `inline script: ${tag}`);
+  }
+  assert.equal(scriptFiles.at(-1), "app.js");
+  assert.equal(new Set(scriptFiles).size, scriptFiles.length, "a script is listed twice");
+  const onDisk = fs.readdirSync(path.join(__dirname, "js")).filter((name) => name.endsWith(".js")).map((name) => `js/${name}`);
+  assert.deepEqual(scriptFiles.slice(0, -1).sort(), onDisk.sort(), "web/js/ and index.html list different files");
+  scriptFiles.forEach((file, index) => {
+    assert.ok(fs.existsSync(path.join(__dirname, file)), file);
+    assert.doesNotThrow(() => new vm.Script(scriptSources[index], { filename: file }), file);
+    assert.equal(scriptSources[index].includes(BOOT_MARKER), file === "app.js", file);
+  });
+});
+
+// Concatenation hoists functions across files, which a browser does not do,
+// so this test also runs the files as separate scripts in the same context.
+test("each script loads on its own in index.html order", () => {
+  const context = vm.createContext({
+    document: { documentElement: node("html"), addEventListener() {} },
+    localStorage: { getItem: () => null, setItem() {} },
+    location: { hash: "" },
+    window: { matchMedia: () => ({ matches: false, addEventListener() {} }), addEventListener() {} },
+    setTimeout, clearTimeout, console, URL,
+  });
+  scriptFiles.forEach((file, index) => {
+    const text = file === "app.js" ? bootlessSource(scriptSources[index]) : scriptSources[index];
+    assert.doesNotThrow(() => new vm.Script(text, { filename: file }).runInContext(context), file);
+  });
+  assert.equal(vm.runInContext("typeof render === 'function' && state.route", context), "dashboard");
+});
+
+test("every class selector in style.css is used by the frontend", () => {
+  let selectors = css.replace(/\/\*[\s\S]*?\*\//g, "");
+  while (/\{[^{}]*\}/.test(selectors)) selectors = selectors.replace(/\{[^{}]*\}/g, " ");
+  const classes = new Set([...selectors.matchAll(/\.([a-zA-Z_][\w-]*)/g)].map((match) => match[1]));
+  const unused = [...classes].filter((name) => !new RegExp(`(?<![\\w-])${name}(?![\\w-])`).test(source + html));
+  assert.deepEqual(unused, []);
+  // Word matches cannot catch these, because the words also appear elsewhere in the scripts.
+  for (const selector of ["textarea.input", ".qr-box img", ".badge.orange", ".mselect-group", ".checkbox.checked", ".checkbox.indeterminate"]) {
+    assert.equal(css.includes(selector), false, selector);
+  }
+});
+
+test("stylesheet keeps one phone breakpoint block and named stacking layers", () => {
+  assert.equal(css.match(/@media \(max-width: 900px\)/g).length, 1);
+  const rules = css.replace(/:root\s*\{[^}]*\}/, "");
+  assert.doesNotMatch(rules, /z-index:\s*\d{2,}/);
+  for (const layer of ["--z-dropdown", "--z-modal", "--z-toast"]) assert.match(css, new RegExp(`:root\\s*\\{[^}]*${layer}:`));
 });
 
 test("setup wires the same theme and language controls as login", () => {

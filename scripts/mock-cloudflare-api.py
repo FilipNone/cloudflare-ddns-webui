@@ -5,18 +5,20 @@ Seeded only with example.com records and documentation-range addresses.
 Usage: python3 scripts/mock-cloudflare-api.py [port]  (default 8787)
 Then run the web UI with CLOUDFLARE_API_BASE=http://127.0.0.1:8787/client/v4
 """
+import copy
 import json
 import ipaddress
 import re
 import shlex
 import sys
-import time
+import threading
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from email.parser import BytesParser
 from email.policy import default
 from urllib.parse import urlparse, parse_qs
 
+DEFAULT_PORT = 8787
 NOW = "2026-07-29T17:25:21.000000Z"
 ZONES = [
     {"id": "0123456789abcdef0123456789abcdef", "name": "example.com", "status": "active", "paused": False, "type": "full"},
@@ -49,6 +51,8 @@ RECORDS = {
         rec("CNAME", "www.example.com", "example.com", True, 1),
     ],
 }
+# Handler threads share RECORDS. Hold LOCK for every read and write.
+LOCK = threading.Lock()
 
 EXPORT_BIND = """;;
 ;; Domain: example.com.
@@ -72,6 +76,98 @@ def envelope(result, page=1, per_page=100):
         "result": result,
         "result_info": {"page": page, "per_page": per_page, "total_pages": 1, "total_count": total},
     }
+
+
+def error_envelope(message, code=1000):
+    return {"success": False, "errors": [{"code": code, "message": message}],
+            "messages": [], "result": None}
+
+
+def json_object(body):
+    """Decode a JSON object request body. Returns None if it is malformed or not an object."""
+    try:
+        value = json.loads(body or b"{}")
+    except ValueError:
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def snapshot_records():
+    """Deep copy of RECORDS, taken under LOCK."""
+    with LOCK:
+        return copy.deepcopy(RECORDS)
+
+
+def reset_records(records):
+    """Replace every zone's records with a deep copy of `records`."""
+    with LOCK:
+        RECORDS.clear()
+        RECORDS.update(copy.deepcopy(records))
+
+
+# Batch operation lists in the order Cloudflare applies them.
+BATCH_KEYS = ("deletes", "patches", "puts", "posts")
+# Free plan limit on the items in one batch, the smallest of any plan.
+BATCH_LIMIT = 200
+PATCH_FIELDS = ("content", "ttl", "proxied", "comment", "tags", "priority", "data", "name")
+
+
+def batch_item_ids(payload):
+    """Record IDs named by a batch body, in Cloudflare's order. Skips malformed items."""
+    ids = []
+    for key in BATCH_KEYS:
+        items = payload.get(key) if isinstance(payload, dict) else None
+        for item in items if isinstance(items, list) else []:
+            if isinstance(item, dict) and isinstance(item.get("id"), str):
+                ids.append(item["id"])
+    return ids
+
+
+def apply_batch(records, payload):
+    """Apply a batch body to `records` like Cloudflare: check every item first,
+    and change nothing when one fails. Returns (status, reply).
+
+    Only deletes and patches are supported. Records are changed in place, so
+    callers that hold a record dict see the update.
+    """
+    if payload is None:
+        return 400, error_envelope("request body must be a JSON object")
+    unknown = sorted(set(payload) - set(BATCH_KEYS))
+    if unknown:
+        return 400, error_envelope(f"unknown batch field {unknown[0]}")
+    if payload.get("puts") or payload.get("posts"):
+        return 400, error_envelope("mock: batch puts and posts are not supported")
+    lists = {key: payload.get(key, []) for key in ("deletes", "patches")}
+    for key, items in lists.items():
+        if not isinstance(items, list):
+            return 400, error_envelope(f"{key} must be a list")
+    if sum(len(items) for items in lists.values()) > BATCH_LIMIT:
+        return 400, error_envelope(f"a batch may contain at most {BATCH_LIMIT} records")
+    by_id = {r["id"]: r for r in records}
+    deleted = set()
+    for key, items in lists.items():
+        for item in items:
+            rid = item.get("id") if isinstance(item, dict) else None
+            if not isinstance(rid, str):
+                return 400, error_envelope(f"every item in {key} needs an id")
+            # A record deleted earlier in the batch no longer exists for later items.
+            if rid not in by_id or rid in deleted:
+                return 404, error_envelope("Record not found", 81044)
+            if key == "deletes":
+                deleted.add(rid)
+    result = {key: [] for key in BATCH_KEYS}
+    for item in payload.get("deletes", []):
+        found = by_id[item["id"]]
+        records.remove(found)
+        result["deletes"].append(found)
+    for item in payload.get("patches", []):
+        found = by_id[item["id"]]
+        for k in PATCH_FIELDS:
+            if k in item:
+                found[k] = item[k]
+        found["modified_on"] = "2026-07-29T18:30:00.000000Z"
+        result["patches"].append(found)
+    return 200, envelope(result)
 
 
 def parse_bind(text, zone_name):
@@ -205,18 +301,29 @@ class Handler(BaseHTTPRequestHandler):
 
     def _body(self):
         length = int(self.headers.get("Content-Length") or 0)
+        if length < 0:
+            raise ValueError("negative Content-Length")
         return self.rfile.read(length) if length else b""
 
     def _zone_records(self, zone_id):
         return RECORDS.setdefault(zone_id, [])
 
-    def route(self, method):
+    def _dispatch(self, method):
+        # Read the body once here and pass it on, so overrides of route() can
+        # inspect it without consuming it.
+        try:
+            body = self._body()
+        except ValueError:
+            return self._json(error_envelope("invalid Content-Length"), 400)
+        return self.route(method, body)
+
+    def route(self, method, body):
         parsed = urlparse(self.path)
         path = parsed.path
         qs = parse_qs(parsed.query)
         prefix = "/client/v4/"
         if not path.startswith(prefix):
-            return self._json({"success": False, "errors": [{"message": "not found"}]}, 404)
+            return self._json(error_envelope("not found"), 404)
         rest = path[len(prefix):]
         parts = [p for p in rest.split("/") if p]
 
@@ -228,83 +335,105 @@ class Handler(BaseHTTPRequestHandler):
 
         # /zones/{z}/dns_records...
         if len(parts) >= 3 and parts[0] == "zones" and parts[2] == "dns_records":
-            zone_id = parts[1]
-            records = self._zone_records(zone_id)
+            with LOCK:
+                status, reply = self._dns_records(method, parts[1], parts[3:], qs, body)
+                # Copy before releasing the lock so no other thread changes the rows being sent.
+                reply = copy.deepcopy(reply)
+            if isinstance(reply, str):
+                return self._text(reply, status)
+            return self._json(reply, status)
 
-            if len(parts) == 3 and method == "GET":
-                rtype = qs.get("type", [None])[0]
-                name = qs.get("name", [None])[0]
-                out = records
-                if rtype:
-                    out = [r for r in out if r["type"] == rtype]
-                if name:
-                    out = [r for r in out if r["name"].lower() == name.lower()]
-                return self._json(envelope(out))
+        return self._json(error_envelope(f"mock: unhandled {method} {path}"), 404)
 
-            if len(parts) == 3 and method == "POST":
-                payload = json.loads(self._body() or b"{}")
-                r = rec(
-                    payload.get("type", "A"),
-                    payload.get("name", "x.example.com"),
-                    payload.get("content", ""),
-                    payload.get("proxied"),
-                    payload.get("ttl", 1),
-                    payload.get("comment"),
-                    payload.get("tags"),
-                    payload.get("priority"),
-                    payload.get("data"),
-                )
-                records.append(r)
-                return self._json(envelope(r), 201)
+    def _dns_records(self, method, zone_id, rest, qs, body):
+        """Handle /zones/{zone_id}/dns_records/{rest...}. The caller holds LOCK.
 
-            if len(parts) == 4 and parts[3] == "export" and method == "GET":
-                return self._text(EXPORT_BIND)
+        Returns (status, reply), where reply is a JSON object or BIND text.
+        """
+        records = self._zone_records(zone_id)
 
-            if len(parts) == 4 and parts[3] == "import" and method == "POST":
-                body = self._body()
-                # Extract the zone file from the multipart body (or raw body).
-                zone_name = next((z["name"] for z in ZONES if z["id"] == zone_id), "example.com")
-                try:
-                    bind = import_body(body, self.headers.get("Content-Type", ""))
-                    imported = parse_bind(bind.decode("utf-8"), zone_name)
-                except (ValueError, UnicodeError) as exc:
-                    return self._json({"success": False, "errors": [{"message": str(exc)}]}, 400)
-                added = 0
-                for row in imported:
-                    if row is None:
-                        continue  # SOA/NS are skipped by Cloudflare imports
-                    if any(r["name"] == row["name"] and r["type"] == row["type"] and r["content"] == row["content"] for r in records):
-                        continue  # duplicate - skipped, not replaced
-                    records.append(row)
-                    added += 1
-                return self._json(envelope({"recs_added": added, "total_records_parsed": len(imported)}))
+        if not rest and method == "GET":
+            rtype = qs.get("type", [None])[0]
+            # DDNS lookups send name.exact; plain name is kept for manual testing.
+            name = qs.get("name.exact", qs.get("name", [None]))[0]
+            out = records
+            if rtype:
+                out = [r for r in out if r["type"] == rtype]
+            if name:
+                out = [r for r in out if r["name"].lower() == name.lower()]
+            return 200, envelope(out)
 
-            if len(parts) == 4:
-                rid = parts[3]
-                found = next((r for r in records if r["id"] == rid), None)
-                if not found:
-                    return self._json({"success": False, "errors": [{"code": 81044, "message": "Record not found"}]}, 404)
-                if method == "DELETE":
-                    records.remove(found)
-                    return self._json(envelope({"id": rid}))
-                if method in ("PATCH", "PUT"):
-                    payload = json.loads(self._body() or b"{}")
-                    for k in ("content", "ttl", "proxied", "comment", "tags", "priority", "data", "name"):
-                        if k in payload:
-                            found[k] = payload[k]
-                    found["modified_on"] = "2026-07-29T18:30:00.000000Z"
-                    return self._json(envelope(found))
+        if not rest and method == "POST":
+            payload = json_object(body)
+            if payload is None:
+                return 400, error_envelope("request body must be a JSON object")
+            r = rec(
+                payload.get("type", "A"),
+                payload.get("name", "x.example.com"),
+                payload.get("content", ""),
+                payload.get("proxied"),
+                payload.get("ttl", 1),
+                payload.get("comment"),
+                payload.get("tags"),
+                payload.get("priority"),
+                payload.get("data"),
+            )
+            records.append(r)
+            return 201, envelope(r)
 
-        return self._json({"success": False, "errors": [{"message": f"mock: unhandled {method} {path}"}]}, 404)
+        if rest == ["export"] and method == "GET":
+            return 200, EXPORT_BIND
 
-    do_GET = lambda self: self.route("GET")
-    do_POST = lambda self: self.route("POST")
-    do_PUT = lambda self: self.route("PUT")
-    do_PATCH = lambda self: self.route("PATCH")
-    do_DELETE = lambda self: self.route("DELETE")
+        if rest == ["import"] and method == "POST":
+            # Extract the zone file from the multipart body (or raw body).
+            zone_name = next((z["name"] for z in ZONES if z["id"] == zone_id), "example.com")
+            try:
+                bind = import_body(body, self.headers.get("Content-Type", ""))
+                imported = parse_bind(bind.decode("utf-8"), zone_name)
+            except (ValueError, UnicodeError) as exc:
+                return 400, error_envelope(str(exc))
+            added = 0
+            for row in imported:
+                if row is None:
+                    continue  # SOA/NS are skipped by Cloudflare imports
+                if any(r["name"] == row["name"] and r["type"] == row["type"] and r["content"] == row["content"] for r in records):
+                    continue  # duplicate - skipped, not replaced
+                records.append(row)
+                added += 1
+            return 200, envelope({"recs_added": added, "total_records_parsed": len(imported)})
+
+        # Checked before the record ID routes below, which would read "batch" as an ID.
+        if rest == ["batch"] and method == "POST":
+            return apply_batch(records, json_object(body))
+
+        if len(rest) == 1:
+            rid = rest[0]
+            found = next((r for r in records if r["id"] == rid), None)
+            if not found:
+                return 404, error_envelope("Record not found", 81044)
+            if method == "DELETE":
+                records.remove(found)
+                return 200, envelope({"id": rid})
+            if method in ("PATCH", "PUT"):
+                payload = json_object(body)
+                if payload is None:
+                    return 400, error_envelope("request body must be a JSON object")
+                for k in PATCH_FIELDS:
+                    if k in payload:
+                        found[k] = payload[k]
+                found["modified_on"] = "2026-07-29T18:30:00.000000Z"
+                return 200, envelope(found)
+
+        return 404, error_envelope(f"mock: unhandled {method} {urlparse(self.path).path}")
+
+    do_GET = lambda self: self._dispatch("GET")
+    do_POST = lambda self: self._dispatch("POST")
+    do_PUT = lambda self: self._dispatch("PUT")
+    do_PATCH = lambda self: self._dispatch("PATCH")
+    do_DELETE = lambda self: self._dispatch("DELETE")
 
 
 if __name__ == "__main__":
-    port = int(sys.argv[1]) if len(sys.argv) > 1 else 8787
+    port = int(sys.argv[1]) if len(sys.argv) > 1 else DEFAULT_PORT
     print(f"Mock Cloudflare API on http://127.0.0.1:{port}/client/v4")
     ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
