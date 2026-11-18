@@ -28,6 +28,8 @@ const SESSION_FLAGS = {
   password: { rotatesSession: true },
   "2fa/confirm": { rotatesSession: true },
   "2fa/disable": { rotatesSession: true },
+  "passkey/finish": { rotatesSession: true, clearsRecoveryCodes: true },
+  "passkeys/register/finish": { rotatesSession: true },
 };
 
 function authCall(endpoint) {
@@ -81,6 +83,72 @@ function deferred() {
   const promise = new Promise((yes, no) => { resolve = yes; reject = no; });
   return { promise, resolve, reject };
 }
+
+test("passkey base64url and browser credential conversion preserve bytes", () => {
+  const { context, run } = app();
+  context.atob = (value) => Buffer.from(value, "base64").toString("binary");
+  context.btoa = (value) => Buffer.from(value, "binary").toString("base64");
+  assert.equal(run("bufferToBase64url(Uint8Array.from([0, 1, 127, 128, 255]).buffer)"), "AAF_gP8");
+  assert.equal(
+    run("JSON.stringify(Array.from(new Uint8Array(base64urlToBuffer('AAF_gP8'))))"),
+    "[0,1,127,128,255]",
+  );
+  assert.equal(
+    run(`JSON.stringify((() => {
+      const options = {publicKey: {challenge:'AQI', user:{id:'_w', name:'admin'},
+        excludeCredentials:[{type:'public-key',id:'gA'}]}};
+      const converted = passkeyCreationOptions(options);
+      return {
+        challenge:Array.from(new Uint8Array(converted.challenge)),
+        user:Array.from(new Uint8Array(converted.user.id)),
+        excluded:Array.from(new Uint8Array(converted.excludeCredentials[0].id)),
+        name:converted.user.name
+      };
+    })())`),
+    '{"challenge":[1,2],"user":[255],"excluded":[128],"name":"admin"}',
+  );
+  assert.equal(
+    run(`JSON.stringify(registrationCredentialJSON({
+      id:'credential-id', rawId:Uint8Array.from([1,2]).buffer, type:'public-key',
+      response:{attestationObject:Uint8Array.from([3]).buffer,
+        clientDataJSON:Uint8Array.from([4]).buffer, getTransports:()=>['internal']},
+      getClientExtensionResults:()=>({credProps:{rk:false}})
+    }))`),
+    '{"id":"credential-id","rawId":"AQI","type":"public-key","response":{"attestationObject":"Aw","clientDataJSON":"BA","transports":["internal"]},"extensions":{"credProps":{"rk":false}}}',
+  );
+  assert.equal(
+    run(`JSON.stringify(authenticationCredentialJSON({
+      id:'credential-id', rawId:Uint8Array.from([1]).buffer, type:'public-key',
+      response:{authenticatorData:Uint8Array.from([2]).buffer,
+        clientDataJSON:Uint8Array.from([3]).buffer, signature:Uint8Array.from([4]).buffer,
+        userHandle:null}, getClientExtensionResults:()=>({})
+    }))`),
+    '{"id":"credential-id","rawId":"AQ","type":"public-key","response":{"authenticatorData":"Ag","clientDataJSON":"Aw","signature":"BA","userHandle":null},"extensions":{}}',
+  );
+});
+
+test("passkey controls require both server support and browser APIs", () => {
+  const { context, run } = app();
+  context.navigator = {};
+  run("state.config = {passkey_supported:true}");
+  assert.equal(run("passkeyCapable()"), false);
+  context.navigator.credentials = {};
+  assert.equal(run("passkeyCapable()"), false);
+  context.window.PublicKeyCredential = function PublicKeyCredential() {};
+  assert.equal(run("passkeyCapable()"), true);
+  run("state.config.passkey_supported = false");
+  assert.equal(run("passkeyCapable()"), false);
+});
+
+test("passkey cancellation and browser security failures have clear errors", () => {
+  const { context, run } = app();
+  context.syntheticError = { name: "NotAllowedError", message: "browser detail" };
+  assert.equal(run("passkeyError(syntheticError)"), "Passkey request cancelled or timed out.");
+  context.syntheticError = { name: "InvalidStateError" };
+  assert.equal(run("passkeyError(syntheticError)"), "This passkey is already registered.");
+  context.syntheticError = { name: "SecurityError" };
+  assert.match(run("passkeyError(syntheticError)"), /HTTPS origin/);
+});
 
 test("late zone response never replaces the current zone's records", async () => {
   const { context, run } = app();
@@ -372,6 +440,16 @@ test("actual API still logs out on a current authenticated request's 401", async
   assert.equal(codes.isConnected, false);
   run("state.authed = true; renderRecoveryNotice()");
   assert.equal(nodes.get("recovery-notice").innerHTML, "");
+});
+
+test("a successful passkey DELETE rotates the session context", async () => {
+  const { context, run } = securityApp();
+  context.fetch = async () => response(200);
+  run("state.records = [{id:'stale'}]");
+  const before = run("authGeneration");
+  await run("api('/api/auth/passkeys/passkey-id', {method:'DELETE', json:{password:'synthetic-password'}, rotatesSession:true})");
+  assert.equal(run("authGeneration"), before + 1);
+  assert.equal(run("state.records.length"), 0);
 });
 
 for (const endpoint of ["logout", "login", "login/2fa", "setup"]) {

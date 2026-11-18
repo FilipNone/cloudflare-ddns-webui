@@ -20,7 +20,7 @@ Known follow-ups, roughly in order.
 - [ ] Proxy status per domain setting (right now it only accepts true or false for every domain).
 - [ ] Implement WAF_LISTS, WAF IP lists.
 - [ ] Add notifications and heartbeats (SHOUTRRR, HEALTHCHECKS, UPTIMEKUMA).
-- [ ] Implement passkey.
+- [x] Implement Passkey registration, passwordless authentication and credential management.
 - [ ] Make proxy enabled by default during the creation of a record.
 - [ ] Let the user use `@` as domain on every field.
 - [ ] Implement that not filling a field will use the default unless filling is absolutely necessary (e.g. in A record, in ipv4 field, the grayed current ipv4 will be used to fill the form if nothing specified from the user otherwise).

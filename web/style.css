@@ -136,6 +136,8 @@ html.theme-changing::view-transition-new(root) { z-index: 1; }
 .login-logo .brand-logo { width: 72px; height: 44px; }
 .login-logo h1 { font-size: 20px; font-weight: 650; }
 .login-sub { color: var(--text-dim); font-size: 13px; margin-bottom: 26px; }
+.login-divider { display: flex; align-items: center; gap: 10px; color: var(--text-faint); font-size: 12px; margin: 14px 0; }
+.login-divider::before, .login-divider::after { content: ""; height: 1px; background: var(--border); flex: 1; }
 .login-error {
   background: var(--red-soft);
   border: 1px solid var(--red);
@@ -727,10 +729,15 @@ a:hover { text-decoration: underline; }
 .security-factor-status { display: flex; align-items: center; gap: 10px; }
 .security-factor-status .badge { flex-shrink: 0; }
 .security-factor-status .cell-muted { min-width: 0; overflow-wrap: anywhere; }
+.passkey-list { display: grid; gap: 8px; margin-top: 12px; }
+.passkey-item { display: flex; align-items: center; gap: 8px; padding: 10px; border: 1px solid var(--border); border-radius: 8px; }
+.passkey-item .grow { flex: 1; min-width: 0; overflow-wrap: anywhere; }
 @media (max-width: 600px) {
   .record-cards, .ddns-cards { grid-template-columns: 1fr; padding: 12px; }
   .search-box { max-width: none; min-width: 100%; }
   .pagination { gap: 8px; font-size: 12px; }
   .pagination .spacer { display: none; }
   .toolbar .btn, .record-card-foot .btn { min-height: 38px; }
+  .passkey-item { flex-wrap: wrap; }
+  .passkey-item .grow { flex-basis: 100%; }
 }

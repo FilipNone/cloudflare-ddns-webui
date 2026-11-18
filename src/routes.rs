@@ -15,6 +15,7 @@ use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::sync::{Arc, LazyLock};
+use webauthn_rs::prelude::{PublicKeyCredential, RegisterPublicKeyCredential};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const SESSION_COOKIE: &str = "cfddns_session";
@@ -117,6 +118,41 @@ struct ChangePasswordBody {
     code: Option<String>,
     new_password: String,
     confirm: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PasskeyLoginFinishBody {
+    flow: String,
+    credential: PublicKeyCredential,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PasskeyRegistrationStartBody {
+    name: String,
+    password: String,
+    code: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PasskeyRegistrationFinishBody {
+    flow: String,
+    credential: RegisterPublicKeyCredential,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PasskeyRenameBody {
+    name: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PasskeyRemoveBody {
+    password: String,
+    code: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -290,15 +326,19 @@ fn auth_error(error: AuthError) -> Response {
         AuthError::InvalidPassword
         | AuthError::InvalidCode
         | AuthError::CodeAlreadyUsed
-        | AuthError::ChallengeExpired => 401,
-        AuthError::AlreadyConfigured => 409,
+        | AuthError::ChallengeExpired
+        | AuthError::PasskeyInvalid => 401,
+        AuthError::PasskeyNotFound => 404,
+        AuthError::AlreadyConfigured | AuthError::PasskeyLimitReached => 409,
         AuthError::NotConfigured
         | AuthError::TotpAlreadyEnabled
         | AuthError::TotpNotEnabled
         | AuthError::EnrollmentExpired
         | AuthError::EnrollmentCodeRejected
         | AuthError::PasswordTooShort
-        | AuthError::PasswordTooLong => 400,
+        | AuthError::PasswordTooLong
+        | AuthError::PasskeyUnavailable
+        | AuthError::PasskeyNameInvalid => 400,
     };
     api_error(status, error.message())
 }
@@ -446,6 +486,8 @@ async fn route(
         ("POST", ["auth", "setup"]) => return setup(state, &req).await,
         ("POST", ["auth", "login"]) => return login(state, &req).await,
         ("POST", ["auth", "login", "2fa"]) => return login_2fa(state, &req).await,
+        ("POST", ["auth", "passkey", "start"]) => return passkey_login_start(state, &req).await,
+        ("POST", ["auth", "passkey", "finish"]) => return passkey_login_finish(state, &req).await,
         // Needs no valid session, so an expired one can still clear its cookie.
         ("POST", ["auth", "logout"]) => return Ok(logout(state, &req)),
         _ => {}
@@ -473,11 +515,45 @@ fn public_config(state: &AppState) -> Response {
             "languages": [{ "code": "en", "name": "English" }],
             "ddns_configured": !state.cfg.domains.is_empty(),
             "configured": state.auth.is_configured(),
+            "passkey_supported": state.auth.passkey_supported(),
             "accent": ui.accent,
             "has_icon": ui.has_icon,
             "github": GITHUB_URL,
         }),
     )
+}
+
+async fn passkey_login_start(state: &Arc<AppState>, req: &Request) -> Result<Response, Response> {
+    if !state.auth.is_configured() {
+        return Err(api_error(428, "setup required"));
+    }
+    let ip = req.remote.ip();
+    let (flow, options) = run_auth(state, move |auth| auth.passkey_authentication_start(ip))
+        .await
+        .map_err(|error| match error {
+            AuthError::PasskeyUnavailable => api_error(400, "passkey login unavailable"),
+            other => auth_error(other),
+        })?;
+    Ok(api_json(200, &json!({ "flow": flow, "options": options })))
+}
+
+async fn passkey_login_finish(state: &Arc<AppState>, req: &Request) -> Result<Response, Response> {
+    let ip = req.remote.ip();
+    let body: PasskeyLoginFinishBody = json_body(req)?;
+    let token = run_auth(state, move |auth| {
+        auth.passkey_authentication_finish(ip, &body.flow, &body.credential)
+    })
+    .await
+    .map_err(|error| match error {
+        AuthError::ChallengeExpired => api_error(401, "passkey request expired - try again"),
+        AuthError::PasskeyInvalid => api_error(401, "passkey verification failed"),
+        other => auth_error(other),
+    })?;
+    state.pp.infof(
+        pp::EMOJI_LOCK,
+        format!("Successful passkey login from {ip}"),
+    );
+    Ok(with_session(ok(), &state.cfg, &token))
 }
 
 async fn setup(state: &Arc<AppState>, req: &Request) -> Result<Response, Response> {
@@ -595,8 +671,71 @@ async fn account_routes(
                 "session_ttl": state.cfg.session_ttl.as_secs(),
                 "totp_enabled": state.auth.totp_enabled(),
                 "backup_codes_remaining": state.auth.backup_codes_remaining(),
+                "passkey_supported": state.auth.passkey_supported(),
+                "passkeys_registered": state.auth.passkey_count(),
             }),
         )),
+        ("GET", ["auth", "passkeys"]) => Ok(api_json(200, &state.auth.passkey_summaries())),
+        ("POST", ["auth", "passkeys", "register", "start"]) => {
+            let body: PasskeyRegistrationStartBody = json_body(req)?;
+            let session = session_token(state, req)
+                .ok_or_else(|| api_error(401, "authentication required"))?;
+            let (flow, options) = run_auth(state, move |auth| {
+                auth.passkey_registration_start_verified(
+                    ip,
+                    &session,
+                    &body.name,
+                    &body.password,
+                    body.code.as_deref(),
+                )
+            })
+            .await
+            .map_err(auth_error)?;
+            Ok(api_json(200, &json!({ "flow": flow, "options": options })))
+        }
+        ("POST", ["auth", "passkeys", "register", "finish"]) => {
+            let body: PasskeyRegistrationFinishBody = json_body(req)?;
+            let session = session_token(state, req)
+                .ok_or_else(|| api_error(401, "authentication required"))?;
+            let (passkey, token) = run_auth(state, move |auth| {
+                auth.passkey_registration_finish(ip, &session, &body.flow, &body.credential)
+            })
+            .await
+            .map_err(auth_error)?;
+            state.pp.infof(pp::EMOJI_LOCK, "Passkey registered");
+            Ok(with_session(api_json(201, &passkey), &state.cfg, &token))
+        }
+        ("PUT", ["auth", "passkeys", id]) => {
+            let body: PasskeyRenameBody = json_body(req)?;
+            let session = session_token(state, req)
+                .ok_or_else(|| api_error(401, "authentication required"))?;
+            let id = (*id).to_string();
+            run_auth(state, move |auth| {
+                auth.passkey_rename(&session, &id, &body.name)
+            })
+            .await
+            .map_err(auth_error)?;
+            Ok(ok())
+        }
+        ("DELETE", ["auth", "passkeys", id]) => {
+            let body: PasskeyRemoveBody = json_body(req)?;
+            let session = session_token(state, req)
+                .ok_or_else(|| api_error(401, "authentication required"))?;
+            let id = (*id).to_string();
+            let token = run_auth(state, move |auth| {
+                auth.passkey_remove_verified(
+                    ip,
+                    &session,
+                    &id,
+                    &body.password,
+                    body.code.as_deref(),
+                )
+            })
+            .await
+            .map_err(auth_error)?;
+            state.pp.infof(pp::EMOJI_LOCK, "Passkey removed");
+            Ok(with_session(ok(), &state.cfg, &token))
+        }
         ("POST", ["auth", "2fa", "begin"]) => {
             let body: PasswordBody = json_body(req)?;
             let (secret, uri, qr) = run_auth(state, move |auth| {
