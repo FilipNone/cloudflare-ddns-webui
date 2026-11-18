@@ -2,11 +2,10 @@
 
 ## Owner rules
 
-- Use only `165696124+FilipNone@users.noreply.github.com` as author or committer email. Never print or publish another owner email, and don't change global Git configuration.
 - Never read or copy `.env`, `data/`, tokens, account state or real DNS exports into logs, tests, docs, commits or PRs. Use synthetic fixtures and mock credentials.
-- Commit, push, open a PR, deploy or merge only when asked. A human approves the merge.
-- No AI co-author trailers or attribution lines. One fix per commit.
-- Keep existing comments unless the change makes them wrong. Before a PR, run the `humanizer` skill over the comments the PR adds; if the skill is unavailable, say the PR is blocked.
+- Always explain added dependencies in PRs.
+- Do not automatically merge PRs without human review and approval first.
+- Do not change the README.md, it needs human review and approval.
 
 ## Never crash
 
