@@ -9,7 +9,7 @@ src/
   main.rs        startup: config, auth state, UI store, signals, listener
   http.rs        HTTP/1.1 parsing and framing, connection limit, timeouts, graceful shutdown
   routes.rs      API routes, Host/Origin and mutation-header checks, input validation, security headers, static files
-  auth.rs        admin account, sessions, PBKDF2 hashes, backup codes, login limiter, state.json
+  auth.rs        admin account, sessions, PBKDF2 hashes, WebAuthn Passkeys, backup codes, login limiter, state.json
   totp.rs        RFC 6238 TOTP and the enrollment QR code
   cloudflare.rs  Cloudflare API client, record types, batch endpoint
   ddns.rs        IP detection, DNS status, Update now
@@ -42,8 +42,9 @@ All routes are under `/api`.
 | Route | Notes |
 | --- | --- |
 | `GET /config` | public |
-| `POST /auth/setup`, `/auth/login`, `/auth/login/2fa`, `/auth/logout` | public; logout works with an expired session |
+| `POST /auth/setup`, `/auth/login`, `/auth/login/2fa`, `/auth/passkey/start`, `/auth/passkey/finish`, `/auth/logout` | public; logout works with an expired session |
 | `GET /auth/me`, `POST /auth/password`, `/auth/2fa/begin`, `/confirm`, `/cancel`, `/disable` | account |
+| `GET /auth/passkeys`, `POST /auth/passkeys/register/start`, `/finish`, `PUT` / `DELETE /auth/passkeys/{id}` | Passkey enrollment and management; all require a session |
 | `POST /ui/accent`, `POST /ui/icon`, `DELETE /ui/icon` | appearance |
 | `GET /zones`, `GET /zones/{id}/records`, `POST /zones/{id}/records` | zones and records |
 | `PUT` / `DELETE /zones/{id}/records/{record}` | `PUT` is sent to Cloudflare as PATCH |
@@ -57,8 +58,8 @@ Request bodies use `#[serde(deny_unknown_fields)]`, so the frontend must send on
 
 `DATA_DIR` (default `/data`) holds:
 
-- `state.json`: password hash and iteration count, TOTP secret, backup code hashes. Mode `600`. Missing means first-run setup; unreadable or invalid stops startup.
+- `state.json`: password hash and iteration count, TOTP secret, backup code hashes, and WebAuthn public credentials with their relying-party metadata. Mode `600`. It never contains Passkey private keys or biometric data. Missing means first-run setup; unreadable or invalid stops startup.
 - `ui-settings.json`: accent colour and the icon's MIME type and file name. Invalid content is renamed to `ui-settings.json.invalid`.
 - `icon-<32 hex>`: the uploaded logo.
 
-Every write goes through `persist::replace_file`: a private temp file, fsync, rename, then a directory sync. Memory changes only after the save succeeds. Sessions, login challenges and limiter counters live in memory and reset on restart.
+Every write goes through `persist::replace_file`: a private temp file, fsync, rename, then a directory sync. Memory changes only after the save succeeds. Sessions, password/TOTP challenges, WebAuthn ceremony state and limiter counters live in memory and reset on restart. WebAuthn challenges are bounded, expire and are consumed before verification so they cannot be replayed.

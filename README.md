@@ -4,7 +4,7 @@
 
 Edit your Cloudflare DNS records and check on your dynamic DNS from a page you host yourself.
 
-A web interface for Cloudflare DNS, written in Rust: one static binary in a `FROM scratch` Docker image of about 2.4 MB, with the frontend compiled in. The record editor follows the Cloudflare dashboard, and the DDNS page shows whether the domains [cloudflare-ddns](https://github.com/timothymiller/cloudflare-ddns) manages point at your current IP address, with a button to update them now.
+A web interface for Cloudflare DNS, written in Rust: one static binary in a `FROM scratch` Docker image, with the frontend compiled in. The record editor follows the Cloudflare dashboard, and the DDNS page shows whether the domains [cloudflare-ddns](https://github.com/timothymiller/cloudflare-ddns) manages point at your current IP address, with a button to update them now.
 
 ## ✨ Features
 
@@ -14,7 +14,7 @@ A web interface for Cloudflare DNS, written in Rust: one static binary in a `FRO
 - The dashboard's proxy rules, enforced by the server: only A, AAAA and CNAME records can be proxied, and proxied records use TTL Auto
 - BIND zone file export, and append-only import that is checked before anything is sent
 - A DDNS page with your current IPv4 and IPv6 addresses, whether each domain's record matches, and an Update now button
-- One admin account with TOTP two-factor login and single-use backup codes
+- One admin account with password login, TOTP and single-use backup codes, plus phishing-resistant Passkey login
 - Light, dark and system themes, an accent colour, and your own logo
 - The same `CLOUDFLARE_API_TOKEN` and `DOMAINS` settings as cloudflare-ddns
 
@@ -25,6 +25,7 @@ A web interface for Cloudflare DNS, written in Rust: one static binary in a `FRO
 - [Configuration](#-configuration)
 - [Environment variable reference](#-environment-variable-reference)
 - [Deployment](#-deployment)
+- [Passkeys](#%EF%B8%8F-passkeys)
 - [Two-factor authentication](#%EF%B8%8F-two-factor-authentication)
 - [Security notes](#-security-notes)
 - [Troubleshooting](#-troubleshooting)
@@ -129,7 +130,7 @@ There is no password setting. You create the password in the browser on first ru
 | `DATA_DIR` | `/data` | Where the account and UI settings are saved |
 | `SESSION_TTL` | `24h` | Session lifetime |
 | `SECURE_COOKIES` | `false` | Marks the session cookie `Secure` and names it `__Host-cfddns_session`. Turn it on behind HTTPS |
-| `PUBLIC_ORIGIN` | unset | The exact origin your reverse proxy serves, such as `https://dns-admin.example.com`. It must be HTTPS (HTTP only on loopback) and needs `SECURE_COOKIES=true`; an HTTPS origin also turns on HSTS. When unset, only IP addresses and `localhost` are accepted as the host |
+| `PUBLIC_ORIGIN` | unset | The exact origin your reverse proxy serves, such as `https://dns-admin.example.com`. It must be HTTPS (HTTP only on loopback) and needs `SECURE_COOKIES=true`. Setting it enables Passkeys; an HTTPS origin also turns on HSTS. When unset, Passkeys are disabled and only IP addresses and `localhost` are accepted as the host |
 
 ### Domains
 
@@ -248,13 +249,26 @@ DATA_DIR=./data ./target/release/cloudflare-ddns-webui
 
 The Dockerfile builds a static musl binary, compresses it with UPX and runs it in a `FROM scratch` image as UID/GID 65534. On SIGTERM (`docker stop`) or SIGINT (Ctrl+C) the GUI stops accepting connections, gives requests in progress up to 5 seconds and exits with status 0, inside Docker's 10-second stop timeout.
 
+## 🗝️ Passkeys
+
+Passkeys are an optional passwordless sign-in method backed by WebAuthn. They require user verification, so the authenticator must verify a fingerprint, face, device PIN or supported hardware-security-key PIN. The GUI never receives biometric data or a private key.
+
+1. Set `PUBLIC_ORIGIN` to the exact HTTPS origin users open (for example `https://dns-admin.example.com`) and set `SECURE_COOKIES=true`. For local development only, `http://localhost:<port>` is supported.
+2. Sign in with the existing password, open **Settings › Security › Add passkey**, name the device and confirm the current password. If TOTP is enabled, also enter a TOTP or backup code.
+3. Complete the browser or operating-system prompt. You may register up to 20 Passkeys and can rename or remove each one in Security settings.
+4. On the sign-in screen, choose **Sign in with a passkey**. Password sign-in, TOTP and backup codes remain available as recovery paths.
+
+Passkey login is a passwordless multi-factor login: successful WebAuthn user verification replaces the password-plus-TOTP path for that login. Enabling TOTP does not make a TOTP code follow a Passkey assertion. Adding or removing a Passkey still requires the password and, when enabled, TOTP or a backup code. Registration and removal rotate all sessions; renaming requires a valid session.
+
+Passkeys are tied to the configured relying-party ID and exact origin. Changing the hostname in `PUBLIC_ORIGIN` makes existing Passkeys unavailable at the new hostname; restore the old origin or sign in with the password and register new Passkeys. Browser and authenticator support varies, and private/incognito policies may disable WebAuthn.
+
 ## 🛡️ Two-factor authentication
 
 1. Go to **Settings › Security › Enable 2FA**, enter your password, scan the QR code with an authenticator app and confirm with a 6-digit code.
 2. Save the backup codes. They are shown once, can be downloaded as a `.txt` file, and each one works once.
 3. Logins then need the current TOTP code or one backup code. Each TOTP code works once, so right after logging in, wait for the next code before disabling 2FA or changing the password.
 
-Disabling 2FA needs a code, and changing the password needs the current password plus a code.
+Disabling 2FA needs a code, and changing the password needs the current password plus a code. Passkey login uses authenticator user verification instead of this password-plus-code flow, but Passkey enrollment and removal still require both when TOTP is enabled.
 
 If you lose both the authenticator and the backup codes, stop the service and remove remote access. Delete `state.json` from the data volume, then create a new account over loopback. If `state.json` is present but unreadable or invalid, the GUI refuses to start instead of resetting the account.
 
@@ -262,7 +276,8 @@ If you lose both the authenticator and the backup codes, stop the service and re
 
 - The password is stored in `state.json` (mode `600`) as a PBKDF2-HMAC-SHA256 hash with 600,000 iterations. Hashes from older versions use 100,000 and are upgraded at your next login. Older versions then reject the password, so keep a copy of `state.json` before upgrading if you might roll back; restoring it also undoes later password and 2FA changes.
 - Backup codes are stored as salted PBKDF2 hashes with 100,000 iterations and removed when used. Codes from older versions have no salt of their own; while any are left, the GUI logs a warning at startup, and disabling and re-enabling 2FA replaces them.
-- Sessions are random 256-bit tokens kept in memory, so a restart logs everyone out. Changing the password or 2FA signs out existing sessions.
+- Passkeys use the maintained `webauthn-rs` verifier. `state.json` stores only the WebAuthn public credential, counter, backup state, relying-party metadata and the user-supplied name—never biometric data or private keys. WebAuthn challenges are random, expire, are single-use and stay only in memory.
+- Sessions are random 256-bit tokens kept in memory, so a restart logs everyone out. Changing the password or 2FA, registering a Passkey, or removing a Passkey signs out existing sessions and issues a fresh one to the caller.
 - Failed passwords are limited per IP address, or per /64 for IPv6. Behind a reverse proxy every client shares the proxy's address and its limit. Failed 2FA codes share one account-wide limit of five per five minutes. Both counters reset on restart.
 - Every write needs the session cookie and a header that browsers won't send cross-site. Request bodies with unknown fields are rejected.
 - Responses carry a strict Content-Security-Policy with no inline scripts or styles, plus anti-framing, `nosniff`, `no-referrer`, COOP, CORP and `Permissions-Policy` headers. An HTTPS `PUBLIC_ORIGIN` adds HSTS.
@@ -281,6 +296,10 @@ The GUI found a [setting it rejects](#updater-settings-the-gui-rejects), usually
 ### "untrusted Host or Origin"
 
 Set `PUBLIC_ORIGIN` to the exact origin your proxy serves, with the scheme and any non-default port. Without it, only IP addresses and `localhost` work.
+
+### The Passkey button is missing or a Passkey fails after a hostname change
+
+Passkeys are enabled only when `PUBLIC_ORIGIN` is set, and the browser must support WebAuthn. Use the exact HTTPS origin users open; HTTP works only for `localhost`. Credentials registered for one hostname cannot authenticate another. Sign in with the password to register a replacement credential.
 
 ### The admin account is gone after an update
 

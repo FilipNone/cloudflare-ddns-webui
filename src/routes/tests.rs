@@ -157,10 +157,11 @@ impl Fixture {
         let state = Arc::new(AppState {
             cf: CloudflareClient::new("synthetic", cfg.update_timeout, Some(&api_base)).unwrap(),
             detector: ddns::Detector::new(cfg.detection_timeout).unwrap(),
-            auth: Auth::new(
+            auth: Auth::new_with_origin(
                 cfg.session_ttl,
                 dir.join("state.json").to_str().unwrap(),
                 PP::new(false, true),
+                cfg.public_origin.as_ref(),
             )
             .unwrap(),
             ui: UiStore::new(&cfg.data_dir, PP::new(false, true)).unwrap(),
@@ -622,6 +623,16 @@ async fn request_bodies_reject_unknown_fields() {
         ),
         (
             "POST",
+            "/api/auth/passkeys/register/start",
+            json!({"name": "Laptop", "password": PASSWORD, "code": null, "extra": true}),
+        ),
+        (
+            "POST",
+            "/api/auth/passkey/finish",
+            json!({"flow": "invalid", "credential": {}, "extra": true}),
+        ),
+        (
+            "POST",
             &format!("/api/zones/{ZONE}/records"),
             json!({"type": "A", "name": "example.com", "content": "192.0.2.1", "zone": ZONE}),
         ),
@@ -659,7 +670,107 @@ async fn public_config_does_not_reveal_two_factor_state() {
     let fixture = Fixture::new().await;
     let config = body_json(&fixture.get("/api/config").await);
     assert!(config.get("totp_enabled").is_none(), "{config}");
+    assert!(config.get("passkeys_registered").is_none(), "{config}");
+    assert_eq!(config["passkey_supported"], false);
     assert_eq!(config["configured"], false);
+}
+
+#[tokio::test]
+async fn passkey_routes_expose_capability_without_leaking_credentials() {
+    let fixture = Fixture::with_config(|cfg| {
+        cfg.public_origin = Some("http://localhost:8888".parse().unwrap());
+    })
+    .await;
+    let config = body_json(&fixture.get("/api/config").await);
+    assert_eq!(config["passkey_supported"], true);
+    assert!(config.get("passkeys").is_none(), "{config}");
+
+    let start_before_setup = fixture
+        .send("POST", "/api/auth/passkey/start", None, b"")
+        .await;
+    assert_eq!(start_before_setup.status, 428);
+
+    let cookie = fixture.login();
+    let empty = fixture
+        .send("GET", "/api/auth/passkeys", Some(&cookie), b"")
+        .await;
+    assert_eq!(empty.status, 200);
+    assert_eq!(body_json(&empty), json!([]));
+    let me = fixture
+        .send("GET", "/api/auth/me", Some(&cookie), b"")
+        .await;
+    assert_eq!(body_json(&me)["passkeys_registered"], 0);
+    assert_eq!(body_json(&me)["passkey_supported"], true);
+
+    let unavailable = fixture
+        .send("POST", "/api/auth/passkey/start", None, b"")
+        .await;
+    assert_eq!(unavailable.status, 400);
+    assert_eq!(
+        body_json(&unavailable)["error"],
+        "passkey login unavailable"
+    );
+
+    for (method, path, body) in [
+        ("GET", "/api/auth/passkeys", json!(null)),
+        (
+            "POST",
+            "/api/auth/passkeys/register/start",
+            json!({"name": "Laptop", "password": PASSWORD}),
+        ),
+        (
+            "PUT",
+            "/api/auth/passkeys/00000000000000000000000000000000",
+            json!({"name": "Phone"}),
+        ),
+        (
+            "DELETE",
+            "/api/auth/passkeys/00000000000000000000000000000000",
+            json!({"password": PASSWORD}),
+        ),
+    ] {
+        let bytes = if body.is_null() {
+            Vec::new()
+        } else {
+            body.to_string().into_bytes()
+        };
+        let response = fixture.send(method, path, None, &bytes).await;
+        assert_eq!(response.status, 401, "{method} {path}");
+    }
+
+    let invalid_name = fixture
+        .send(
+            "POST",
+            "/api/auth/passkeys/register/start",
+            Some(&cookie),
+            json!({"name": " ", "password": PASSWORD})
+                .to_string()
+                .as_bytes(),
+        )
+        .await;
+    assert_eq!(invalid_name.status, 400);
+    let wrong_password = fixture
+        .send(
+            "POST",
+            "/api/auth/passkeys/register/start",
+            Some(&cookie),
+            json!({"name": "Laptop", "password": "incorrect-password"})
+                .to_string()
+                .as_bytes(),
+        )
+        .await;
+    assert_eq!(wrong_password.status, 401);
+}
+
+#[tokio::test]
+async fn passkey_login_stays_disabled_without_public_origin() {
+    let fixture = Fixture::new().await;
+    fixture.login();
+    let response = fixture
+        .send("POST", "/api/auth/passkey/start", None, b"")
+        .await;
+    assert_eq!(response.status, 400);
+    assert_eq!(body_json(&response)["error"], "passkey login unavailable");
 }
 
 #[tokio::test]
