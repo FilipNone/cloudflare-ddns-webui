@@ -21,6 +21,11 @@ use std::net::{IpAddr, Ipv6Addr};
 use std::num::NonZeroU32;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use webauthn_rs::prelude::{
+    CreationChallengeResponse, Passkey, PasskeyAuthentication, PasskeyRegistration,
+    PublicKeyCredential, RegisterPublicKeyCredential, RequestChallengeResponse, Uuid, Webauthn,
+    WebauthnBuilder,
+};
 
 // The unwraps run at compile time, so a zero count fails the build.
 /// Iterations for new password hashes. 600,000 is the OWASP Password
@@ -53,6 +58,10 @@ const LOGIN_LOCKOUT: Duration = Duration::from_secs(5 * 60);
 const CHALLENGE_TTL: Duration = Duration::from_secs(5 * 60);
 const MAX_2FA_ATTEMPTS: u32 = 5;
 const MAX_LIMITER_ENTRIES: usize = 10_000;
+const MAX_PASSKEYS: usize = 20;
+const MAX_PASSKEY_NAME_BYTES: usize = 64;
+const PASSKEY_ID_LEN: usize = 16;
+const MAX_PENDING_PASSKEY_FLOWS: usize = 64;
 
 /// Why an authentication call failed. `message` is the text the API sends
 /// back, which the web UI shows as is.
@@ -73,6 +82,11 @@ pub enum AuthError {
     EnrollmentCodeRejected,
     PasswordTooShort,
     PasswordTooLong,
+    PasskeyUnavailable,
+    PasskeyInvalid,
+    PasskeyNotFound,
+    PasskeyLimitReached,
+    PasskeyNameInvalid,
 }
 
 impl AuthError {
@@ -95,6 +109,11 @@ impl AuthError {
             }
             AuthError::PasswordTooShort => "password must be at least 8 characters long",
             AuthError::PasswordTooLong => "password is too long",
+            AuthError::PasskeyUnavailable => "passkeys are unavailable for this origin",
+            AuthError::PasskeyInvalid => "passkey verification failed",
+            AuthError::PasskeyNotFound => "passkey not found",
+            AuthError::PasskeyLimitReached => "passkey limit reached",
+            AuthError::PasskeyNameInvalid => "passkey name must be 1 to 64 bytes",
         }
     }
 }
@@ -162,6 +181,12 @@ pub struct AuthState {
     pub password_iterations: Option<u32>,
     pub totp_secret: Option<String>, // base32
     pub backup_code_hashes: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    passkey_user_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    passkey_rp_id: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    passkeys: Vec<StoredPasskey>,
 }
 
 impl AuthState {
@@ -182,6 +207,42 @@ impl AuthState {
             }),
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StoredPasskey {
+    id: String,
+    name: String,
+    created_at: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_used_at: Option<u64>,
+    credential: Passkey,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PasskeySummary {
+    pub id: String,
+    pub name: String,
+    pub created_at: u64,
+    pub last_used_at: Option<u64>,
+}
+
+struct PendingPasskeyRegistration {
+    state: PasskeyRegistration,
+    name: String,
+    user_id: Uuid,
+    session_token: String,
+    expires_at: Instant,
+}
+
+struct PendingPasskeyAuthentication {
+    state: PasskeyAuthentication,
+    expires_at: Instant,
+}
+
+struct PasskeyRuntime {
+    webauthn: Webauthn,
+    rp_id: String,
 }
 
 // --- Pending TOTP enrollment ---
@@ -208,6 +269,8 @@ struct Flow {
     /// After a password hash upgrade fails to save, upgrades are skipped
     /// until this time. It lives in memory only, so a restart tries again.
     upgrade_retry_after: Option<Instant>,
+    passkey_registrations: HashMap<String, PendingPasskeyRegistration>,
+    passkey_authentications: HashMap<String, PendingPasskeyAuthentication>,
 }
 
 impl Flow {
@@ -251,10 +314,44 @@ pub struct Auth {
     session_ttl: Duration,
     state_path: String,
     pp: PP,
+    passkeys: Option<PasskeyRuntime>,
 }
 
 impl Auth {
+    #[cfg(test)]
     pub fn new(session_ttl: Duration, state_path: &str, pp: PP) -> Result<Self, String> {
+        Self::new_inner(session_ttl, state_path, pp, None)
+    }
+
+    pub fn new_with_origin(
+        session_ttl: Duration,
+        state_path: &str,
+        pp: PP,
+        origin: Option<&reqwest::Url>,
+    ) -> Result<Self, String> {
+        let passkeys = origin
+            .map(|origin| -> Result<PasskeyRuntime, String> {
+                let rp_id = origin
+                    .host_str()
+                    .ok_or_else(|| "PUBLIC_ORIGIN has no passkey relying-party ID".to_string())?;
+                let webauthn = WebauthnBuilder::new(rp_id, origin)
+                    .and_then(|builder| builder.rp_name("Cloudflare DDNS").build())
+                    .map_err(|_| "PUBLIC_ORIGIN is not valid for WebAuthn".to_string())?;
+                Ok(PasskeyRuntime {
+                    webauthn,
+                    rp_id: rp_id.to_string(),
+                })
+            })
+            .transpose()?;
+        Self::new_inner(session_ttl, state_path, pp, passkeys)
+    }
+
+    fn new_inner(
+        session_ttl: Duration,
+        state_path: &str,
+        pp: PP,
+        passkeys: Option<PasskeyRuntime>,
+    ) -> Result<Self, String> {
         let state = load_state(state_path)?;
         crate::persist::remove_temp_files(std::path::Path::new(state_path));
         Ok(Auth {
@@ -265,12 +362,15 @@ impl Auth {
                 factor_failures: (0, Instant::now()),
                 last_totp_step: None,
                 upgrade_retry_after: None,
+                passkey_registrations: HashMap::new(),
+                passkey_authentications: HashMap::new(),
             }),
             sessions: Mutex::new(HashMap::new()),
             limiter: LoginLimiter::new(),
             session_ttl,
             state_path: state_path.to_string(),
             pp,
+            passkeys,
         })
     }
 
@@ -341,6 +441,8 @@ impl Auth {
         lock(&self.sessions).clear();
         flow.challenges.clear();
         flow.pending_totp = None;
+        flow.passkey_registrations.clear();
+        flow.passkey_authentications.clear();
     }
 
     fn check_lockout(&self, flow: &mut Flow, ip: Option<IpAddr>) -> Result<(), AuthError> {
@@ -367,6 +469,34 @@ impl Auth {
         if let Some(ip) = ip {
             self.limiter.record_success(ip);
         }
+    }
+
+    fn verified_step_up(
+        &self,
+        flow: &mut Flow,
+        ip: IpAddr,
+        password: &str,
+        code: Option<&str>,
+    ) -> Result<(AuthState, Option<u64>, bool), AuthError> {
+        self.check_lockout(flow, Some(ip))?;
+        if !self.verify_password(password) {
+            self.factor_failure(flow, Some(ip));
+            return Err(AuthError::InvalidPassword);
+        }
+        self.upgrade_password_hash(flow, password);
+        let mut candidate = self.snapshot();
+        if !candidate.totp_enabled() {
+            return Ok((candidate, None, false));
+        }
+        let recovery_codes = candidate.backup_code_hashes.len();
+        let totp_step = self
+            .verify_factor(flow, ip, code.unwrap_or(""), &candidate)?
+            .consume(&mut candidate);
+        Ok((
+            candidate,
+            totp_step,
+            recovery_codes != self.backup_codes_remaining(),
+        ))
     }
 
     // The flow lock covers proof verification through the persisted mutation.
@@ -560,6 +690,309 @@ impl Auth {
         Ok((outcome, self.create_session()?))
     }
 
+    // --- Passkeys ---
+
+    pub fn passkey_supported(&self) -> bool {
+        self.passkeys.is_some()
+    }
+
+    pub fn passkey_count(&self) -> usize {
+        lock(&self.state).passkeys.len()
+    }
+
+    pub fn passkey_summaries(&self) -> Vec<PasskeySummary> {
+        lock(&self.state)
+            .passkeys
+            .iter()
+            .map(|passkey| PasskeySummary {
+                id: passkey.id.clone(),
+                name: passkey.name.clone(),
+                created_at: passkey.created_at,
+                last_used_at: passkey.last_used_at,
+            })
+            .collect()
+    }
+
+    pub fn passkey_authentication_start(
+        &self,
+        ip: IpAddr,
+    ) -> Result<(String, RequestChallengeResponse), AuthError> {
+        let runtime = self
+            .passkeys
+            .as_ref()
+            .ok_or(AuthError::PasskeyUnavailable)?;
+        let mut flow = lock(&self.flow);
+        self.check_lockout(&mut flow, Some(ip))?;
+        let state = self.snapshot();
+        if state.passkeys.is_empty()
+            || state
+                .passkey_rp_id
+                .as_deref()
+                .is_some_and(|rp_id| rp_id != runtime.rp_id)
+        {
+            return Err(AuthError::PasskeyUnavailable);
+        }
+        let credentials = state
+            .passkeys
+            .iter()
+            .map(|passkey| passkey.credential.clone())
+            .collect::<Vec<_>>();
+        let now = Instant::now();
+        flow.passkey_authentications
+            .retain(|_, pending| pending.expires_at > now);
+        if flow.passkey_authentications.len() >= MAX_PENDING_PASSKEY_FLOWS {
+            return Err(AuthError::LockedOut);
+        }
+        let (options, authentication) = runtime
+            .webauthn
+            .start_passkey_authentication(&credentials)
+            .map_err(|_| AuthError::Internal)?;
+        let token = hex(&random_bytes::<CHALLENGE_TOKEN_LEN>()?);
+        flow.passkey_authentications.insert(
+            token.clone(),
+            PendingPasskeyAuthentication {
+                state: authentication,
+                expires_at: now + CHALLENGE_TTL,
+            },
+        );
+        Ok((token, options))
+    }
+
+    pub fn passkey_authentication_finish(
+        &self,
+        ip: IpAddr,
+        flow_token: &str,
+        credential: &PublicKeyCredential,
+    ) -> Result<String, AuthError> {
+        let runtime = self
+            .passkeys
+            .as_ref()
+            .ok_or(AuthError::PasskeyUnavailable)?;
+        let mut flow = lock(&self.flow);
+        self.check_lockout(&mut flow, Some(ip))?;
+        let Some(pending) = flow.passkey_authentications.remove(flow_token) else {
+            return Err(AuthError::ChallengeExpired);
+        };
+        if pending.expires_at <= Instant::now() {
+            return Err(AuthError::ChallengeExpired);
+        }
+        let result = runtime
+            .webauthn
+            .finish_passkey_authentication(credential, &pending.state)
+            .map_err(|_| {
+                self.factor_failure(&mut flow, Some(ip));
+                AuthError::PasskeyInvalid
+            })?;
+        let mut candidate = self.snapshot();
+        let mut matched = false;
+        for passkey in &mut candidate.passkeys {
+            if passkey.credential.update_credential(&result).is_some() {
+                if matched {
+                    return Err(AuthError::Internal);
+                }
+                matched = true;
+                passkey.last_used_at = Some(now_secs());
+            }
+        }
+        if !matched {
+            self.factor_failure(&mut flow, Some(ip));
+            return Err(AuthError::PasskeyInvalid);
+        }
+        self.commit_state(candidate)?;
+        self.factor_success(&mut flow, Some(ip));
+        self.create_session()
+    }
+
+    pub fn passkey_registration_start_verified(
+        &self,
+        ip: IpAddr,
+        session_token: &str,
+        name: &str,
+        password: &str,
+        code: Option<&str>,
+    ) -> Result<(String, CreationChallengeResponse), AuthError> {
+        let runtime = self
+            .passkeys
+            .as_ref()
+            .ok_or(AuthError::PasskeyUnavailable)?;
+        let name = validate_passkey_name(name)?;
+        let mut flow = lock(&self.flow);
+        if !self.session_valid(session_token) {
+            return Err(AuthError::ChallengeExpired);
+        }
+        let now = Instant::now();
+        flow.passkey_registrations
+            .retain(|_, pending| pending.expires_at > now);
+        if flow.passkey_registrations.len() >= MAX_PENDING_PASSKEY_FLOWS {
+            return Err(AuthError::LockedOut);
+        }
+        let (candidate, totp_step, recovery_used) =
+            self.verified_step_up(&mut flow, ip, password, code)?;
+        if candidate.passkeys.len() >= MAX_PASSKEYS {
+            return Err(AuthError::PasskeyLimitReached);
+        }
+        if !candidate.passkeys.is_empty()
+            && candidate
+                .passkey_rp_id
+                .as_deref()
+                .is_some_and(|rp_id| rp_id != runtime.rp_id)
+        {
+            return Err(AuthError::PasskeyUnavailable);
+        }
+        if recovery_used {
+            self.commit_state(candidate.clone())?;
+        }
+        if let Some(step) = totp_step {
+            flow.last_totp_step = Some(step);
+        }
+        self.factor_success(&mut flow, Some(ip));
+
+        let user_id = candidate
+            .passkey_user_id
+            .as_deref()
+            .and_then(|id| Uuid::parse_str(id).ok())
+            .unwrap_or_else(Uuid::new_v4);
+        let excluded = candidate
+            .passkeys
+            .iter()
+            .map(|passkey| passkey.credential.cred_id().clone())
+            .collect::<Vec<_>>();
+        let (options, registration) = runtime
+            .webauthn
+            .start_passkey_registration(
+                user_id,
+                "admin",
+                "Cloudflare DDNS administrator",
+                Some(excluded),
+            )
+            .map_err(|_| AuthError::Internal)?;
+        let token = hex(&random_bytes::<CHALLENGE_TOKEN_LEN>()?);
+        flow.passkey_registrations.insert(
+            token.clone(),
+            PendingPasskeyRegistration {
+                state: registration,
+                name,
+                user_id,
+                session_token: session_token.to_string(),
+                expires_at: now + CHALLENGE_TTL,
+            },
+        );
+        Ok((token, options))
+    }
+
+    pub fn passkey_registration_finish(
+        &self,
+        ip: IpAddr,
+        session_token: &str,
+        flow_token: &str,
+        credential: &RegisterPublicKeyCredential,
+    ) -> Result<(PasskeySummary, String), AuthError> {
+        let runtime = self
+            .passkeys
+            .as_ref()
+            .ok_or(AuthError::PasskeyUnavailable)?;
+        let mut flow = lock(&self.flow);
+        let Some(pending) = flow.passkey_registrations.remove(flow_token) else {
+            return Err(AuthError::ChallengeExpired);
+        };
+        if pending.expires_at <= Instant::now()
+            || pending.session_token != session_token
+            || !self.session_valid(session_token)
+        {
+            return Err(AuthError::ChallengeExpired);
+        }
+        let passkey = runtime
+            .webauthn
+            .finish_passkey_registration(credential, &pending.state)
+            .map_err(|_| {
+                self.factor_failure(&mut flow, Some(ip));
+                AuthError::PasskeyInvalid
+            })?;
+        let mut candidate = self.snapshot();
+        if candidate.passkeys.len() >= MAX_PASSKEYS {
+            return Err(AuthError::PasskeyLimitReached);
+        }
+        if candidate
+            .passkeys
+            .iter()
+            .any(|stored| stored.credential.cred_id() == passkey.cred_id())
+        {
+            return Err(AuthError::PasskeyInvalid);
+        }
+        if candidate
+            .passkey_user_id
+            .as_deref()
+            .is_some_and(|id| id != pending.user_id.to_string())
+        {
+            return Err(AuthError::Internal);
+        }
+        let stored = StoredPasskey {
+            id: hex(&random_bytes::<PASSKEY_ID_LEN>()?),
+            name: pending.name,
+            created_at: now_secs(),
+            last_used_at: None,
+            credential: passkey,
+        };
+        let summary = PasskeySummary {
+            id: stored.id.clone(),
+            name: stored.name.clone(),
+            created_at: stored.created_at,
+            last_used_at: None,
+        };
+        candidate.passkey_user_id = Some(pending.user_id.to_string());
+        candidate.passkey_rp_id = Some(runtime.rp_id.clone());
+        candidate.passkeys.push(stored);
+        let token = self.commit_and_reissue(&mut flow, Some(ip), candidate, None)?;
+        Ok((summary, token))
+    }
+
+    pub fn passkey_rename(
+        &self,
+        session_token: &str,
+        id: &str,
+        name: &str,
+    ) -> Result<(), AuthError> {
+        let name = validate_passkey_name(name)?;
+        let _flow = lock(&self.flow);
+        if !self.session_valid(session_token) {
+            return Err(AuthError::ChallengeExpired);
+        }
+        let mut candidate = self.snapshot();
+        let Some(passkey) = candidate
+            .passkeys
+            .iter_mut()
+            .find(|passkey| passkey.id == id)
+        else {
+            return Err(AuthError::PasskeyNotFound);
+        };
+        passkey.name = name;
+        self.commit_state(candidate)
+    }
+
+    pub fn passkey_remove_verified(
+        &self,
+        ip: IpAddr,
+        session_token: &str,
+        id: &str,
+        password: &str,
+        code: Option<&str>,
+    ) -> Result<String, AuthError> {
+        let mut flow = lock(&self.flow);
+        if !self.session_valid(session_token) {
+            return Err(AuthError::ChallengeExpired);
+        }
+        let (mut candidate, totp_step, _) = self.verified_step_up(&mut flow, ip, password, code)?;
+        let Some(index) = candidate
+            .passkeys
+            .iter()
+            .position(|passkey| passkey.id == id)
+        else {
+            return Err(AuthError::PasskeyNotFound);
+        };
+        candidate.passkeys.remove(index);
+        self.commit_and_reissue(&mut flow, Some(ip), candidate, totp_step)
+    }
+
     // --- TOTP enrollment ---
 
     /// Begin enrollment: generates a secret and otpauth URI + QR SVG.
@@ -691,6 +1124,15 @@ fn validate_password(password: &str) -> Result<(), AuthError> {
         return Err(AuthError::PasswordTooLong);
     }
     Ok(())
+}
+
+fn validate_passkey_name(name: &str) -> Result<String, AuthError> {
+    let name = name.trim();
+    if name.is_empty() || name.len() > MAX_PASSKEY_NAME_BYTES || name.chars().any(char::is_control)
+    {
+        return Err(AuthError::PasskeyNameInvalid);
+    }
+    Ok(name.to_string())
 }
 
 /// Stores a hash of `password` under a fresh salt.
@@ -848,6 +1290,43 @@ fn load_state(path: &str) -> Result<AuthState, String> {
         .any(|hash| !valid_backup_hash(hash))
     {
         return Err("invalid auth recovery hash".to_string());
+    }
+    if state.passkeys.len() > MAX_PASSKEYS {
+        return Err("too many stored passkeys".to_string());
+    }
+    if state
+        .passkey_user_id
+        .as_deref()
+        .is_some_and(|id| Uuid::parse_str(id).is_err())
+    {
+        return Err("invalid passkey user ID".to_string());
+    }
+    if !state.passkeys.is_empty()
+        && (state.passkey_user_id.is_none() || state.passkey_rp_id.is_none())
+    {
+        return Err("stored passkeys are missing account metadata".to_string());
+    }
+    if state
+        .passkey_rp_id
+        .as_deref()
+        .is_some_and(|rp_id| rp_id.is_empty() || !rp_id.is_ascii() || rp_id.len() > 253)
+    {
+        return Err("invalid passkey relying-party ID".to_string());
+    }
+    for (index, passkey) in state.passkeys.iter().enumerate() {
+        if !valid_hex(&passkey.id, PASSKEY_ID_LEN)
+            || validate_passkey_name(&passkey.name).as_deref() != Ok(passkey.name.as_str())
+            || passkey
+                .last_used_at
+                .is_some_and(|last_used| last_used < passkey.created_at)
+        {
+            return Err("invalid stored passkey metadata".to_string());
+        }
+        if state.passkeys.iter().skip(index + 1).any(|other| {
+            other.id == passkey.id || other.credential.cred_id() == passkey.credential.cred_id()
+        }) {
+            return Err("duplicate stored passkey".to_string());
+        }
     }
     Ok(state)
 }

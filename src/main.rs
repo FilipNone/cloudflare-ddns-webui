@@ -49,7 +49,12 @@ async fn main() {
     config::print_config_summary(&cfg, &ppfmt);
 
     let state_path = format!("{}/state.json", cfg.data_dir);
-    let auth = match Auth::new(cfg.session_ttl, &state_path, ppfmt) {
+    let auth = match Auth::new_with_origin(
+        cfg.session_ttl,
+        &state_path,
+        ppfmt,
+        cfg.public_origin.as_ref(),
+    ) {
         Ok(auth) => auth,
         Err(error) => {
             ppfmt.errorf(
@@ -69,6 +74,12 @@ async fn main() {
         ppfmt.warningf(
             pp::EMOJI_LOCK,
             "Some 2FA backup codes use the older hash format without a random salt - disable and re-enable 2FA to issue new codes.",
+        );
+    }
+    if !auth.passkey_supported() {
+        ppfmt.infof(
+            pp::EMOJI_LOCK,
+            "Passkeys disabled - set PUBLIC_ORIGIN to the exact HTTPS origin (HTTP is allowed on localhost).",
         );
     }
 
