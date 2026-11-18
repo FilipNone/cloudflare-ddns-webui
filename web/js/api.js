@@ -52,14 +52,13 @@ async function api(path, opts = {}) {
       state.authed = false;
       resetSessionData();
       state.pendingBackupCodes = null;
-      state.passkeys = [];
       invalidatePageRequests();
       render();
     }
     throw new Error("unauthorized");
   }
   const sameAuthentication = authentication === authGeneration;
-  if (resp.ok && sameAuthentication && opts.rotatesSession) {
+  if (resp.ok && init.method === "POST" && sameAuthentication && opts.rotatesSession) {
     authGeneration++;
     resetSessionData();
     if (opts.clearsRecoveryCodes) state.pendingBackupCodes = null;

@@ -11,11 +11,11 @@ js/core.js           saved preferences, constants, state, formatters, validators
 js/i18n.js           strings, t(), tHtml()
 js/ui.js             icons, theme, toasts, select menus, dropdowns, modal frame
 js/api.js            api() client, session reset, loaders
-js/login.js          setup, password/Passkey sign-in, 2FA step, WebAuthn conversion
+js/login.js          setup, sign-in, 2FA step
 js/dashboard.js      DDNS page
 js/records.js        records page: filters, list and cards, selection, pagination
 js/record-modals.js  add/edit, bulk edit, delete, import/export dialogs
-js/settings.js       appearance, security, Passkeys, 2FA, recovery codes, password
+js/settings.js       appearance, security, 2FA, recovery codes, password
 app.js               entry script, always last: page shell, navigation, boot
 ```
 
@@ -36,7 +36,6 @@ The CSP is `default-src 'self'`, with no inline scripts or styles.
 - All strings live in the `I18N` table in `js/i18n.js`; use `t()`.
 - `localStorage` access goes through `readStored()` and `writeStored()`, which never throw.
 - `api()` sends `X-Requested-With: fetch`. Auth calls that issue a new session pass `{ rotatesSession: true }`.
-- WebAuthn binary fields are converted between browser `ArrayBuffer` values and unpadded base64url in `js/login.js`; never send the browser credential object directly.
 - Request bodies must match the backend structs exactly (the server rejects unknown fields).
 - Mirror the backend rules: only A, AAAA and CNAME can be proxied, proxied means TTL 1, TTL is 1 or 30 to 86400, and comments are at most 500 UTF-8 bytes.
 
