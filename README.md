@@ -331,7 +331,7 @@ python3 scripts/smoke-test.py --serve --port 8888   # disposable instance on loo
 python3 scripts/smoke-test.py                        # full smoke test
 ```
 
-Log in to the disposable instance with the `PASSWORD` constant from `scripts/smoke-test.py`. Its public IP changes every minute, so you can try Update now. Contributors and AI agents should read [AGENTS.md](AGENTS.md) first; it lists every check to run before a PR.
+Log in to the disposable instance with the `PASSWORD` constant from `scripts/smoke-test.py`. Its public IP changes every minute, so you can try Update now. Contributors should read [CONTRIBUTING.md](CONTRIBUTING.md); AI agents should also read [AGENTS.md](AGENTS.md).
 
 ## 🔗 Helpful links
 
@@ -341,7 +341,7 @@ Log in to the disposable instance with the `PASSWORD` constant from `scripts/smo
 
 ## 📜 License
 
-This project is licensed under the GNU General Public License, version 3 (GPLv3).
+This project is licensed under the [GNU General Public License, version 3](LICENSE).
 
 ## 👨‍💻 Author
 
