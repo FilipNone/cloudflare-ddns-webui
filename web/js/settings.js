@@ -207,6 +207,12 @@ function renderSecurityBody() {
         ${totpOn ? `<span class="cell-muted">${esc(t("settings.2fa.backup_count", { n: state.backupCodesRemaining }))}</span>` : ""}
         </div>
       </td></tr>
+      <tr><td>${esc(t("settings.passkey.title"))}</td><td>
+        <div class="security-factor-status">
+          <span class="badge ${state.passkeys.length ? "green" : "grey"}">${esc(state.passkeys.length ? t("settings.passkey.status.on") : t("settings.passkey.status.off"))}</span>
+          ${state.passkeys.length ? `<span class="cell-muted">${esc(t("settings.passkey.count", { n: state.passkeys.length }))}</span>` : ""}
+        </div>
+      </td></tr>
     </table>
     <div class="settings-sep"></div>
     <div class="settings-row">
@@ -217,6 +223,21 @@ function renderSecurityBody() {
       ${totpOn
         ? `<button class="btn sm danger" id="2fa-disable-btn">${esc(t("settings.2fa.disable"))}</button>`
         : `<button class="btn sm primary" id="2fa-enable-btn">${esc(t("settings.2fa.enable"))}</button>`}
+    </div>
+    <div class="settings-sep"></div>
+    <div class="settings-row u-row-start">
+      <div class="grow">
+        <div class="lbl">${esc(t("settings.passkey.title"))}</div>
+        <div class="hint">${esc(state.passkeySupported ? t("settings.passkey.desc") : t("settings.passkey.unavailable"))}</div>
+        <div class="passkey-list" id="passkey-list">
+          ${state.passkeys.map((passkey) => `<div class="passkey-item">
+            <div class="grow"><strong>${esc(passkey.name)}</strong><div class="hint">${esc(t("settings.passkey.created", { date: new Date(passkey.created_at * 1000).toLocaleDateString() }))}</div></div>
+            <button class="btn sm" data-passkey-rename="${esc(passkey.id)}">${esc(t("settings.passkey.rename"))}</button>
+            <button class="btn sm danger" data-passkey-remove="${esc(passkey.id)}">${esc(t("settings.passkey.remove"))}</button>
+          </div>`).join("")}
+        </div>
+      </div>
+      <button class="btn sm primary" id="passkey-add-btn" ${state.passkeySupported ? "" : "disabled"}>${esc(t("settings.passkey.add"))}</button>
     </div>
     <div class="settings-sep"></div>
     <div class="settings-row">
@@ -230,7 +251,147 @@ function renderSecurityBody() {
   if (enableBtn) enableBtn.addEventListener("click", open2faSetupModal);
   const disableBtn = el("2fa-disable-btn");
   if (disableBtn) disableBtn.addEventListener("click", open2faDisableModal);
+  el("passkey-add-btn")?.addEventListener("click", openPasskeyAddModal);
+  body.querySelectorAll?.("[data-passkey-rename]").forEach((button) => button.addEventListener("click", () => {
+    const passkey = state.passkeys.find((item) => item.id === button.dataset.passkeyRename);
+    if (passkey) openPasskeyRenameModal(passkey);
+  }));
+  body.querySelectorAll?.("[data-passkey-remove]").forEach((button) => button.addEventListener("click", () => {
+    const passkey = state.passkeys.find((item) => item.id === button.dataset.passkeyRemove);
+    if (passkey) openPasskeyRemoveModal(passkey);
+  }));
   el("pw-change-btn").addEventListener("click", openPasswordModal);
+}
+
+function passkeyStepUpFields(prefix) {
+  return `<label class="field"><span>${esc(t("settings.passkey.name"))}</span>
+      <input class="input" id="${prefix}-name" maxlength="64" autocomplete="off"></label>
+    <label class="field"><span>${esc(t("settings.password.current"))}</span>
+      <input class="input" id="${prefix}-password" type="password" autocomplete="current-password"></label>
+    ${state.totpEnabled ? `<label class="field"><span>${esc(t("settings.password.code"))}</span>
+      <input class="input" id="${prefix}-code" autocomplete="one-time-code"></label>` : ""}`;
+}
+
+function openPasskeyAddModal() {
+  if (!passkeyCapable()) { toast(t("settings.passkey.browser_unavailable"), "error"); return; }
+  const modal = openModal(`
+    ${modalHead(t("settings.passkey.add"))}
+    <div class="modal-body">
+      <p class="u-note-sm">${esc(t("settings.passkey.add_desc"))}</p>
+      <div class="login-error" id="passkey-add-error"></div>
+      ${passkeyStepUpFields("passkey-add")}
+    </div>
+    <div class="modal-foot">
+      <button class="btn" data-close>${esc(t("modal.cancel"))}</button>
+      <button class="btn primary" id="passkey-add-submit">${esc(t("settings.passkey.add"))}</button>
+    </div>`);
+  modal.querySelector("#passkey-add-submit").addEventListener("click", async () => {
+    const btn = modal.querySelector("#passkey-add-submit");
+    const errorBox = modal.querySelector("#passkey-add-error");
+    const name = modal.querySelector("#passkey-add-name").value.trim();
+    const password = modal.querySelector("#passkey-add-password").value;
+    const code = modal.querySelector("#passkey-add-code")?.value.trim() || null;
+    if (!name || !password || (state.totpEnabled && !code)) { showError(errorBox, t("modal.required")); return; }
+    btn.disabled = true;
+    errorBox.classList.remove("visible");
+    const session = { generation: authGeneration };
+    try {
+      const start = await api("/api/auth/passkeys/register/start", {
+        method: "POST", json: { name, password, code },
+      });
+      const credential = await navigator.credentials.create({
+        publicKey: passkeyCreationOptions(start.options),
+      });
+      if (!credential) throw new Error(t("passkey.cancelled"));
+      const passkey = await api("/api/auth/passkeys/register/finish", {
+        method: "POST",
+        json: { flow: start.flow, credential: registrationCredentialJSON(credential) },
+        authContext: session,
+        rotatesSession: true,
+      });
+      if (session.generation !== authGeneration || !state.authed) return;
+      state.passkeys.push(passkey);
+      if (modal.isConnected) closeModal();
+      toast(t("toast.passkey.added"));
+      renderSecurityBody();
+    } catch (error) {
+      showError(errorBox, passkeyError(error));
+      btn.disabled = false;
+    }
+  });
+}
+
+function openPasskeyRenameModal(passkey) {
+  const modal = openModal(`
+    ${modalHead(t("settings.passkey.rename"))}
+    <div class="modal-body">
+      <div class="login-error" id="passkey-rename-error"></div>
+      <label class="field"><span>${esc(t("settings.passkey.name"))}</span>
+        <input class="input" id="passkey-rename-name" maxlength="64" value="${esc(passkey.name)}" autocomplete="off"></label>
+    </div>
+    <div class="modal-foot">
+      <button class="btn" data-close>${esc(t("modal.cancel"))}</button>
+      <button class="btn primary" id="passkey-rename-submit">${esc(t("settings.passkey.rename"))}</button>
+    </div>`);
+  modal.querySelector("#passkey-rename-submit").addEventListener("click", async () => {
+    const btn = modal.querySelector("#passkey-rename-submit");
+    const errorBox = modal.querySelector("#passkey-rename-error");
+    const name = modal.querySelector("#passkey-rename-name").value.trim();
+    if (!name) { showError(errorBox, t("modal.required")); return; }
+    btn.disabled = true;
+    try {
+      await api(`/api/auth/passkeys/${encodeURIComponent(passkey.id)}`, { method: "PUT", json: { name } });
+      passkey.name = name;
+      if (modal.isConnected) closeModal();
+      toast(t("toast.passkey.renamed"));
+      renderSecurityBody();
+    } catch (error) {
+      showError(errorBox, error.message);
+      btn.disabled = false;
+    }
+  });
+}
+
+function openPasskeyRemoveModal(passkey) {
+  const modal = openModal(`
+    ${modalHead(t("settings.passkey.remove"))}
+    <div class="modal-body">
+      <p class="u-note-sm">${esc(t("settings.passkey.remove_desc", { name: passkey.name }))}</p>
+      <div class="login-error" id="passkey-remove-error"></div>
+      <label class="field"><span>${esc(t("settings.password.current"))}</span>
+        <input class="input" id="passkey-remove-password" type="password" autocomplete="current-password"></label>
+      ${state.totpEnabled ? `<label class="field"><span>${esc(t("settings.password.code"))}</span>
+        <input class="input" id="passkey-remove-code" autocomplete="one-time-code"></label>` : ""}
+    </div>
+    <div class="modal-foot">
+      <button class="btn" data-close>${esc(t("modal.cancel"))}</button>
+      <button class="btn danger" id="passkey-remove-submit">${esc(t("settings.passkey.remove"))}</button>
+    </div>`);
+  modal.querySelector("#passkey-remove-submit").addEventListener("click", async () => {
+    const btn = modal.querySelector("#passkey-remove-submit");
+    const errorBox = modal.querySelector("#passkey-remove-error");
+    const password = modal.querySelector("#passkey-remove-password").value;
+    const code = modal.querySelector("#passkey-remove-code")?.value.trim() || null;
+    if (!password || (state.totpEnabled && !code)) { showError(errorBox, t("modal.required")); return; }
+    btn.disabled = true;
+    const session = { generation: authGeneration };
+    try {
+      await api(`/api/auth/passkeys/${encodeURIComponent(passkey.id)}`, {
+        method: "DELETE",
+        json: { password, code },
+        authContext: session,
+        rotatesSession: true,
+      });
+      if (session.generation !== authGeneration || !state.authed) return;
+      state.passkeys = state.passkeys.filter((item) => item.id !== passkey.id);
+      if (modal.isConnected) closeModal();
+      toast(t("toast.passkey.removed"));
+      renderSecurityBody();
+    } catch (error) {
+      showError(errorBox, error.message);
+      btn.disabled = false;
+    }
+  });
 }
 
 /* ----- 2FA setup ----- */

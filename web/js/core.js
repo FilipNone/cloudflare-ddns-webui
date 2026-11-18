@@ -66,6 +66,8 @@ const state = {
   authed: false,
   configured: true,
   totpEnabled: false,
+  passkeySupported: false,
+  passkeys: [],
   route: location.hash.replace("#/", "") || "dashboard",
   zones: [],
   zoneId: null,

@@ -1,0 +1,7 @@
+[advisories]
+# `webauthn-rs` 0.6.2 pulls `rsa` 0.10.0-rc.19 through `crypto-glue` 0.2.2.
+# RUSTSEC-2023-0071 affects RSA private-key operations; this application only
+# uses that dependency for WebAuthn public-key signature verification. The
+# fixed rsa 0.10.0 release cannot currently satisfy crypto-glue's `sha2`
+# feature requirement. Remove this exception when crypto-glue supports it.
+ignore = ["RUSTSEC-2023-0071"]
