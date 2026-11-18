@@ -56,7 +56,6 @@ function render() {
     state.authed = false;
     resetSessionData();
     state.pendingBackupCodes = null;
-    state.passkeys = [];
     // navigate() also invalidates pending page requests and renders.
     navigate("dashboard");
   });
@@ -129,13 +128,6 @@ async function bootAuthed() {
     state.sessionTtl = me.session_ttl;
     state.totpEnabled = !!me.totp_enabled;
     state.backupCodesRemaining = me.backup_codes_remaining ?? 0;
-    state.passkeySupported = !!me.passkey_supported;
-    if (state.passkeySupported) {
-      state.passkeys = await api("/api/auth/passkeys");
-      if (!current()) return;
-    } else {
-      state.passkeys = [];
-    }
   } catch { /* non-fatal */ }
   if (!current()) return;
   try {
@@ -164,7 +156,6 @@ async function bootAuthed() {
     state.sessionTtl = me.session_ttl;
     state.totpEnabled = !!me.totp_enabled;
     state.backupCodesRemaining = me.backup_codes_remaining ?? 0;
-    state.passkeySupported = !!me.passkey_supported;
   } catch {
     state.authed = false;
   }

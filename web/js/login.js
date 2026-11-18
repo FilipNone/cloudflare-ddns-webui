@@ -1,81 +1,6 @@
 /* Signed-out screens: first-run setup, password sign-in and the 2FA step. */
 "use strict";
 
-function passkeyCapable() {
-  return !!(state.config?.passkey_supported && window.PublicKeyCredential && navigator.credentials);
-}
-
-function base64urlToBuffer(value) {
-  const base64 = value.replace(/-/g, "+").replace(/_/g, "/");
-  const padded = base64 + "=".repeat((4 - base64.length % 4) % 4);
-  const bytes = atob(padded);
-  return Uint8Array.from(bytes, (byte) => byte.charCodeAt(0)).buffer;
-}
-
-function bufferToBase64url(value) {
-  const bytes = new Uint8Array(value);
-  let binary = "";
-  bytes.forEach((byte) => { binary += String.fromCharCode(byte); });
-  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-}
-
-function passkeyCreationOptions(options) {
-  const publicKey = options.publicKey;
-  publicKey.challenge = base64urlToBuffer(publicKey.challenge);
-  publicKey.user.id = base64urlToBuffer(publicKey.user.id);
-  (publicKey.excludeCredentials || []).forEach((credential) => {
-    credential.id = base64urlToBuffer(credential.id);
-  });
-  return publicKey;
-}
-
-function passkeyRequestOptions(options) {
-  const publicKey = options.publicKey;
-  publicKey.challenge = base64urlToBuffer(publicKey.challenge);
-  (publicKey.allowCredentials || []).forEach((credential) => {
-    credential.id = base64urlToBuffer(credential.id);
-  });
-  return publicKey;
-}
-
-function registrationCredentialJSON(credential) {
-  const response = credential.response;
-  return {
-    id: credential.id,
-    rawId: bufferToBase64url(credential.rawId),
-    type: credential.type,
-    response: {
-      attestationObject: bufferToBase64url(response.attestationObject),
-      clientDataJSON: bufferToBase64url(response.clientDataJSON),
-      transports: typeof response.getTransports === "function" ? response.getTransports() : [],
-    },
-    extensions: credential.getClientExtensionResults(),
-  };
-}
-
-function authenticationCredentialJSON(credential) {
-  const response = credential.response;
-  return {
-    id: credential.id,
-    rawId: bufferToBase64url(credential.rawId),
-    type: credential.type,
-    response: {
-      authenticatorData: bufferToBase64url(response.authenticatorData),
-      clientDataJSON: bufferToBase64url(response.clientDataJSON),
-      signature: bufferToBase64url(response.signature),
-      userHandle: response.userHandle ? bufferToBase64url(response.userHandle) : null,
-    },
-    extensions: credential.getClientExtensionResults(),
-  };
-}
-
-function passkeyError(error) {
-  if (error?.name === "NotAllowedError") return t("passkey.cancelled");
-  if (error?.name === "InvalidStateError") return t("passkey.already_registered");
-  if (error?.name === "SecurityError") return t("passkey.security_error");
-  return error?.message || t("passkey.failed");
-}
-
 /* ================= Render: first-run setup ================= */
 
 function renderSetup(app) {
@@ -171,35 +96,8 @@ function renderLogin(app) {
         <input class="input" type="password" id="login-password" autocomplete="current-password" required autofocus>
       </label>
       <button class="btn primary u-w100" type="submit" id="login-submit">${esc(t("login.submit"))}</button>
-      ${passkeyCapable() ? `<div class="login-divider"><span>${esc(t("login.or"))}</span></div>
-      <button class="btn u-w100" type="button" id="passkey-login">${I.key} ${esc(t("passkey.sign_in"))}</button>` : ""}
     </form>`);
   wireLoginShell();
-
-  el("passkey-login")?.addEventListener("click", async () => {
-    const btn = el("passkey-login");
-    const errBox = el("login-error");
-    errBox.classList.remove("visible");
-    btn.disabled = true;
-    try {
-      const start = await api("/api/auth/passkey/start", { method: "POST" });
-      const credential = await navigator.credentials.get({
-        publicKey: passkeyRequestOptions(start.options),
-      });
-      if (!credential) throw new Error(t("passkey.cancelled"));
-      await api("/api/auth/passkey/finish", {
-        method: "POST",
-        json: { flow: start.flow, credential: authenticationCredentialJSON(credential) },
-        rotatesSession: true,
-        clearsRecoveryCodes: true,
-      });
-      state.authed = true;
-      await bootAuthed();
-    } catch (error) {
-      showError(errBox, passkeyError(error));
-      btn.disabled = false;
-    }
-  });
 
   el("login-form").addEventListener("submit", async (e) => {
     e.preventDefault();
